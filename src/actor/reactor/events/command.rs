@@ -283,6 +283,7 @@ impl CommandEventHandler {
                 focus_window: Some((window_id, None)),
                 app_handles,
                 focus_quiet: Quiet::No,
+                activate: false,
             });
             if let Err(e) = reactor.communication_manager.raise_manager_tx.try_send(request) {
                 warn!("Failed to send raise request: {}", e);

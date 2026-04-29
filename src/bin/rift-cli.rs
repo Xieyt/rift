@@ -556,7 +556,7 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
         WindowCommands::Next => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::NextWindow))),
         WindowCommands::Prev => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::PrevWindow))),
         WindowCommands::Focus { direction } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::MoveFocus(direction.into()),
+            LC::MoveFocus { direction: direction.into(), activate: false },
         ))),
         WindowCommands::ToggleFloat => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleWindowFloating,

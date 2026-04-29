@@ -2211,6 +2211,7 @@ impl Reactor {
             raise_windows,
             mut focus_window,
             boundary_hit,
+            activate,
         } = response;
 
         if let Some(dir) = boundary_hit
@@ -2388,6 +2389,7 @@ impl Reactor {
             focus_window: focus_window_with_warp,
             app_handles,
             focus_quiet,
+            activate,
         });
 
         if let Err(e) = self.communication_manager.raise_manager_tx.try_send(msg) {
@@ -2646,6 +2648,7 @@ impl Reactor {
                 focus_window: Some((wid, warp)),
                 app_handles,
                 focus_quiet: quiet,
+                activate: false,
             }));
     }
 

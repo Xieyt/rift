@@ -213,10 +213,10 @@ pub enum Request {
     /// Events attributed to this request will use the provided [`Quiet`]
     /// parameter for the last window only. Events for other windows will be
     /// marked `Quiet::Yes` automatically.
-    Raise(Vec<WindowId>, CancellationToken, u64, Quiet),
+    Raise(Vec<WindowId>, CancellationToken, u64, Quiet, bool),
 }
 
-struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet);
+struct RaiseRequest(Vec<WindowId>, CancellationToken, u64, Quiet, bool);
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub enum Quiet {
@@ -376,10 +376,11 @@ impl State {
 
     async fn handle_raises(this: &RefCell<Self>, mut rx: actor::Receiver<RaiseRequest>) {
         while let Some((span, raise)) = rx.recv().await {
-            let RaiseRequest(wids, token, sequence_id, quiet) = raise;
-            if let Err(e) = Self::handle_raise_request(this, wids, &token, sequence_id, quiet)
-                .instrument(span)
-                .await
+            let RaiseRequest(wids, token, sequence_id, quiet, activate) = raise;
+            if let Err(e) =
+                Self::handle_raise_request(this, wids, &token, sequence_id, quiet, activate)
+                    .instrument(span)
+                    .await
             {
                 debug!("Raise request failed: {e:?}");
             }
@@ -712,9 +713,9 @@ impl State {
                 ));
                 SLSReenableUpdate(*G_CONNECTION);
             }
-            &mut Request::Raise(ref wids, ref token, sequence_id, quiet) => {
+            &mut Request::Raise(ref wids, ref token, sequence_id, quiet, activate) => {
                 self.raises_tx
-                    .send(RaiseRequest(wids.clone(), token.clone(), sequence_id, quiet));
+                    .send(RaiseRequest(wids.clone(), token.clone(), sequence_id, quiet, activate));
             }
         }
         Ok(false)
@@ -860,6 +861,7 @@ impl State {
         token: &CancellationToken,
         sequence_id: u64,
         quiet: Quiet,
+        activate: bool,
     ) -> Result<(), RaiseError> {
         let check_cancel = || {
             if token.is_cancelled() {
@@ -898,6 +900,9 @@ impl State {
         }
 
         if !is_frontmost && make_key_result.is_ok() && is_standard {
+            if activate {
+                let _ = this.running_app.activate();
+            }
             let (tx, rx) = continuation();
             let (quiet_activation, quiet_window_change);
             if wids.len() == 1 {
