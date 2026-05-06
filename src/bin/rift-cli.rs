@@ -140,6 +140,9 @@ enum WindowCommands {
     /// Move focus in a direction
     Focus {
         direction: String, // up, down, left, right
+        /// Activate (bring to foreground) the focused app
+        #[arg(long, default_value_t = false)]
+        activate: bool,
     },
     /// Toggle window floating state
     ToggleFloat,
@@ -555,9 +558,9 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
     match cmd {
         WindowCommands::Next => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::NextWindow))),
         WindowCommands::Prev => Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::PrevWindow))),
-        WindowCommands::Focus { direction } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::MoveFocus { direction: direction.into(), activate: false },
-        ))),
+        WindowCommands::Focus { direction, activate } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::MoveFocus { direction: direction.into(), activate }),
+        )),
         WindowCommands::ToggleFloat => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleWindowFloating,
         ))),

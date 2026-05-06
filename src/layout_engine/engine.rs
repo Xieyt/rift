@@ -548,7 +548,7 @@ impl LayoutEngine {
             focus_window,
             raise_windows: vec![],
             boundary_hit: None,
-            activate: false,
+            activate: focus_window.is_some(),
         }
     }
 
