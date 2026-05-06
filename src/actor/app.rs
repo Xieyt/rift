@@ -899,10 +899,11 @@ impl State {
             warn!(?this.pid, "Failed to activate app");
         }
 
+        if activate && make_key_result.is_ok() && is_standard {
+            let _ = this.running_app.activate();
+        }
+
         if !is_frontmost && make_key_result.is_ok() && is_standard {
-            if activate {
-                let _ = this.running_app.activate();
-            }
             let (tx, rx) = continuation();
             let (quiet_activation, quiet_window_change);
             if wids.len() == 1 {
