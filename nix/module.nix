@@ -40,6 +40,12 @@
           description = "Configuration settings for rift. Also accepts paths (string or path type) to a config file. If null, rift uses internal defaults.";
           default = null;
         };
+
+        logLevel = lib.mkOption {
+          type = lib.types.str;
+          default = "error,warn,info,rift_wm::actor::reactor=debug,rift_wm::layout_engine=debug,rift_wm::actor::raise_manager=debug";
+          description = "RUST_LOG value for rift. Supports per-module log levels.";
+        };
       };
 
       config = lib.mkIf cfg.enable {
@@ -91,7 +97,7 @@
               [ "/Applications/Rift.app/Contents/MacOS/rift" ]
               ++ lib.optionals (configFile != null) [ "--config" (toString configFile) ];
             EnvironmentVariables = {
-              RUST_LOG = "error,warn,info";
+              RUST_LOG = cfg.logLevel;
               # todo improve
               PATH = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
             };

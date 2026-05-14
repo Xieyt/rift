@@ -765,7 +765,12 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 .copied()
                 .unwrap_or((tiling.size.width * ratio).max(1.0));
             let start = column_starts.get(col_idx).copied().unwrap_or(0.0);
-            let x = anchor_x + start - offset;
+            let x_raw = anchor_x + start - offset;
+            let x = if x_raw + column_width <= screen.origin.x {
+                screen.origin.x - column_width
+            } else {
+                x_raw
+            };
             if col.windows.is_empty() {
                 continue;
             }
