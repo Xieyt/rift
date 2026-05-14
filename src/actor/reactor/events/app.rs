@@ -61,6 +61,15 @@ impl AppEventHandler {
         }
 
         reactor.handle_app_activation_workspace_switch(pid);
+
+        // Sync the layout engine's focused node to the newly-clicked window.
+        // Without this, move_focus (hyper+hjkl) navigates from wherever Rift last
+        // set focus rather than from the window the user just clicked.
+        if let Some(main_window) = reactor.main_window() {
+            if let Some(space) = reactor.main_window_space() {
+                reactor.send_layout_event(LayoutEvent::WindowFocused(space, main_window));
+            }
+        }
     }
 
     pub fn handle_windows_discovered(
