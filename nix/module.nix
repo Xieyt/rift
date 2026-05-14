@@ -13,6 +13,11 @@
 
       toml = pkgs.formats.toml { };
 
+      logRotateScript = pkgs.writeShellScript "rift-logrotate" ''
+        mkdir -p "${cfg.logDir}"
+        find "${cfg.logDir}" -name "*.log" -mmin +1440 -delete
+      '';
+
       configFile =
         if cfg.config == null then
           null
@@ -45,6 +50,11 @@
           type = lib.types.str;
           default = "error,warn,info,rift_wm::actor::reactor=debug,rift_wm::layout_engine=debug,rift_wm::actor::raise_manager=debug";
           description = "RUST_LOG value for rift. Supports per-module log levels.";
+        };
+
+        logDir = lib.mkOption {
+          type = lib.types.str;
+          description = "Directory for rift log files. Must be an absolute path.";
         };
       };
 
@@ -106,14 +116,24 @@
               SuccessfulExit = false;
               Crashed = true;
             };
-            # todo add _{user} to log file name
-            StandardOutPath = "/tmp/rift.out.log";
-            StandardErrorPath = "/tmp/rift.err.log";
+            StandardOutPath = "${cfg.logDir}/rift.out.log";
+            StandardErrorPath = "${cfg.logDir}/rift.err.log";
             ProcessType = "Interactive";
             LimitLoadToSessionType = "Aqua";
             Nice = -20;
           };
+        };
+
+        launchd.user.agents.rift-logrotate = {
+          serviceConfig = {
+            Label = "git.acsandmann.rift.logrotate";
+            ProgramArguments = [ "${logRotateScript}" ];
+            StartInterval = 3600;
+            RunAtLoad = true;
+            StandardOutPath = "/tmp/rift-logrotate.log";
+            StandardErrorPath = "/tmp/rift-logrotate.log";
+          };
+        };
       };
     };
-  };
 }
