@@ -772,14 +772,13 @@ impl LayoutEngine {
                 .filter_active_workspace_window(space, previous_selection)
                 .or_else(|| visible_windows.first().copied())
             {
-                let response = EventResponse {
+                let state_response = EventResponse {
                     focus_window: Some(fallback_focus),
-                    raise_windows: visible_windows,
+                    raise_windows: vec![],
                     boundary_hit: None,
                     activate: false,
                 };
-                self.apply_focus_response(space, ws_id, layout, &response);
-                return response;
+                self.apply_focus_response(space, ws_id, layout, &state_response);
             }
 
             EventResponse::default()
