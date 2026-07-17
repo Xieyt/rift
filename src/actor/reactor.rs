@@ -3637,6 +3637,7 @@ impl Reactor {
             raise_windows,
             mut focus_window,
             boundary_hit,
+            activate,
         } = response;
 
         if let Some(space) = workspace_switch_space
@@ -3831,6 +3832,7 @@ impl Reactor {
             focus_window: focus_window_with_warp,
             app_handles,
             focus_quiet,
+            activate,
         });
 
         if let Err(e) = self.communication_manager.raise_manager_tx.try_send(msg) {
@@ -4117,7 +4119,6 @@ impl Reactor {
         }
     }
 
-    #[instrument(skip(self))]
     fn clear_menu_state_for_pid(&mut self, pid: pid_t) {
         if matches!(self.menu_manager.menu_state, MenuState::Open(owner) if owner == pid) {
             debug!(pid, "Clearing menu-open state for deactivated app");

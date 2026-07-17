@@ -630,6 +630,11 @@ pub struct LayoutSettings {
     /// Scrolling layout configuration (niri-style columns)
     #[serde(default)]
     pub scrolling: ScrollingLayoutSettings,
+    /// Bring the focused window's application to the foreground when focus moves
+    /// (keyboard focus changes, workspace switches). Per-command `activate` flags
+    /// override this upward. Default: true.
+    #[serde(default = "yes")]
+    pub activate_on_focus: bool,
 }
 
 /// Layout mode enum

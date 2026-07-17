@@ -171,6 +171,9 @@ enum WindowCommands {
         /// Optional macOS window server ID for the target window
         #[arg(long, requires = "window_id")]
         window_server_id: Option<String>,
+        /// Activate (bring to foreground) the focused app
+        #[arg(long, default_value_t = false)]
+        activate: bool,
     },
     /// Toggle window floating state
     ToggleFloat,
@@ -662,9 +665,10 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
             direction,
             window_id,
             window_server_id,
+            activate,
         } => match (direction, window_id) {
             (Some(direction), None) => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-                LC::MoveFocus(parse_focus_direction(&direction)?),
+                LC::MoveFocus(layout::MoveFocusArgs { direction: parse_focus_direction(&direction)?, activate }),
             ))),
             (None, Some(window_id)) => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::FocusWindow {

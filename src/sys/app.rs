@@ -10,7 +10,10 @@ pub use nix::libc::pid_t;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{AnyThread, DefinedClass, define_class, exception, msg_send};
-use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication, NSWorkspace};
+use objc2_app_kit::{
+    NSApplicationActivationOptions, NSApplicationActivationPolicy, NSRunningApplication,
+    NSWorkspace,
+};
 use objc2_core_foundation::{CGRect, CGSize};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString, ns_string};
 use once_cell::sync::Lazy;
@@ -319,6 +322,7 @@ pub trait NSRunningApplicationExt {
     fn pid(&self) -> pid_t;
     fn bundle_id(&self) -> Option<Retained<NSString>>;
     fn localized_name(&self) -> Option<Retained<NSString>>;
+    fn activate(&self) -> bool;
 }
 
 impl NSRunningApplicationExt for NSRunningApplication {
@@ -331,6 +335,11 @@ impl NSRunningApplicationExt for NSRunningApplication {
     fn bundle_id(&self) -> Option<Retained<NSString>> { self.bundleIdentifier() }
 
     fn localized_name(&self) -> Option<Retained<NSString>> { self.localizedName() }
+
+    #[allow(deprecated)]
+    fn activate(&self) -> bool {
+        self.activateWithOptions(NSApplicationActivationOptions::ActivateIgnoringOtherApps)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
