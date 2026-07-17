@@ -38,13 +38,48 @@ struct WindowRemovalImpact {
     active_space: Option<SpaceId>,
 }
 
+/// Arguments for [`LayoutCommand::MoveFocus`].
+///
+/// Deserializes from either the bare direction (`move_focus = "left"` — the
+/// upstream default-config form, with `activate` defaulting to `false`) or the
+/// full table (`move_focus = { direction = "left", activate = true }`). The
+/// `activate` override forces app foregrounding even when
+/// `[settings.layout] activate_on_focus` is disabled.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct MoveFocusArgs {
+    pub direction: Direction,
+    pub activate: bool,
+}
+
+impl<'de> Deserialize<'de> for MoveFocusArgs {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(Direction),
+            Full {
+                direction: Direction,
+                #[serde(default)]
+                activate: bool,
+            },
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Bare(direction) => MoveFocusArgs { direction, activate: false },
+            Repr::Full { direction, activate } => MoveFocusArgs { direction, activate },
+        })
+    }
+}
+
 #[non_exhaustive]
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutCommand {
     NextWindow,
     PrevWindow,
-    MoveFocus(#[serde(rename = "direction")] Direction),
+    MoveFocus(MoveFocusArgs),
     Ascend,
     Descend,
     MoveNode(Direction),
@@ -137,6 +172,7 @@ pub struct EventResponse {
     pub raise_windows: Vec<WindowId>,
     pub focus_window: Option<WindowId>,
     pub boundary_hit: Option<Direction>,
+    pub activate: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -265,11 +301,12 @@ impl LayoutEngine {
         if raise_windows.is_empty() {
             EventResponse::default()
         } else {
-            EventResponse {
-                raise_windows,
-                focus_window: None,
-                boundary_hit: None,
-            }
+             EventResponse {
+                 raise_windows,
+                 focus_window: None,
+                 boundary_hit: None,
+                 activate: false,
+             }
         }
     }
 
@@ -605,16 +642,17 @@ impl LayoutEngine {
         self.update_active_floating_windows(window_store, space);
         self.broadcast_workspace_changed(space);
         self.broadcast_windows_changed(window_store, space);
-
+        let focus_window = self.preferred_focus_for_workspace(
+            window_store,
+            space,
+            workspace_id,
+            preferred_focus_window,
+        );
         EventResponse {
-            focus_window: self.preferred_focus_for_workspace(
-                window_store,
-                space,
-                workspace_id,
-                preferred_focus_window,
-            ),
+            focus_window,
             raise_windows: vec![],
             boundary_hit: None,
+            activate: self.layout_settings.activate_on_focus && focus_window.is_some(),
         }
     }
 
@@ -756,6 +794,7 @@ impl LayoutEngine {
                                 focus_window,
                                 raise_windows: vec![],
                                 boundary_hit: None,
+                                activate: false,
                             };
                             self.apply_focus_response(
                                 window_store,
@@ -791,6 +830,7 @@ impl LayoutEngine {
                     focus_window: tiled_windows.first().copied(),
                     raise_windows: tiled_windows,
                     boundary_hit: None,
+                    activate: false,
                 };
                 self.apply_focus_response(window_store, space, ws_id, layout, &response);
                 return response;
@@ -813,6 +853,7 @@ impl LayoutEngine {
                 focus_window,
                 raise_windows,
                 boundary_hit: None,
+                activate: false,
             };
             self.apply_focus_response(window_store, space, ws_id, layout, &response);
             response
@@ -852,6 +893,7 @@ impl LayoutEngine {
                         focus_window: Some(target_window),
                         raise_windows: windows_in_new_space,
                         boundary_hit: None,
+                        activate: false,
                     };
                     self.apply_focus_response(
                         window_store,
@@ -872,6 +914,7 @@ impl LayoutEngine {
                     focus_window,
                     raise_windows: vec![],
                     boundary_hit: None,
+                    activate: false,
                 };
                 self.apply_focus_response(window_store, space, ws_id, layout, &response);
                 return response;
@@ -891,6 +934,7 @@ impl LayoutEngine {
                     focus_window: Some(fallback_focus),
                     raise_windows: vec![],
                     boundary_hit: None,
+                    activate: false,
                 };
                 self.apply_focus_response(window_store, space, ws_id, layout, &response);
                 return response;
@@ -1644,6 +1688,7 @@ impl LayoutEngine {
                 raise_windows: vec![wid],
                 focus_window: Some(wid),
                 boundary_hit: None,
+                activate: false,
             };
         }
 
@@ -1678,6 +1723,7 @@ impl LayoutEngine {
                     raise_windows,
                     focus_window,
                     boundary_hit: None,
+                    activate: false,
                 };
                 self.apply_focus_response(window_store, space, workspace_id, layout, &response);
                 return response;
@@ -1694,6 +1740,7 @@ impl LayoutEngine {
                     raise_windows,
                     focus_window,
                     boundary_hit: None,
+                    activate: false,
                 };
                 self.apply_focus_response(window_store, space, workspace_id, layout, &response);
                 return response;
@@ -1730,6 +1777,7 @@ impl LayoutEngine {
                         focus_window: Some(windows[next]),
                         raise_windows: vec![windows[next]],
                         boundary_hit: None,
+                        activate: false,
                     };
                     self.apply_focus_response(window_store, space, workspace_id, layout, &response);
                     return response;
@@ -1744,17 +1792,18 @@ impl LayoutEngine {
                         focus_window,
                         raise_windows,
                         boundary_hit: None,
+                        activate: false,
                     };
                     self.apply_focus_response(window_store, space, workspace_id, layout, &response);
                     return response;
                 }
             }
-            LayoutCommand::MoveFocus(direction) => {
+            LayoutCommand::MoveFocus(MoveFocusArgs { direction, activate }) => {
                 debug!(
-                    "MoveFocus command received, direction: {:?}, is_floating: {}",
-                    direction, is_floating
+                    "MoveFocus command received, direction: {:?}, is_floating: {}, activate: {}",
+                    direction, is_floating, activate
                 );
-                return self.move_focus_internal(
+                let mut response = self.move_focus_internal(
                     window_store,
                     space,
                     visible_spaces,
@@ -1762,6 +1811,10 @@ impl LayoutEngine {
                     direction,
                     is_floating,
                 );
+                if activate || self.layout_settings.activate_on_focus {
+                    response.activate = true;
+                }
+                return response;
             }
             LayoutCommand::Ascend => {
                 if is_floating {
@@ -1819,6 +1872,7 @@ impl LayoutEngine {
                         raise_windows,
                         focus_window: None,
                         boundary_hit: None,
+                        activate: false,
                     }
                 }
             }
@@ -1833,6 +1887,7 @@ impl LayoutEngine {
                         raise_windows,
                         focus_window: None,
                         boundary_hit: None,
+                        activate: false,
                     }
                 }
             }
@@ -2446,6 +2501,7 @@ impl LayoutEngine {
                         focus_window: Some(focused_window),
                         raise_windows: vec![],
                         boundary_hit: None,
+                        activate: false,
                     };
                 } else if Some(current_workspace_id) == active_workspace {
                     self.focused_window = None;
@@ -2464,6 +2520,7 @@ impl LayoutEngine {
                             focus_window: Some(new_focus),
                             raise_windows: vec![],
                             boundary_hit: None,
+                            activate: false,
                         };
                     }
                 }
@@ -2521,6 +2578,7 @@ impl LayoutEngine {
                         None
                     },
                     boundary_hit: None,
+                    activate: false,
                 }
             }
             _ => EventResponse::default(),
@@ -2616,6 +2674,7 @@ impl LayoutEngine {
                 raise_windows: vec![window_id],
                 focus_window: Some(window_id),
                 boundary_hit: None,
+                activate: false,
             };
         }
 
@@ -2729,6 +2788,7 @@ impl LayoutEngine {
             raise_windows: vec![window_id],
             focus_window: Some(window_id),
             boundary_hit: None,
+            activate: false,
         }
     }
 
@@ -3222,7 +3282,7 @@ mod tests {
                 Some(current_space),
                 &visible_spaces,
                 &visible_space_centers,
-                LayoutCommand::MoveFocus(Direction::Right),
+                LayoutCommand::MoveFocus(MoveFocusArgs { direction: Direction::Right, activate: false }),
             )
         }));
 

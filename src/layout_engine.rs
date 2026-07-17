@@ -5,7 +5,7 @@ pub mod systems;
 pub mod utils;
 mod workspaces;
 
-pub use engine::{EventResponse, LayoutCommand, LayoutEngine, LayoutEvent, RestoreScope};
+pub use engine::{EventResponse, LayoutCommand, LayoutEngine, LayoutEvent, MoveFocusArgs, RestoreScope};
 pub(crate) use floating::FloatingManager;
 pub use graph::{Direction, LayoutKind, Orientation};
 pub(crate) use systems::LayoutId;
