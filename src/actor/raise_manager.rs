@@ -864,4 +864,117 @@ mod tests {
             }
         });
     }
+
+    fn raise_token_for(requests: &[Request], wid: WindowId) -> Option<CancellationToken> {
+        requests.iter().find_map(|r| match r {
+            Request::Raise(wids, token, _, _, _) if wids.contains(&wid) => Some(token.clone()),
+            _ => None,
+        })
+    }
+
+    // Guards the documented hang: on timeout the hung raises' token is cancelled,
+    // and the focus raise sent next MUST carry a fresh (live) token — otherwise the
+    // app rejects it as cancelled, never reports completion, and the manager blocks
+    // forever.
+    #[test]
+    fn timeout_installs_fresh_token_so_focus_raise_is_not_rejected() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, mut app_rx) = create_test_app_handles();
+
+            raise_manager.handle_message(create_layout_response(
+                vec![WindowId::new(1, 1)],
+                Some((WindowId::new(1, 2), None)),
+                app_handles,
+                Quiet::No,
+            ));
+
+            let initial = collect_requests(&mut app_rx);
+            let original = raise_token_for(&initial, WindowId::new(1, 1))
+                .expect("regular raise should have been sent");
+            assert!(!original.is_cancelled(), "token starts live");
+
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+
+            assert!(original.is_cancelled(), "the timed-out raise's token must be cancelled");
+
+            let after = collect_requests(&mut app_rx);
+            let focus_token = raise_token_for(&after, WindowId::new(1, 2))
+                .expect("focus raise should be sent after timeout");
+            assert!(
+                !focus_token.is_cancelled(),
+                "focus raise after timeout must use a live token"
+            );
+        });
+    }
+
+    // A hung focus raise must itself be able to time out; otherwise it blocks every
+    // future raise. The first timeout re-arms the window (timed_out reset) for the
+    // focus phase; the second timeout clears it and frees the manager.
+    #[test]
+    fn focus_phase_can_time_out_and_unblock_the_manager() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, _app_rx) = create_test_app_handles();
+
+            raise_manager.handle_message(create_layout_response(
+                vec![WindowId::new(1, 1)],
+                Some((WindowId::new(1, 2), None)),
+                app_handles,
+                Quiet::No,
+            ));
+
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            let sequence =
+                raise_manager.active_sequence.as_ref().expect("focus phase still active");
+            assert!(sequence.pending_raises.contains(&WindowId::new(1, 2)));
+            assert!(!sequence.timed_out, "timeout window must be re-armed for the focus phase");
+
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
+            assert!(
+                raise_manager.active_sequence.is_none(),
+                "focus-phase timeout must unblock the manager"
+            );
+        });
+    }
+
+    // Late/stale events for a sequence that is no longer active must not disturb the
+    // live sequence (out-of-order delivery during churn).
+    #[test]
+    fn stale_sequence_events_do_not_disturb_the_active_sequence() {
+        Executor::run(async {
+            let mut raise_manager = RaiseManager::new();
+            let (app_handles, _app_rx) = create_test_app_handles();
+
+            raise_manager.handle_message(create_layout_response(
+                vec![WindowId::new(1, 1)],
+                Some((WindowId::new(1, 2), None)),
+                app_handles,
+                Quiet::No,
+            ));
+            assert_eq!(raise_manager.active_sequence.as_ref().unwrap().pending_raises.len(), 1);
+
+            raise_manager.handle_message(Event::RaiseCompleted {
+                window_id: WindowId::new(1, 1),
+                sequence_id: 999,
+            });
+            assert!(
+                raise_manager
+                    .active_sequence
+                    .as_ref()
+                    .unwrap()
+                    .pending_raises
+                    .contains(&WindowId::new(1, 1)),
+                "stale completion must not clear a live pending raise"
+            );
+
+            raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 999 });
+            let sequence = raise_manager
+                .active_sequence
+                .as_ref()
+                .expect("active sequence must survive a stale timeout");
+            assert!(sequence.pending_raises.contains(&WindowId::new(1, 1)));
+            assert!(!sequence.timed_out);
+        });
+    }
 }
