@@ -128,6 +128,48 @@ install: build
       echo "  Privacy & Security → Accessibility, then \`just restart\`."
     fi
 
+# ---------------------------------------------------------------------------
+# fast dev loop — skip the hermetic `nix build` entirely
+# ---------------------------------------------------------------------------
+#
+# `nix build` recompiles the WHOLE rift-wm crate every time (the sandbox can't
+# see your working target/, so there's no incremental reuse) and then rebuilds
+# the .app bundle. For iterate-and-test that's the slow path.
+#
+# `dev-install` instead builds with plain `cargo` inside the nix dev shell
+# (reuses target/ incrementally — seconds after the first build), then swaps
+# ONLY the Mach-O into the existing /Applications/Rift.app and re-signs. This is
+# safe because TCC keys on the signing IDENTITY + --identifier, not the cdhash,
+# so the Accessibility grant survives an in-place binary swap.
+#
+# Requires a prior full `just install` to create the bundle. Default profile is
+# `release-fast` (opt-level 2, incremental); pass `dev` for the fastest compile.
+dev-install profile="release-fast":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -d "{{app}}" ]; then
+      echo "!! {{app}} missing — run \`just install\` once to create the bundle." >&2
+      exit 1
+    fi
+    echo "==> cargo build (--profile {{profile}}, incremental)"
+    nix develop -c cargo build --profile {{profile}} --bin rift --bin rift-cli
+    bin="target/{{profile}}/rift"
+    if security find-certificate -c "{{signing_cert}}" "{{sys_keychain}}" >/dev/null 2>&1; then
+      sign="{{signing_cert}}"
+    else
+      sign="-"
+      echo "!! '{{signing_cert}}' not in System keychain; signing ad-hoc (re-grant Accessibility)."
+    fi
+    echo "==> swapping {{app}}/Contents/MacOS/rift (sudo required)"
+    # atomic rename: the running process keeps its old inode; no mmap corruption.
+    tmp="{{app}}/Contents/MacOS/.rift.new"
+    sudo cp -f "$bin" "$tmp"
+    sudo mv -f "$tmp" "{{app}}/Contents/MacOS/rift"
+    sudo /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "{{app}}/Contents/MacOS/rift"
+    sudo /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "{{app}}"
+    just restart
+    echo "✓ rift swapped ({{profile}}) and restarted."
+
 # one-time: create a stable self-signed code-signing cert in the System keychain
 # so the Accessibility grant survives rebuilds. Requires admin.
 setup-signing-cert:

@@ -139,6 +139,16 @@ EOF
         packages = [
           toolchain
         ];
+        # nixpkgs' apple-sdk doesn't ship libiconv, and unlike the crane build
+        # (clangStdenv injects it via NIX_LDFLAGS) the devshell has to add it
+        # itself — otherwise ambient `cargo build`/`test` fail to LINK with
+        # `ld: library 'iconv' not found`. Prepend it to the SDK's LIBRARY_PATH.
+        env = [
+          {
+            name = "LIBRARY_PATH";
+            prefix = "${pkgs.libiconv}/lib";
+          }
+        ];
         commands = [
           {
             help = "";
