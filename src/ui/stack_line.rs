@@ -3,8 +3,9 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2_app_kit::NSNormalWindowLevel;
+use objc2_foundation::NSString;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
-use objc2_quartz_core::CALayer;
+use objc2_quartz_core::{CALayer, CATextLayer};
 use tracing::warn;
 
 use crate::actor::app::WindowId;
@@ -33,6 +34,18 @@ impl Color {
     pub fn to_nscolor(&self) -> Retained<objc2_app_kit::NSColor> {
         objc2_app_kit::NSColor::colorWithRed_green_blue_alpha(self.r, self.g, self.b, self.a)
     }
+
+    /// Parse `#RRGGBB` or `#RRGGBBAA` (case-insensitive, leading `#` optional).
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.trim().trim_start_matches('#');
+        let (r, g, b, a): (&str, &str, &str, &str) = match s.len() {
+            6 => (&s[0..2], &s[2..4], &s[4..6], "ff"),
+            8 => (&s[0..2], &s[2..4], &s[4..6], &s[6..8]),
+            _ => return None,
+        };
+        let p = |h: &str| u8::from_str_radix(h, 16).ok().map(|v| v as f64 / 255.0);
+        Some(Self::new(p(r)?, p(g)?, p(b)?, p(a)?))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +58,10 @@ pub struct IndicatorConfig {
     pub horizontal_placement: HorizontalPlacement,
     pub vertical_placement: VerticalPlacement,
     pub spacing: f64,
+    pub show_titles: bool,
+    pub active_title_color: Color,
+    pub inactive_title_color: Color,
+    pub font_size: Option<f64>,
 }
 
 impl Default for IndicatorConfig {
@@ -58,21 +75,33 @@ impl Default for IndicatorConfig {
             horizontal_placement: HorizontalPlacement::Top,
             vertical_placement: VerticalPlacement::Right,
             spacing: 4.0,
+            show_titles: false,
+            active_title_color: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
+            inactive_title_color: Color { r: 0.72, g: 0.72, b: 0.75, a: 1.0 },
+            font_size: None,
         }
     }
 }
 
 impl From<&crate::common::config::StackLineSettings> for IndicatorConfig {
     fn from(config: &crate::common::config::StackLineSettings) -> Self {
+        let hex = |s: &Option<String>, d: Color| s.as_deref().and_then(Color::from_hex).unwrap_or(d);
         Self {
             bar_thickness: config.thickness,
-            selected_color: Color::blue(),
-            unselected_color: Color::light_gray(),
-            border_color: Color::gray(),
+            selected_color: hex(&config.active_color, Color::new(0.26, 0.53, 0.98, 0.55)),
+            unselected_color: hex(&config.inactive_color, Color::new(0.12, 0.12, 0.14, 0.92)),
+            border_color: Color::new(0.0, 0.0, 0.0, 0.25),
             border_width: 0.5,
             horizontal_placement: config.horiz_placement,
             vertical_placement: config.vert_placement,
             spacing: config.spacing,
+            show_titles: config.show_titles,
+            active_title_color: hex(&config.active_title_color, Color::new(1.0, 1.0, 1.0, 1.0)),
+            inactive_title_color: hex(
+                &config.inactive_title_color,
+                Color::new(0.72, 0.72, 0.75, 1.0),
+            ),
+            font_size: config.font_size,
         }
     }
 }
@@ -96,6 +125,7 @@ pub struct GroupDisplayData {
     pub total_count: usize,
     pub selected_index: usize,
     pub window_ids: Vec<WindowId>,
+    pub titles: Vec<String>,
 }
 
 pub type SegmentClickCallback = Rc<dyn Fn(usize)>;
@@ -109,6 +139,7 @@ struct IndicatorState {
     click_callback: Option<SegmentClickCallback>,
     space_id: Option<SpaceId>,
     is_visible: bool,
+    text_layers: Vec<Retained<CATextLayer>>,
 }
 
 impl IndicatorState {
@@ -122,6 +153,7 @@ impl IndicatorState {
             click_callback: None,
             space_id: None,
             is_visible: false,
+            text_layers: Vec::new(),
         }
     }
 }
@@ -136,6 +168,9 @@ pub struct GroupIndicatorWindow {
 impl GroupIndicatorWindow {
     pub fn new(frame: CGRect, config: IndicatorConfig) -> Result<Self, CgsWindowError> {
         let root_layer = CALayer::layer();
+        // CGS window content renders in a bottom-left origin; flip so text
+        // (and everything else) draws upright, matching the layout coordinates.
+        root_layer.setGeometryFlipped(true);
         root_layer.setFrame(CGRect::new(
             CGPoint::new(0.0, 0.0),
             CGSize::new(frame.size.width, frame.size.height),
@@ -275,6 +310,7 @@ impl GroupIndicatorWindow {
         let mut state = self.state.borrow_mut();
         state.background_layer = None;
         state.separator_layers.clear();
+        state.text_layers.clear();
         state.selected_layer = None;
     }
 
@@ -299,6 +335,11 @@ impl GroupIndicatorWindow {
             self.update_separator_layers(&group_data, adjusted_bounds);
 
             self.update_selected_layer(&group_data, bounds);
+            if config.show_titles {
+                self.update_title_layers(&group_data, adjusted_bounds, config);
+            } else {
+                self.clear_text_layers();
+            }
         });
     }
 
@@ -673,8 +714,108 @@ impl GroupIndicatorWindow {
         }
     }
 
+    fn clear_text_layers(&self) {
+        let mut state = self.state.borrow_mut();
+        for layer in state.text_layers.drain(..) {
+            layer.removeFromSuperlayer();
+        }
+    }
+
+    fn ensure_text_layers(&self, count: usize) {
+        let mut state = self.state.borrow_mut();
+        while state.text_layers.len() > count {
+            if let Some(layer) = state.text_layers.pop() {
+                layer.removeFromSuperlayer();
+            }
+        }
+        while state.text_layers.len() < count {
+            let layer = CATextLayer::layer();
+            self.root_layer.addSublayer(&layer);
+            state.text_layers.push(layer);
+        }
+    }
+
+    /// Render each window's title centered in its tab segment (niri-style
+    /// tabbed columns). Only meaningful for stacked groups; the segment
+    /// geometry mirrors `calculate_segment_frame` so labels line up with the
+    /// selected-segment highlight and click hit-testing.
+    fn update_title_layers(
+        &self,
+        group_data: &GroupDisplayData,
+        bounds: CGRect,
+        config: IndicatorConfig,
+    ) {
+        self.ensure_text_layers(group_data.total_count);
+
+        let font_size = config
+            .font_size
+            .unwrap_or_else(|| (config.bar_thickness * 0.6).clamp(8.0, 15.0));
+        let state = self.state.borrow();
+        for (index, layer) in state.text_layers.iter().enumerate() {
+            let seg = Self::calculate_segment_frame(group_data, bounds, index);
+            let inset = 3.0;
+            let text_frame = CGRect::new(
+                CGPoint::new(seg.origin.x + inset, seg.origin.y),
+                CGSize::new((seg.size.width - 2.0 * inset).max(0.0), seg.size.height),
+            );
+            layer.setFrame(text_frame);
+
+            let title = group_data.titles.get(index).map(String::as_str).unwrap_or("");
+            let ns = NSString::from_str(title);
+            unsafe {
+                layer.setString(Some(&ns));
+            }
+            layer.setFontSize(font_size);
+            layer.setWrapped(false);
+            layer.setAlignmentMode(unsafe { objc2_quartz_core::kCAAlignmentCenter });
+            layer.setTruncationMode(unsafe { objc2_quartz_core::kCATruncationEnd });
+            layer.setContentsScale(2.0);
+
+            let tc = if index == group_data.selected_index {
+                config.active_title_color
+            } else {
+                config.inactive_title_color
+            };
+            let cg = tc.to_nscolor().CGColor();
+            layer.setForegroundColor(Some(&cg));
+            layer.setZPosition(10.0);
+        }
+    }
+
     fn present(&self) {
         let frame = *self.frame.borrow();
         render_layer_to_cgs_window(self.cgs_window.id(), frame.size, &self.root_layer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn horizontal_group(n: usize) -> GroupDisplayData {
+        GroupDisplayData {
+            group_kind: GroupKind::Horizontal,
+            total_count: n,
+            selected_index: 0,
+            window_ids: Vec::new(),
+            titles: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn tab_segments_tile_the_bar_without_gaps_or_overlap() {
+        let bar = CGRect::new(CGPoint::new(10.0, 5.0), CGSize::new(300.0, 6.0));
+        let data = horizontal_group(3);
+        let mut prev_end = bar.origin.x;
+        for i in 0..data.total_count {
+            let seg = GroupIndicatorWindow::calculate_segment_frame(&data, bar, i);
+            assert!((seg.origin.x - prev_end).abs() < 1.5, "segment {i} abuts previous");
+            assert!(seg.size.width > 0.0, "segment {i} has positive width");
+            prev_end = seg.origin.x + seg.size.width;
+        }
+        assert!(
+            (prev_end - (bar.origin.x + bar.size.width)).abs() < 1.5,
+            "segments span the full bar width"
+        );
     }
 }

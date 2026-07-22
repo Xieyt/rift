@@ -196,6 +196,16 @@ vert_placement = "left"
 thickness = 20.0
 # spacing between the stack line and window edges (in px)
 spacing = 1.0
+# draw window titles as tab labels on the indicator (niri-style tabbed columns);
+# needs a larger `thickness` (20+) to fit text
+show_titles = false
+# tab-bar colors (hex "#RRGGBB" or "#RRGGBBAA"); unset uses built-in defaults
+# (dark bar + accent-blue active tab). uncomment to customize:
+# active_color = "#3d7bfaee"          # focused tab fill
+# inactive_color = "#1f1f24ee"        # bar background
+# active_title_color = "#ffffff"      # focused tab label
+# inactive_title_color = "#b8b8be"    # other tab labels
+# font_size = 13.0                    # title size (default ~60% of thickness)
 
 # experimental mission control
 [settings.ui.mission_control]

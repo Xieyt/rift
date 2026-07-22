@@ -326,8 +326,25 @@ impl LayoutManager {
                             total_count: g.total_count,
                             selected_index: g.selected_index,
                             window_ids: g.window_ids.clone(),
+                            titles: g
+                                .window_ids
+                                .iter()
+                                .map(|wid| {
+                                    reactor
+                                        .state
+                                        .windows
+                                        .window(*wid)
+                                        .map(|w| w.info.title.clone())
+                                        .unwrap_or_default()
+                                })
+                                .collect(),
                         })
                         .collect();
+                    tracing::debug!(
+                        "stack_line feed: {} group(s) for space {:?}",
+                        groups.len(),
+                        space
+                    );
                     let active_space_ids: Vec<crate::sys::screen::SpaceId> =
                         reactor.iter_active_spaces().collect();
 

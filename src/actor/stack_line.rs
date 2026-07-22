@@ -36,6 +36,7 @@ pub struct GroupInfo {
     pub total_count: usize,
     pub selected_index: usize,
     pub window_ids: Vec<WindowId>,
+    pub titles: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -126,6 +127,17 @@ impl StackLine {
 
     #[instrument(name = "stack_line::handle_event", skip(self))]
     fn handle_event(&mut self, event: Event) {
+        tracing::debug!(
+            enabled = self.is_enabled(),
+            kind = match &event {
+                Event::GroupsUpdated { groups, .. } => format!("GroupsUpdated({})", groups.len()),
+                Event::ConfigUpdated(_) => "ConfigUpdated".to_string(),
+                Event::SpaceStateUpdated(..) => "SpaceStateUpdated".to_string(),
+                Event::MouseDown(_) => "MouseDown".to_string(),
+                Event::MouseMoved { .. } => "MouseMoved".to_string(),
+            },
+            "stack_line handle_event"
+        );
         if !self.is_enabled()
             && !matches!(
                 event,
@@ -365,6 +377,7 @@ impl StackLine {
             total_count: group.total_count,
             selected_index: group.selected_index,
             window_ids: group.window_ids,
+            titles: group.titles,
         };
 
         let indicator_frame = Self::calculate_indicator_frame(
@@ -404,7 +417,10 @@ impl StackLine {
         tracing::debug!(
             ?group.frame,
             ?indicator_frame,
-            "Positioned indicator"
+            ?group_kind,
+            spacing = config.spacing,
+            thickness = config.bar_thickness,
+            "stack_line positioned indicator"
         );
     }
 
@@ -472,6 +488,7 @@ struct GroupSig {
     total: usize,
     selected_index: usize,
     window_ids: Vec<WindowId>,
+    titles: Vec<String>,
 }
 
 impl GroupSig {
@@ -487,6 +504,7 @@ impl GroupSig {
             total: g.total_count,
             selected_index: g.selected_index,
             window_ids: g.window_ids.clone(),
+            titles: g.titles.clone(),
         }
     }
 }

@@ -565,6 +565,24 @@ pub struct StackLineSettings {
     /// This creates spacing between the window and the stack line
     #[serde(default = "default_stack_line_spacing")]
     pub spacing: f64,
+    /// Draw window titles as tab labels on the stack-line indicator
+    /// (niri-style tabbed columns). Needs a larger `thickness` to fit text.
+    #[serde(default = "no")]
+    pub show_titles: bool,
+    /// Indicator colors as hex ("#RRGGBB" or "#RRGGBBAA"); unset uses built-in
+    /// defaults. `active_color` = focused-tab fill, `inactive_color` = bar
+    /// background, `active_title_color` / `inactive_title_color` = tab labels.
+    #[serde(default)]
+    pub active_color: Option<String>,
+    #[serde(default)]
+    pub inactive_color: Option<String>,
+    #[serde(default)]
+    pub active_title_color: Option<String>,
+    #[serde(default)]
+    pub inactive_title_color: Option<String>,
+    /// Title font size in points; unset defaults to ~60% of `thickness` (8–15).
+    #[serde(default)]
+    pub font_size: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
