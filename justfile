@@ -144,7 +144,7 @@ install: build
 #
 # Requires a prior full `just install` to create the bundle. Default profile is
 # `release-fast` (opt-level 2, incremental); pass `dev` for the fastest compile.
-dev-install profile="release-fast":
+dev-install profile="release-fast" config="dev-config.toml":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -d "{{app}}" ]; then
@@ -167,8 +167,44 @@ dev-install profile="release-fast":
     sudo mv -f "$tmp" "{{app}}/Contents/MacOS/rift"
     sudo /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "{{app}}/Contents/MacOS/rift"
     sudo /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "{{app}}"
-    just restart
-    echo "✓ rift swapped ({{profile}}) and restarted."
+    # Point the launch agent at a repo-local test config via `--config`, so you can
+    # iterate on keybinds/settings without touching your real ~/.config. Editing the
+    # file hot-reloads (hot_reload=true in it); only a config-PATH change needs the
+    # bootout/bootstrap below (kickstart won't pick up new ProgramArguments).
+    plist="$HOME/Library/LaunchAgents/git.acsandmann.rift.plist"
+    cfg=""
+    if [ -n "{{config}}" ] && [ -f "{{config}}" ]; then
+      cfg="$(cd "$(dirname "{{config}}")" && pwd)/$(basename "{{config}}")"
+    fi
+    if [ -n "$cfg" ] && [ -f "$plist" ]; then
+      current="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$plist" 2>/dev/null || echo '')"
+      if [ "$current" != "$cfg" ]; then
+        echo "==> pointing launch agent at $cfg (reloading agent)"
+        chmod u+w "$plist"
+        /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' "$plist"
+        /usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string {{app}}/Contents/MacOS/rift" "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:1 string --config' "$plist"
+        /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $cfg" "$plist"
+        # bootout is async; bootstrapping before teardown finishes returns EIO(5).
+        # Poll until the service is gone, then bootstrap (retry once on a lingering race).
+        launchctl bootout {{agent}} 2>/dev/null || true
+        for _ in $(seq 1 50); do
+          launchctl print {{agent}} >/dev/null 2>&1 || break
+          sleep 0.1
+        done
+        launchctl bootstrap gui/{{uid}} "$plist" 2>/dev/null \
+          || { sleep 0.5; launchctl bootstrap gui/{{uid}} "$plist"; }
+        echo "✓ rift swapped ({{profile}}), config=$cfg, agent reloaded."
+      else
+        just restart
+        echo "✓ rift swapped ({{profile}}), config=$cfg, restarted."
+      fi
+    else
+      [ -n "{{config}}" ] && [ -z "$cfg" ] && echo "note: config '{{config}}' not found; using the agent's existing --config."
+      just restart
+      echo "✓ rift swapped ({{profile}}) and restarted."
+    fi
 
     # Reload hyperkey launch agent (workaround for it not restarting cleanly)
     launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
@@ -217,6 +253,12 @@ status:
 # follow the logs
 logs:
     tail -f /tmp/rift.err.log /tmp/rift.out.log
+
+# probe REAL on-screen window geometry from the window server (ground truth).
+# Detects tile overlaps; with --rift, diffs Rift's intended frames vs reality.
+# e.g. `just probe`  |  `just probe --app Emacs alacritty`  |  `just probe --rift`
+probe *ARGS:
+    uv run scripts/wm-probe.py {{ARGS}}
 
 # ---------------------------------------------------------------------------
 # fork maintenance (see FORK.md)
