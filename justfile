@@ -170,6 +170,10 @@ dev-install profile="release-fast":
     just restart
     echo "✓ rift swapped ({{profile}}) and restarted."
 
+    # Reload hyperkey launch agent (workaround for it not restarting cleanly)
+    launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
+
 # one-time: create a stable self-signed code-signing cert in the System keychain
 # so the Accessibility grant survives rebuilds. Requires admin.
 setup-signing-cert:
