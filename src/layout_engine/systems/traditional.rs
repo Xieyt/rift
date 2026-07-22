@@ -5396,4 +5396,73 @@ mod tests {
             .expect("right node proportion missing");
         assert_eq!(before, after);
     }
+
+    use crate::common::config::GapSettings;
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// A split-only (no stacks/fullscreen) traditional layout partitions the
+        /// tiling area: every window stays within bounds, no two windows overlap,
+        /// and their areas sum to the tiling area (zero gaps).
+        #[test]
+        fn traditional_tiles_partition_the_area(
+            n in 1usize..=6,
+            sw in 400i64..=2000,
+            sh in 400i64..=2000,
+        ) {
+            let mut system = TraditionalLayoutSystem::default();
+            let layout = system.create_layout();
+            let root = system.root(layout);
+            system.tree.data.layout.set_kind(root, LayoutKind::Horizontal);
+            let ids: Vec<WindowId> = (1..=n as u32).map(w).collect();
+            for &id in &ids {
+                system.add_window_after_selection(layout, id);
+            }
+
+            let scr = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(sw as f64, sh as f64));
+            let gaps = GapSettings::default();
+            let frames: HashMap<WindowId, CGRect> = system
+                .calculate_layout(
+                    layout, scr, 0.0, &Default::default(), &gaps, 0.0,
+                    Default::default(), Default::default(),
+                )
+                .into_iter()
+                .collect();
+            let tiling = compute_tiling_area(scr, &gaps);
+
+            prop_assert_eq!(frames.len(), n, "every window laid out");
+
+            let eps = 1.5;
+            let rects: Vec<CGRect> = ids.iter().map(|id| *frames.get(id).unwrap()).collect();
+            for r in &rects {
+                prop_assert!(r.origin.x + eps >= tiling.origin.x, "spills left: {:?}", r);
+                prop_assert!(r.origin.y + eps >= tiling.origin.y, "spills top: {:?}", r);
+                prop_assert!(
+                    r.origin.x + r.size.width <= tiling.origin.x + tiling.size.width + eps,
+                    "spills right: {:?}", r
+                );
+                prop_assert!(
+                    r.origin.y + r.size.height <= tiling.origin.y + tiling.size.height + eps,
+                    "spills bottom: {:?}", r
+                );
+            }
+            for i in 0..rects.len() {
+                for j in (i + 1)..rects.len() {
+                    let a = rects[i];
+                    let b = rects[j];
+                    let ox = (a.origin.x + a.size.width).min(b.origin.x + b.size.width)
+                        - a.origin.x.max(b.origin.x);
+                    let oy = (a.origin.y + a.size.height).min(b.origin.y + b.size.height)
+                        - a.origin.y.max(b.origin.y);
+                    prop_assert!(ox <= eps || oy <= eps, "windows overlap: {:?} and {:?}", a, b);
+                }
+            }
+            let sum: f64 = rects.iter().map(|r| r.size.width * r.size.height).sum();
+            let area = tiling.size.width * tiling.size.height;
+            let tol = (n as f64) * (sw as f64 + sh as f64);
+            prop_assert!((sum - area).abs() <= tol, "areas don't cover tiling: sum={} area={}", sum, area);
+        }
+    }
 }

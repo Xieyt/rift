@@ -2911,4 +2911,66 @@ mod tests {
         assert!((w1_frame2.size.width - 400.0).abs() < 1.0);
         assert!((w2_frame2.size.width - 400.0).abs() < 1.0);
     }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(200))]
+
+        /// Freshly-added single-window columns form a contiguous, non-overlapping
+        /// horizontal strip: each column starts exactly `gap_x` after the previous
+        /// one ends, every column fills the tiling height, and focus is always
+        /// resolvable. Offset-invariant (scrolling shifts the whole strip, not the
+        /// relative spacing).
+        #[test]
+        fn scrolling_columns_are_contiguous_and_non_overlapping(
+            n in 1usize..=6,
+            sw in 600i64..=3000,
+            sh in 400i64..=2000,
+            gx in 0i64..=20,
+            gy in 0i64..=20,
+            ratio in 0.3f64..=0.9,
+        ) {
+            let mut settings = ScrollingLayoutSettings::default();
+            settings.column_width_ratio = ratio;
+            let mut system = ScrollingLayoutSystem::new(&settings);
+            let layout = system.create_layout();
+            let ids: Vec<WindowId> = (1..=n as u32).map(|i| wid(1, i)).collect();
+            for &id in &ids {
+                system.add_window_after_selection(layout, id);
+            }
+
+            let mut gaps = GapSettings::default();
+            gaps.inner.horizontal = gx as f64;
+            gaps.inner.vertical = gy as f64;
+            let scr = screen(sw as f64, sh as f64);
+            let tiling = compute_tiling_area(scr, &gaps);
+            let frames = render(&system, layout, scr, &gaps);
+
+            prop_assert_eq!(frames.len(), n, "every window is laid out");
+            prop_assert!(system.selected_window(layout).is_some(), "focus resolvable");
+
+            let mut rects: Vec<CGRect> = ids.iter().map(|id| frame_for(&frames, *id)).collect();
+            rects.sort_by(|a, b| a.origin.x.partial_cmp(&b.origin.x).unwrap());
+
+            let eps = 1.5;
+            for pair in rects.windows(2) {
+                let (cur, next) = (pair[0], pair[1]);
+                let cur_right = cur.origin.x + cur.size.width;
+                prop_assert!(
+                    next.origin.x + eps >= cur_right,
+                    "columns overlap: {:?} then {:?}", cur, next
+                );
+                let gap = next.origin.x - cur_right;
+                prop_assert!(
+                    (gap - gx as f64).abs() <= eps,
+                    "columns not contiguous: gap={} expected={}", gap, gx
+                );
+            }
+            for r in &rects {
+                prop_assert!((r.origin.y - tiling.origin.y).abs() <= eps, "not top-aligned: {:?}", r);
+                prop_assert!((r.size.height - tiling.size.height).abs() <= eps, "not full height: {:?}", r);
+            }
+        }
+    }
 }

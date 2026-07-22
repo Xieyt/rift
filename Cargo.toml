@@ -186,3 +186,4 @@ tokio = { version = "1.35.1", features = ["sync", "tokio-macros"] }
 test-log = { version = "0.2.16", default-features = false }
 test_bin = "0.5.0"
 tempfile = { version = "3.17.1", default-features = false }
+proptest = "1"
