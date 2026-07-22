@@ -194,6 +194,8 @@ horiz_placement = "top"
 vert_placement = "left"
 # how thick the indicator will be (in px)
 thickness = 20.0
+# outline thickness of the indicator + active tab (in px); 0 disables the outline
+border_width = 0.5
 # spacing between the stack line and window edges (in px)
 spacing = 1.0
 # draw window titles as tab labels on the indicator (niri-style tabbed columns);

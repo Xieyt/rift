@@ -695,8 +695,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
         _stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
-        _stack_line_thickness: f64,
-        _stack_line_horiz: crate::common::config::HorizontalPlacement,
+        stack_line_thickness: f64,
+        stack_line_horiz: crate::common::config::HorizontalPlacement,
         _stack_line_vert: crate::common::config::VerticalPlacement,
     ) -> Vec<(WindowId, CGRect)> {
         let Some(state) = self.layouts.get(layout) else {
@@ -911,18 +911,25 @@ impl LayoutSystem for ScrollingLayoutSystem {
             }
             if col.tabbed && col.windows.len() > 1 {
                 // Tabbed column (niri-style): all windows overlap on one frame and
-                // the focused one is raised on top. Reserve a strip at the top for
-                // the stack-line tab bar so the indicator isn't occluded by the
-                // focused window; the bar itself is drawn from `tab_groups`.
-                let bar = _stack_line_thickness.max(0.0);
-                // Frame the indicator sits on (full column, top-aligned).
+                // the focused one is raised on top. Reserve a strip for the
+                // stack-line tab bar (top or bottom per `horiz_placement`) so the
+                // indicator isn't occluded by the focused window; the bar itself is
+                // drawn from `tab_groups`.
+                let bar = stack_line_thickness.max(0.0);
+                // Frame the indicator sits on (full column).
                 let group_frame = CGRect::new(
                     CGPoint::new(x.round(), tiling.origin.y.round()),
                     CGSize::new(column_width.round(), tiling.size.height.round()),
                 );
-                // Windows sit below the reserved bar strip.
+                // Windows occupy the column minus the reserved bar strip. For a
+                // top bar they start below it; for a bottom bar they stay at the
+                // top and the strip is left free at the bottom.
+                let win_y = match stack_line_horiz {
+                    crate::common::config::HorizontalPlacement::Top => tiling.origin.y + bar,
+                    crate::common::config::HorizontalPlacement::Bottom => tiling.origin.y,
+                };
                 let win_frame = CGRect::new(
-                    CGPoint::new(x.round(), (tiling.origin.y + bar).round()),
+                    CGPoint::new(x.round(), win_y.round()),
                     CGSize::new(
                         column_width.round(),
                         (tiling.size.height - bar).max(1.0).round(),
@@ -1103,7 +1110,18 @@ impl LayoutSystem for ScrollingLayoutSystem {
         }
         let raise = state
             .selected_location()
-            .map(|(col_idx, _)| state.columns[col_idx].windows.clone())
+            .map(|(col_idx, _)| {
+                let col = &state.columns[col_idx];
+                if col.tabbed && col.windows.len() > 1 {
+                    // Tabbed column: every window overlaps on one frame. Raising the
+                    // whole column flashes each hidden tab to the front in turn before
+                    // focus settles on the selected one -> visible flicker. Only the
+                    // selected tab needs to come forward; the rest stay occluded.
+                    new_sel.into_iter().collect()
+                } else {
+                    col.windows.clone()
+                }
+            })
             .unwrap_or_default();
         (new_sel, raise)
     }
@@ -1855,6 +1873,153 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].windows, vec![w1, w2]);
         assert_eq!(groups[0].selected, 1);
+    }
+
+    #[test]
+    fn move_focus_in_tabbed_column_raises_only_selected_tab() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        let w3 = wid(1, 3);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![Column {
+                windows: vec![w1, w2, w3],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0, 1.0],
+                tabbed: true,
+                active: None,
+            }];
+            state.selected = Some(w1);
+        }
+
+        // Tab windows overlap on one frame; raising the whole column would flash
+        // each hidden tab to the front in turn (visible flicker). Only the newly
+        // selected tab may be raised.
+        let (focus, raise) = system.move_focus(layout, Direction::Down);
+        assert_eq!(focus, Some(w2));
+        assert_eq!(raise, vec![w2], "tabbed column raises only the selected tab");
+    }
+
+    #[test]
+    fn move_focus_in_plain_column_raises_whole_column() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![Column {
+                windows: vec![w1, w2],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0],
+                tabbed: false,
+                active: None,
+            }];
+            state.selected = Some(w1);
+        }
+
+        // A non-tabbed column stacks windows without overlap, so bringing the
+        // whole column forward is correct and does not flicker.
+        let (focus, raise) = system.move_focus(layout, Direction::Down);
+        assert_eq!(focus, Some(w2));
+        assert_eq!(raise, vec![w1, w2], "plain column raises all its windows");
+    }
+
+    #[test]
+    fn tabbed_reserve_strip_follows_horiz_placement() {
+        use crate::common::config::{HorizontalPlacement, VerticalPlacement};
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![Column {
+                windows: vec![w1, w2],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0],
+                tabbed: true,
+                active: None,
+            }];
+            state.selected = Some(w1);
+        }
+
+        let gaps = GapSettings::default();
+        let scr = screen(1000.0, 800.0);
+        let tiling = compute_tiling_area(scr, &gaps);
+        let bar = 26.0;
+        let constraints = HashMap::default();
+
+        // Top bar: windows are pushed below the reserved strip.
+        let top = system.calculate_layout(
+            layout,
+            scr,
+            0.0,
+            &constraints,
+            &gaps,
+            bar,
+            HorizontalPlacement::Top,
+            VerticalPlacement::Left,
+        );
+        let top_f = frame_for(&top, w1);
+        assert!(
+            (top_f.origin.y - (tiling.origin.y + bar)).abs() <= 1.0,
+            "top bar pushes windows below the strip"
+        );
+
+        // Bottom bar: windows stay at the top; the strip is reserved at the bottom.
+        let bottom = system.calculate_layout(
+            layout,
+            scr,
+            0.0,
+            &constraints,
+            &gaps,
+            bar,
+            HorizontalPlacement::Bottom,
+            VerticalPlacement::Left,
+        );
+        let bot_f = frame_for(&bottom, w1);
+        assert!(
+            (bot_f.origin.y - tiling.origin.y).abs() <= 1.0,
+            "bottom bar keeps windows at the top"
+        );
+        assert!(
+            (bot_f.size.height - (tiling.size.height - bar)).abs() <= 1.0,
+            "bottom bar still reserves the strip height"
+        );
+    }
+
+    #[test]
+    fn expel_from_tabbed_column_removes_only_selected() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        let w3 = wid(1, 3);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![Column {
+                windows: vec![w1, w2, w3],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0, 1.0],
+                tabbed: true,
+                active: None,
+            }];
+            state.selected = Some(w2);
+        }
+
+        // Expel the selected tab (w2). Only w2 should leave; w1+w3 remain together
+        // in the still-tabbed column. One expel must NOT dissolve the whole group.
+        system.consume_or_expel_selection(layout, Direction::Right);
+
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.columns.len(), 2, "one expel yields exactly two columns");
+        let multi: Vec<_> = state.columns.iter().filter(|c| c.windows.len() > 1).collect();
+        assert_eq!(multi.len(), 1, "the remaining windows stay in one column");
+        assert_eq!(multi[0].windows, vec![w1, w3]);
+        assert!(multi[0].tabbed, "remaining column stays tabbed");
     }
 
     #[test]

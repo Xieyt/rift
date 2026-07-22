@@ -557,6 +557,10 @@ pub struct StackLineSettings {
     pub enabled: bool,
     #[serde(default = "default_stack_line_thickness")]
     pub thickness: f64,
+    /// Outline thickness (in px) of the indicator background and the active-tab
+    /// segment. 0 disables the outline.
+    #[serde(default = "default_stack_line_border_width")]
+    pub border_width: f64,
     #[serde(default)]
     pub horiz_placement: HorizontalPlacement,
     #[serde(default)]
@@ -1205,6 +1209,7 @@ fn default_overscroll_threshold() -> f64 { 0.625 }
 
 fn default_stack_line_spacing() -> f64 { 1.0 }
 fn default_stack_line_thickness() -> f64 { 20.0 }
+fn default_stack_line_border_width() -> f64 { 0.5 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]

@@ -452,8 +452,8 @@ impl StackLine {
         group_frame: CGRect,
         group_kind: GroupKind,
         thickness: f64,
-        _horizontal_placement: HorizontalPlacement,
-        _vertical_placement: VerticalPlacement,
+        horizontal_placement: HorizontalPlacement,
+        vertical_placement: VerticalPlacement,
         spacing: f64,
     ) -> CGRect {
         let min_size = thickness * 2.0;
@@ -461,14 +461,34 @@ impl StackLine {
         let adjusted_height = group_frame.size.height.max(min_size);
 
         match group_kind {
-            GroupKind::Horizontal => CGRect::new(
-                CGPoint::new(group_frame.origin.x, group_frame.origin.y - spacing),
-                CGSize::new(adjusted_width, thickness),
-            ),
-            GroupKind::Vertical => CGRect::new(
-                CGPoint::new(group_frame.origin.x - spacing, group_frame.origin.y),
-                CGSize::new(thickness, adjusted_height),
-            ),
+            // Horizontal bar spans the group width; placement puts it on the top
+            // or bottom edge. `spacing` pushes it outward from that edge.
+            GroupKind::Horizontal => {
+                let y = match horizontal_placement {
+                    HorizontalPlacement::Top => group_frame.origin.y - spacing,
+                    HorizontalPlacement::Bottom => {
+                        group_frame.origin.y + group_frame.size.height - thickness + spacing
+                    }
+                };
+                CGRect::new(
+                    CGPoint::new(group_frame.origin.x, y),
+                    CGSize::new(adjusted_width, thickness),
+                )
+            }
+            // Vertical bar spans the group height; placement puts it on the left
+            // or right edge.
+            GroupKind::Vertical => {
+                let x = match vertical_placement {
+                    VerticalPlacement::Left => group_frame.origin.x - spacing,
+                    VerticalPlacement::Right => {
+                        group_frame.origin.x + group_frame.size.width - thickness + spacing
+                    }
+                };
+                CGRect::new(
+                    CGPoint::new(x, group_frame.origin.y),
+                    CGSize::new(thickness, adjusted_height),
+                )
+            }
         }
     }
 
@@ -551,5 +571,42 @@ mod tests {
         assert_eq!(frame_vertical.origin.y, 200.0);
         assert_eq!(frame_vertical.size.width, thickness);
         assert_eq!(frame_vertical.size.height, 300.0);
+    }
+
+    #[test]
+    fn calculate_indicator_frame_honors_bottom_and_right_placement() {
+        let group_frame = CGRect::new(CGPoint::new(100.0, 200.0), CGSize::new(400.0, 300.0));
+        let thickness = 6.0;
+        let spacing = 4.0;
+
+        // Bottom: horizontal bar pinned to the group's bottom edge, pushed out
+        // by spacing. y = 200 + 300 - 6 + 4.
+        let bottom = StackLine::calculate_indicator_frame(
+            group_frame,
+            GroupKind::Horizontal,
+            thickness,
+            HorizontalPlacement::Bottom,
+            VerticalPlacement::Left,
+            spacing,
+        );
+        assert_eq!(bottom.origin.x, 100.0);
+        assert_eq!(bottom.origin.y, 200.0 + 300.0 - thickness + spacing);
+        assert_eq!(bottom.size.width, 400.0);
+        assert_eq!(bottom.size.height, thickness);
+
+        // Right: vertical bar pinned to the group's right edge.
+        // x = 100 + 400 - 6 + 4.
+        let right = StackLine::calculate_indicator_frame(
+            group_frame,
+            GroupKind::Vertical,
+            thickness,
+            HorizontalPlacement::Top,
+            VerticalPlacement::Right,
+            spacing,
+        );
+        assert_eq!(right.origin.x, 100.0 + 400.0 - thickness + spacing);
+        assert_eq!(right.origin.y, 200.0);
+        assert_eq!(right.size.width, thickness);
+        assert_eq!(right.size.height, 300.0);
     }
 }

@@ -91,7 +91,7 @@ impl From<&crate::common::config::StackLineSettings> for IndicatorConfig {
             selected_color: hex(&config.active_color, Color::new(0.26, 0.53, 0.98, 0.55)),
             unselected_color: hex(&config.inactive_color, Color::new(0.12, 0.12, 0.14, 0.92)),
             border_color: Color::new(0.0, 0.0, 0.0, 0.25),
-            border_width: 0.5,
+            border_width: config.border_width,
             horizontal_placement: config.horiz_placement,
             vertical_placement: config.vert_placement,
             spacing: config.spacing,
@@ -478,7 +478,7 @@ impl GroupIndicatorWindow {
         let shadow_color = objc2_app_kit::NSColor::blackColor();
         background_layer.setShadowColor(Some(&shadow_color.CGColor()));
 
-        background_layer.setBorderWidth(0.3);
+        background_layer.setBorderWidth(config.border_width);
         let border_color = config.border_color.to_nscolor();
         background_layer.setBorderColor(Some(&border_color.CGColor()));
 
@@ -613,7 +613,7 @@ impl GroupIndicatorWindow {
         let shadow_color = objc2_app_kit::NSColor::blackColor();
         selected_layer.setShadowColor(Some(&shadow_color.CGColor()));
 
-        selected_layer.setBorderWidth(0.5);
+        selected_layer.setBorderWidth(config.border_width);
         let border_color = objc2_app_kit::NSColor::colorWithRed_green_blue_alpha(
             (config.selected_color.r + 0.1).min(1.0),
             (config.selected_color.g + 0.1).min(1.0),
