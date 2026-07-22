@@ -175,6 +175,11 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
     fn toggle_selection_tabbed(&mut self, _layout: LayoutId) -> Vec<WindowId> {
         Vec::new()
     }
+    /// Cycle the selected column to the next preset width (niri-style). Default
+    /// no-op; only the scrolling layout implements it. Returns affected windows.
+    fn cycle_column_width_preset(&mut self, _layout: LayoutId) -> Vec<WindowId> {
+        Vec::new()
+    }
     fn unjoin_selection(&mut self, _layout: LayoutId);
     fn resize_selection_by(&mut self, layout: LayoutId, amount: f64);
     fn rebalance(&mut self, layout: LayoutId);

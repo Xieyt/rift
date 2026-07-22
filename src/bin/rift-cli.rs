@@ -271,6 +271,8 @@ enum LayoutCommands {
     ToggleStack,
     /// Toggle tabbed display of the selected scrolling column (niri-style tabs)
     ToggleTabbed,
+    /// Cycle the selected scrolling column through the configured width presets (niri-style)
+    CycleColumnWidth,
     /// Global orientation toggle that works consistently across layout modes (and between splits/stacks)
     ToggleOrientation,
     /// Unjoin previously joined windows
@@ -812,6 +814,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
         }
         LayoutCommands::ToggleTabbed => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleColumnTabbed,
+        ))),
+        LayoutCommands::CycleColumnWidth => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::CycleColumnWidth,
         ))),
         LayoutCommands::ToggleOrientation => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleOrientation,

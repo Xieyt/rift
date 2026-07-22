@@ -102,6 +102,9 @@ column_width_ratio = 0.7
 # min_column_width_ratio / max_column_width_ratio: clamp bounds used by resize commands
 min_column_width_ratio = 0.3
 max_column_width_ratio = 0.9
+# column width ratios cycled by the `cycle_column_width` command / cli
+# (`rift-cli execute layout cycle-column-width`); niri-style preset cycling
+width_presets = [0.33, 0.5, 0.66]
 # Alignment for the focused column: "left", "center", or "right"
 alignment = "center"
 # Horizontal focus behavior:

@@ -642,6 +642,20 @@ impl ScrollingLayoutSystem {
     }
 }
 
+/// Next preset width ratio strictly greater than `current`, wrapping to the
+/// smallest. Presets are clamped to `[min, max]`, sorted, and de-duplicated;
+/// out-of-order/duplicate config is tolerated. `None` when no usable presets.
+fn next_width_preset(current: f64, presets: &[f64], min: f64, max: f64) -> Option<f64> {
+    let mut ps: Vec<f64> = presets.iter().map(|p| p.clamp(min, max).max(0.05)).collect();
+    ps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    ps.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    if ps.is_empty() {
+        return None;
+    }
+    const EPS: f64 = 1e-3;
+    Some(ps.iter().copied().find(|&p| p > current + EPS).unwrap_or(ps[0]))
+}
+
 impl LayoutSystem for ScrollingLayoutSystem {
     fn create_layout(&mut self) -> LayoutId {
         self.layouts.insert(LayoutState::new(self.settings.column_width_ratio))
@@ -655,6 +669,34 @@ impl LayoutSystem for ScrollingLayoutSystem {
             return Vec::new();
         };
         state.columns[col_idx].tabbed = !state.columns[col_idx].tabbed;
+        state.columns[col_idx].windows.clone()
+    }
+
+    fn cycle_column_width_preset(&mut self, layout: LayoutId) -> Vec<WindowId> {
+        let min = self.settings.min_column_width_ratio;
+        let max = self.settings.max_column_width_ratio;
+        let presets = self.settings.width_presets.clone();
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
+        let Some(state) = self.layout_state_mut(layout) else {
+            return Vec::new();
+        };
+        let base = state.column_width_ratio;
+        let Some((col_idx, _)) = state.selected_location() else {
+            return Vec::new();
+        };
+        let current = (base + state.columns[col_idx].width_offset).clamp(min, max);
+        let Some(next) = next_width_preset(current, &presets, min, max) else {
+            return Vec::new();
+        };
+        state.columns[col_idx].width_offset = next - base;
+        if niri_navigation {
+            state.reveal_selected_without_direction();
+        } else {
+            state.align_scroll_to_selected();
+        }
         state.columns[col_idx].windows.clone()
     }
 
@@ -2971,6 +3013,48 @@ mod tests {
                 prop_assert!((r.origin.y - tiling.origin.y).abs() <= eps, "not top-aligned: {:?}", r);
                 prop_assert!((r.size.height - tiling.size.height).abs() <= eps, "not full height: {:?}", r);
             }
+        }
+    }
+
+    #[test]
+    fn next_width_preset_cycles_and_wraps() {
+        let presets = [0.33, 0.5, 0.66];
+        let (min, max) = (0.1, 0.9);
+        assert_eq!(super::next_width_preset(0.2, &presets, min, max), Some(0.33));
+        assert_eq!(super::next_width_preset(0.33, &presets, min, max), Some(0.5));
+        assert_eq!(super::next_width_preset(0.5, &presets, min, max), Some(0.66));
+        assert_eq!(super::next_width_preset(0.66, &presets, min, max), Some(0.33));
+        assert_eq!(super::next_width_preset(0.9, &presets, min, max), Some(0.33));
+        assert_eq!(super::next_width_preset(0.5, &[], min, max), None);
+    }
+
+    #[test]
+    fn cycle_column_width_preset_sets_selected_column_ratio() {
+        // Defaults: presets [0.33, 0.5, 0.66], base ratio 0.7, bounds [0.3, 0.9].
+        let system_settings = ScrollingLayoutSettings::default();
+        let mut system = ScrollingLayoutSystem::new(&system_settings);
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        system.add_window_after_selection(layout, w1);
+        system.add_window_after_selection(layout, w2);
+        assert!(system.select_window(layout, w1));
+
+        let gaps = GapSettings::default();
+        let scr = screen(1000.0, 800.0);
+        let tiling = compute_tiling_area(scr, &gaps);
+        let col_width = |system: &ScrollingLayoutSystem| {
+            frame_for(&render(system, layout, scr, &gaps), w1).size.width
+        };
+
+        // base 0.7 has no larger preset -> wraps to 0.33, then 0.5, 0.66, wrap.
+        for expected in [0.33, 0.5, 0.66, 0.33] {
+            system.cycle_column_width_preset(layout);
+            let got = col_width(&system);
+            assert!(
+                (got - expected * tiling.size.width).abs() <= 1.5,
+                "expected width {} got {}", expected * tiling.size.width, got
+            );
         }
     }
 }

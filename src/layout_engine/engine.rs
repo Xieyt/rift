@@ -88,6 +88,7 @@ pub enum LayoutCommand {
     ConsumeOrExpelWindow(Direction),
     ToggleStack,
     ToggleColumnTabbed,
+    CycleColumnWidth,
     ToggleOrientation,
     UnjoinWindows,
     ToggleFocusFloating,
@@ -1937,6 +1938,11 @@ impl LayoutEngine {
                 let visible_windows =
                     self.workspace_tree(workspace_id).visible_windows_in_layout(layout);
                 Self::response_for_raised_windows(visible_windows)
+            }
+            LayoutCommand::CycleColumnWidth => {
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                let raised = self.workspace_tree_mut(workspace_id).cycle_column_width_preset(layout);
+                Self::response_for_raised_windows(raised)
             }
             LayoutCommand::UnjoinWindows => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
