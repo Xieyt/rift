@@ -576,9 +576,12 @@ impl ScrollingLayoutSystem {
             Some(loc) => loc,
             None => return false,
         };
-        // If the current column is stacked, horizontal move should extract the selected
-        // window into its own neighbor column. This is a faster way to undo accidental stacks.
-        if state.columns[col_idx].windows.len() > 1 {
+        // A non-tabbed multi-window column is a vertical stack: a horizontal move
+        // extracts the selected window into its own neighbor column (a fast way to
+        // undo accidental stacks). A TABBED column is a single visual unit, so it
+        // moves as a whole (falls through to the column swap below) instead of
+        // tearing the focused tab out of the group.
+        if state.columns[col_idx].windows.len() > 1 && !state.columns[col_idx].tabbed {
             state.columns[col_idx].ensure_height_weights();
             let wid = state.columns[col_idx].windows.remove(row_idx);
             let weight = state.columns[col_idx].height_weights.remove(row_idx);
@@ -3056,5 +3059,73 @@ mod tests {
                 "expected width {} got {}", expected * tiling.size.width, got
             );
         }
+    }
+
+    #[test]
+    fn horizontal_move_shifts_tabbed_column_as_a_whole() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let a1 = wid(1, 1);
+        let a2 = wid(1, 2);
+        let b = wid(1, 3);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state");
+            state.columns = vec![
+                Column {
+                    windows: vec![a1, a2],
+                    width_offset: 0.0,
+                    height_weights: vec![1.0, 1.0],
+                    tabbed: true,
+                    active: None,
+                },
+                Column {
+                    windows: vec![b],
+                    width_offset: 0.0,
+                    height_weights: vec![1.0],
+                    tabbed: false,
+                    active: None,
+                },
+            ];
+            state.selected = Some(a1);
+        }
+
+        // Moving the focused tab right shifts the whole tabbed column, it must not
+        // tear a1 out into its own column.
+        assert!(system.move_selection(layout, Direction::Right));
+
+        let state = system.layouts.get(layout).expect("layout state");
+        assert_eq!(state.columns.len(), 2, "no column extracted");
+        assert_eq!(state.columns[0].windows, vec![b]);
+        assert_eq!(state.columns[1].windows, vec![a1, a2], "tabbed group stayed intact");
+        assert!(state.columns[1].tabbed, "tabbed flag preserved");
+        assert_eq!(state.selected, Some(a1), "selection preserved");
+    }
+
+    #[test]
+    fn horizontal_move_still_extracts_from_non_tabbed_stack() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let a1 = wid(1, 1);
+        let a2 = wid(1, 2);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state");
+            state.columns = vec![Column {
+                windows: vec![a1, a2],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0],
+                tabbed: false,
+                active: None,
+            }];
+            state.selected = Some(a1);
+        }
+
+        // A non-tabbed vertical stack still extracts the focused window on a
+        // horizontal move (undo-accidental-stack ergonomics preserved).
+        assert!(system.move_selection(layout, Direction::Right));
+
+        let state = system.layouts.get(layout).expect("layout state");
+        assert_eq!(state.columns.len(), 2, "focused window extracted into its own column");
+        assert!(state.columns.iter().any(|c| c.windows == vec![a1]));
+        assert!(state.columns.iter().any(|c| c.windows == vec![a2]));
     }
 }
