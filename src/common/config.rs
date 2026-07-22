@@ -56,10 +56,11 @@ pub enum ConfigCommand {
     ReloadConfig,
 }
 
-pub fn data_dir() -> PathBuf { dirs::home_dir().unwrap().join(".rift") }
+fn home_dir() -> PathBuf { dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")) }
+pub fn data_dir() -> PathBuf { home_dir().join(".rift") }
 pub fn restore_file() -> PathBuf { data_dir().join("layout.ron") }
 pub fn config_file() -> PathBuf {
-    dirs::home_dir().unwrap().join(".config").join("rift").join("config.toml")
+    home_dir().join(".config").join("rift").join("config.toml")
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]

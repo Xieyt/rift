@@ -1095,9 +1095,15 @@ impl LayoutEngine {
                     Ok(workspace_id) => workspace_id,
                     Err(e) => {
                         warn!("Failed to auto-assign window to workspace: {:?}", e);
-                        self.virtual_workspace_manager
-                            .active_workspace(space)
-                            .expect("No active workspace available")
+                        let Some(id) = self.virtual_workspace_manager.active_workspace(space)
+                        else {
+                            warn!(
+                                "No active workspace for space {:?}; dropping add of window {:?}",
+                                space, wid
+                            );
+                            return false;
+                        };
+                        id
                     }
                 },
             };
@@ -1624,13 +1630,12 @@ impl LayoutEngine {
                     let assigned_workspace = self
                         .virtual_workspace_manager
                         .workspace_for_window(window_store, space, wid)
-                        .unwrap_or_else(|| {
-                            self.virtual_workspace_manager
-                                .active_workspace(space)
-                                .expect("No active workspace available")
-                        });
+                        .or_else(|| self.virtual_workspace_manager.active_workspace(space));
 
-                    if let Some(layout) = self.workspace_layouts.active(space, assigned_workspace) {
+                    if let Some(assigned_workspace) = assigned_workspace
+                        && let Some(layout) =
+                            self.workspace_layouts.active(space, assigned_workspace)
+                    {
                         self.workspace_tree_mut(assigned_workspace)
                             .add_window_after_selection(layout, wid);
                         debug!(
@@ -2379,7 +2384,9 @@ impl LayoutEngine {
         }
     }
 
-    pub fn serialize_to_string(&self) -> String { ron::ser::to_string(&self).unwrap() }
+    pub fn serialize_to_string(&self) -> String {
+        ron::ser::to_string(&self).unwrap_or_else(|e| format!("<serialize error: {e}>"))
+    }
 
     #[cfg(test)]
     pub(crate) fn selected_window(&mut self, space: SpaceId) -> Option<WindowId> {
