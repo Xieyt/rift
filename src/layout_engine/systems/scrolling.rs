@@ -1,3 +1,7 @@
+use std::cell::RefCell;
+use std::hash::{Hash, Hasher};
+
+use slotmap::KeyData;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
@@ -17,6 +21,13 @@ struct Column {
     width_offset: f64,
     #[serde(default)]
     height_weights: Vec<f64>,
+    #[serde(default)]
+    tabbed: bool,
+    /// Last-focused window in this column, so horizontal focus moves restore the
+    /// active tab instead of snapping to the source column's row (niri tabbed
+    /// columns remember their selection).
+    #[serde(default)]
+    active: Option<WindowId>,
 }
 
 impl Column {
@@ -25,6 +36,16 @@ impl Column {
             self.height_weights.resize(self.windows.len(), 1.0);
         }
     }
+}
+
+/// Geometry of a tabbed column, captured during `calculate_layout` so the
+/// stack-line indicator can be placed without re-deriving scroll math.
+#[derive(Debug, Clone)]
+struct CachedTabGroup {
+    key: u64,
+    frame: CGRect,
+    windows: Vec<WindowId>,
+    selected: usize,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -53,6 +74,8 @@ struct LayoutState {
     overscroll_accumulation: AtomicU64,
     fullscreen: HashSet<WindowId>,
     fullscreen_within_gaps: HashSet<WindowId>,
+    #[serde(skip)]
+    tab_groups: RefCell<Vec<CachedTabGroup>>,
 }
 
 impl LayoutState {
@@ -73,6 +96,7 @@ impl LayoutState {
             overscroll_accumulation: AtomicU64::new(0.0f64.to_bits()),
             fullscreen: HashSet::default(),
             fullscreen_within_gaps: HashSet::default(),
+            tab_groups: RefCell::new(Vec::new()),
         }
     }
 
@@ -209,6 +233,8 @@ impl LayoutState {
             windows: vec![wid],
             width_offset: 0.0,
             height_weights: vec![1.0],
+            tabbed: false,
+            active: None,
         };
         let insert_at = (index + 1).min(self.columns.len());
         self.columns.insert(insert_at, column);
@@ -221,6 +247,8 @@ impl LayoutState {
             windows: vec![wid],
             width_offset: 0.0,
             height_weights: vec![1.0],
+            tabbed: false,
+            active: None,
         });
         self.selected = Some(wid);
         self.align_scroll_to_selected();
@@ -248,6 +276,8 @@ impl LayoutState {
                     windows: vec![window],
                     width_offset: 0.0,
                     height_weights: vec![1.0],
+                    tabbed: false,
+                    active: None,
                 });
             } else {
                 self.columns[target].ensure_height_weights();
@@ -286,6 +316,7 @@ impl Clone for LayoutState {
             ),
             fullscreen: self.fullscreen.clone(),
             fullscreen_within_gaps: self.fullscreen_within_gaps.clone(),
+            tab_groups: RefCell::new(Vec::new()),
         }
     }
 }
@@ -492,6 +523,7 @@ impl ScrollingLayoutSystem {
         };
         let new_sel = column.windows[new_idx];
         state.selected = Some(new_sel);
+        state.columns[col_idx].active = Some(new_sel);
         Some(new_sel)
     }
 
@@ -506,9 +538,17 @@ impl ScrollingLayoutSystem {
         if target_column.windows.is_empty() {
             return None;
         }
-        let target_row = row_idx.min(target_column.windows.len() - 1);
-        let new_sel = target_column.windows[target_row];
+        // Restore the target column's last-focused tab; fall back to the nearest
+        // row only when the column has no remembered (or now-stale) selection.
+        let new_sel = target_column
+            .active
+            .filter(|w| target_column.windows.contains(w))
+            .unwrap_or_else(|| {
+                let target_row = row_idx.min(target_column.windows.len() - 1);
+                target_column.windows[target_row]
+            });
         state.selected = Some(new_sel);
+        state.columns[target_col].active = Some(new_sel);
         Some(new_sel)
     }
 
@@ -551,6 +591,8 @@ impl ScrollingLayoutSystem {
                 windows: vec![wid],
                 width_offset: 0.0,
                 height_weights: vec![weight],
+                tabbed: false,
+                active: None,
             });
             state.selected = Some(wid);
             return true;
@@ -571,11 +613,49 @@ impl ScrollingLayoutSystem {
     fn all_windows(state: &LayoutState) -> Vec<WindowId> {
         state.columns.iter().flat_map(|c| c.windows.iter().copied()).collect()
     }
+
+    pub(crate) fn collect_group_containers_scrolling(
+        &self,
+        layout: LayoutId,
+        _screen: CGRect,
+        _gaps: &crate::common::config::GapSettings,
+        _stack_line_thickness: f64,
+        _stack_line_horiz: crate::common::config::HorizontalPlacement,
+        _stack_line_vert: crate::common::config::VerticalPlacement,
+    ) -> Vec<crate::layout_engine::engine::GroupContainerInfo> {
+        let Some(state) = self.layout_state(layout) else {
+            return Vec::new();
+        };
+        state
+            .tab_groups
+            .borrow()
+            .iter()
+            .map(|g| crate::layout_engine::engine::GroupContainerInfo {
+                node_id: crate::model::tree::NodeId::from(KeyData::from_ffi(g.key | (1 << 63))),
+                container_kind: LayoutKind::HorizontalStack,
+                frame: g.frame,
+                total_count: g.windows.len(),
+                selected_index: g.selected,
+                window_ids: g.windows.clone(),
+            })
+            .collect()
+    }
 }
 
 impl LayoutSystem for ScrollingLayoutSystem {
     fn create_layout(&mut self) -> LayoutId {
         self.layouts.insert(LayoutState::new(self.settings.column_width_ratio))
+    }
+
+    fn toggle_selection_tabbed(&mut self, layout: LayoutId) -> Vec<WindowId> {
+        let Some(state) = self.layout_state_mut(layout) else {
+            return Vec::new();
+        };
+        let Some((col_idx, _)) = state.selected_location() else {
+            return Vec::new();
+        };
+        state.columns[col_idx].tabbed = !state.columns[col_idx].tabbed;
+        state.columns[col_idx].windows.clone()
     }
 
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
@@ -816,6 +896,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         state.scroll_offset_px.store(clamped.to_bits(), Ordering::Relaxed);
 
         let mut out = Vec::new();
+        state.tab_groups.borrow_mut().clear();
         for (col_idx, col) in state.columns.iter().enumerate() {
             let offset = f64::from_bits(state.scroll_offset_px.load(Ordering::Relaxed));
             let ratio = column_ratios.get(col_idx).copied().unwrap_or(base_ratio);
@@ -826,6 +907,49 @@ impl LayoutSystem for ScrollingLayoutSystem {
             let start = column_starts.get(col_idx).copied().unwrap_or(0.0);
             let x = anchor_x + start - offset;
             if col.windows.is_empty() {
+                continue;
+            }
+            if col.tabbed && col.windows.len() > 1 {
+                // Tabbed column (niri-style): all windows overlap on one frame and
+                // the focused one is raised on top. Reserve a strip at the top for
+                // the stack-line tab bar so the indicator isn't occluded by the
+                // focused window; the bar itself is drawn from `tab_groups`.
+                let bar = _stack_line_thickness.max(0.0);
+                // Frame the indicator sits on (full column, top-aligned).
+                let group_frame = CGRect::new(
+                    CGPoint::new(x.round(), tiling.origin.y.round()),
+                    CGSize::new(column_width.round(), tiling.size.height.round()),
+                );
+                // Windows sit below the reserved bar strip.
+                let win_frame = CGRect::new(
+                    CGPoint::new(x.round(), (tiling.origin.y + bar).round()),
+                    CGSize::new(
+                        column_width.round(),
+                        (tiling.size.height - bar).max(1.0).round(),
+                    ),
+                );
+                let mut selected = 0usize;
+                for (row_idx, wid) in col.windows.iter().enumerate() {
+                    let frame = if state.fullscreen.contains(wid) {
+                        screen
+                    } else if state.fullscreen_within_gaps.contains(wid) {
+                        tiling
+                    } else {
+                        win_frame
+                    };
+                    if state.selected == Some(*wid) {
+                        selected = row_idx;
+                    }
+                    out.push((*wid, frame));
+                }
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                col.windows[0].hash(&mut hasher);
+                state.tab_groups.borrow_mut().push(CachedTabGroup {
+                    key: hasher.finish(),
+                    frame: group_frame,
+                    windows: col.windows.clone(),
+                    selected,
+                });
                 continue;
             }
             let total_gap = gap_y * (col.windows.len().saturating_sub(1) as f64);
@@ -1159,6 +1283,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 return true;
             }
             state.selected = Some(wid);
+            if let Some((col_idx, _)) = state.locate(wid) {
+                state.columns[col_idx].active = Some(wid);
+            }
             if niri_navigation {
                 state.reveal_selected_without_direction();
             } else {
@@ -1447,6 +1574,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
             windows: vec![wid],
             width_offset: 0.0,
             height_weights: vec![weight],
+            tabbed: false,
+            active: None,
         });
         state.selected = Some(wid);
         if niri_navigation {
@@ -1526,6 +1655,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 windows: vec![wid],
                 width_offset: 0.0,
                 height_weights: vec![moved_weights[idx]],
+                tabbed: false,
+                active: None,
             });
             insert_at += 1;
         }
@@ -1565,6 +1696,8 @@ impl LayoutSystem for ScrollingLayoutSystem {
             windows: vec![wid],
             width_offset: 0.0,
             height_weights: vec![weight],
+            tabbed: false,
+            active: None,
         });
         state.selected = Some(wid);
         if niri_navigation {
@@ -1685,6 +1818,109 @@ mod tests {
     }
 
     #[test]
+    fn tabbed_column_overlaps_windows_and_emits_one_group() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let w1 = wid(1, 1);
+        let w2 = wid(1, 2);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![Column {
+                windows: vec![w1, w2],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0],
+                tabbed: true,
+                active: None,
+            }];
+            state.selected = Some(w2);
+        }
+
+        let gaps = GapSettings::default();
+        let scr = screen(1000.0, 800.0);
+        let frames = render(&system, layout, scr, &gaps);
+        let tiling = compute_tiling_area(scr, &gaps);
+
+        // Tabbed display: both windows overlap on one full-height column rect.
+        let f1 = frame_for(&frames, w1);
+        let f2 = frame_for(&frames, w2);
+        assert_eq!(f1, f2, "tabbed windows share a single frame");
+        assert!(
+            (f1.size.height - tiling.size.height.round()).abs() <= 1.0,
+            "tabbed window fills the column height"
+        );
+
+        // Exactly one group is emitted; selected index tracks focus (w2 -> 1).
+        let state = system.layouts.get(layout).expect("layout state missing");
+        let groups = state.tab_groups.borrow();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].windows, vec![w1, w2]);
+        assert_eq!(groups[0].selected, 1);
+    }
+
+    #[test]
+    fn toggle_selection_tabbed_flips_the_column_flag() {
+        let (mut system, layout, w1, w2) =
+            setup_two_windows(ScrollingLayoutSettings::default());
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![Column {
+                windows: vec![w1, w2],
+                width_offset: 0.0,
+                height_weights: vec![1.0, 1.0],
+                tabbed: false,
+                active: None,
+            }];
+            state.selected = Some(w1);
+        }
+        assert!(!system.layouts.get(layout).unwrap().columns[0].tabbed);
+        let affected = system.toggle_selection_tabbed(layout);
+        assert_eq!(affected.len(), 2);
+        assert!(system.layouts.get(layout).unwrap().columns[0].tabbed);
+        system.toggle_selection_tabbed(layout);
+        assert!(!system.layouts.get(layout).unwrap().columns[0].tabbed);
+    }
+
+    #[test]
+    fn horizontal_focus_restores_active_tab_in_column() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let a1 = wid(1, 1);
+        let a2 = wid(1, 2);
+        let b = wid(2, 1);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![
+                Column {
+                    windows: vec![a1, a2],
+                    width_offset: 0.0,
+                    height_weights: vec![1.0, 1.0],
+                    tabbed: true,
+                    active: None,
+                },
+                Column {
+                    windows: vec![b],
+                    width_offset: 0.0,
+                    height_weights: vec![1.0],
+                    tabbed: false,
+                    active: None,
+                },
+            ];
+            state.selected = Some(a1);
+        }
+        // Move to the 2nd tab of column 0, then out to column 1 and back.
+        system.move_focus(layout, Direction::Down);
+        assert_eq!(system.selected_window(layout), Some(a2));
+        system.move_focus(layout, Direction::Right);
+        assert_eq!(system.selected_window(layout), Some(b));
+        system.move_focus(layout, Direction::Left);
+        assert_eq!(
+            system.selected_window(layout),
+            Some(a2),
+            "returning to a column restores its last-active tab, not the first"
+        );
+    }
+
+    #[test]
     fn respects_min_width_and_min_height_independently() {
         let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
         let layout = system.create_layout();
@@ -1735,6 +1971,8 @@ mod tests {
             windows: vec![w1, w2],
             width_offset: 0.0,
             height_weights: vec![1.0, 1.0],
+            tabbed: false,
+            active: None,
         }];
         state.selected = Some(w1);
 
@@ -1818,6 +2056,8 @@ mod tests {
             windows: vec![locked, capped],
             width_offset: 0.0,
             height_weights: vec![1.0, 1.0],
+            tabbed: false,
+            active: None,
         }];
         state.selected = Some(locked);
 

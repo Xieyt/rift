@@ -269,6 +269,8 @@ enum LayoutCommands {
     ConsumeOrExpelWindow { direction: String },
     /// Toggle stacked state for the selected container
     ToggleStack,
+    /// Toggle tabbed display of the selected scrolling column (niri-style tabs)
+    ToggleTabbed,
     /// Global orientation toggle that works consistently across layout modes (and between splits/stacks)
     ToggleOrientation,
     /// Unjoin previously joined windows
@@ -668,7 +670,10 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
             activate,
         } => match (direction, window_id) {
             (Some(direction), None) => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-                LC::MoveFocus(layout::MoveFocusArgs { direction: parse_focus_direction(&direction)?, activate }),
+                LC::MoveFocus(layout::MoveFocusArgs {
+                    direction: parse_focus_direction(&direction)?,
+                    activate,
+                }),
             ))),
             (None, Some(window_id)) => Ok(RiftCommand::Reactor(reactor::Command::Reactor(
                 reactor::ReactorCommand::FocusWindow {
@@ -805,6 +810,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
         LayoutCommands::ToggleStack => {
             Ok(RiftCommand::Reactor(reactor::Command::Layout(LC::ToggleStack)))
         }
+        LayoutCommands::ToggleTabbed => Ok(RiftCommand::Reactor(reactor::Command::Layout(
+            LC::ToggleColumnTabbed,
+        ))),
         LayoutCommands::ToggleOrientation => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ToggleOrientation,
         ))),

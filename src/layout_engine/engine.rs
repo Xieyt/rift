@@ -87,6 +87,7 @@ pub enum LayoutCommand {
     JoinWindow(Direction),
     ConsumeOrExpelWindow(Direction),
     ToggleStack,
+    ToggleColumnTabbed,
     ToggleOrientation,
     UnjoinWindows,
     ToggleFocusFloating,
@@ -434,6 +435,14 @@ impl LayoutEngine {
                     )
                 }
             }
+            LayoutSystemKind::Scrolling(s) => s.collect_group_containers_scrolling(
+                layout_id,
+                screen,
+                gaps,
+                stack_line_thickness,
+                stack_line_horiz,
+                stack_line_vert,
+            ),
             _ => Vec::new(),
         }
     }
@@ -1916,6 +1925,13 @@ impl LayoutEngine {
                 let default_orientation: crate::common::config::StackDefaultOrientation =
                     self.layout_settings.stack.default_orientation;
                 self.toggle_stack_for_workspace(workspace_id, layout, default_orientation)
+            }
+            LayoutCommand::ToggleColumnTabbed => {
+                self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
+                let _ = self.workspace_tree_mut(workspace_id).toggle_selection_tabbed(layout);
+                let visible_windows =
+                    self.workspace_tree(workspace_id).visible_windows_in_layout(layout);
+                Self::response_for_raised_windows(visible_windows)
             }
             LayoutCommand::UnjoinWindows => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
