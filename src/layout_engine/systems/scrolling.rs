@@ -572,35 +572,14 @@ impl ScrollingLayoutSystem {
     }
 
     fn move_selected_window_horizontal(state: &mut LayoutState, dir: Direction) -> bool {
-        let (col_idx, row_idx) = match state.selected_location() {
+        let (col_idx, _) = match state.selected_location() {
             Some(loc) => loc,
             None => return false,
         };
-        // A non-tabbed multi-window column is a vertical stack: a horizontal move
-        // extracts the selected window into its own neighbor column (a fast way to
-        // undo accidental stacks). A TABBED column is a single visual unit, so it
-        // moves as a whole (falls through to the column swap below) instead of
-        // tearing the focused tab out of the group.
-        if state.columns[col_idx].windows.len() > 1 && !state.columns[col_idx].tabbed {
-            state.columns[col_idx].ensure_height_weights();
-            let wid = state.columns[col_idx].windows.remove(row_idx);
-            let weight = state.columns[col_idx].height_weights.remove(row_idx);
-            let insert_at = match dir {
-                Direction::Left => col_idx,
-                Direction::Right => (col_idx + 1).min(state.columns.len()),
-                _ => return false,
-            };
-            state.columns.insert(insert_at, Column {
-                windows: vec![wid],
-                width_offset: 0.0,
-                height_weights: vec![weight],
-                tabbed: false,
-                active: None,
-            });
-            state.selected = Some(wid);
-            return true;
-        }
-
+        // In the scrolling layout a column is a single unit — whether a tab group
+        // or a vertical stack. A horizontal move shifts the WHOLE column past its
+        // neighbor rather than tearing the focused window out; use consume/expel
+        // to move windows in or out of a column.
         let target_col = match dir {
             Direction::Left => col_idx.checked_sub(1),
             Direction::Right => (col_idx + 1 < state.columns.len()).then_some(col_idx + 1),
@@ -608,8 +587,6 @@ impl ScrollingLayoutSystem {
         };
         let Some(target_col) = target_col else { return false };
         state.columns.swap(col_idx, target_col);
-        let Some(selected) = state.selected else { return false };
-        state.selected = Some(selected);
         true
     }
 
@@ -2632,28 +2609,29 @@ mod tests {
     }
 
     #[test]
-    fn move_selection_right_extracts_selected_from_stacked_column() {
+    fn move_selection_does_not_extract_from_lone_stacked_column() {
         let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
         system.join_selection_with_direction(layout, Direction::Left);
 
-        assert!(system.move_selection(layout, Direction::Right));
+        // A lone stacked column has no neighbor to swap with, so the whole-column
+        // move is a no-op and the stack is NOT torn apart (extraction is now only
+        // via consume/expel).
+        assert!(!system.move_selection(layout, Direction::Right));
         let state = system.layouts.get(layout).expect("layout state missing");
-        assert_eq!(state.columns.len(), 2);
-        assert_eq!(state.columns[0].windows, vec![w1]);
-        assert_eq!(state.columns[1].windows, vec![w2]);
+        assert_eq!(state.columns.len(), 1);
+        assert_eq!(state.columns[0].windows, vec![w1, w2]);
         assert_eq!(state.selected, Some(w2));
     }
 
     #[test]
-    fn move_selection_left_extracts_selected_from_stacked_column_at_edge() {
+    fn move_selection_left_does_not_extract_from_lone_stacked_column() {
         let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
         system.join_selection_with_direction(layout, Direction::Left);
 
-        assert!(system.move_selection(layout, Direction::Left));
+        assert!(!system.move_selection(layout, Direction::Left));
         let state = system.layouts.get(layout).expect("layout state missing");
-        assert_eq!(state.columns.len(), 2);
-        assert_eq!(state.columns[0].windows, vec![w2]);
-        assert_eq!(state.columns[1].windows, vec![w1]);
+        assert_eq!(state.columns.len(), 1);
+        assert_eq!(state.columns[0].windows, vec![w1, w2]);
         assert_eq!(state.selected, Some(w2));
     }
 
@@ -3102,30 +3080,41 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_move_still_extracts_from_non_tabbed_stack() {
+    fn horizontal_move_shifts_non_tabbed_stack_as_a_whole() {
         let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
         let layout = system.create_layout();
         let a1 = wid(1, 1);
         let a2 = wid(1, 2);
+        let b = wid(1, 3);
         {
             let state = system.layouts.get_mut(layout).expect("layout state");
-            state.columns = vec![Column {
-                windows: vec![a1, a2],
-                width_offset: 0.0,
-                height_weights: vec![1.0, 1.0],
-                tabbed: false,
-                active: None,
-            }];
+            state.columns = vec![
+                Column {
+                    windows: vec![a1, a2],
+                    width_offset: 0.0,
+                    height_weights: vec![1.0, 1.0],
+                    tabbed: false,
+                    active: None,
+                },
+                Column {
+                    windows: vec![b],
+                    width_offset: 0.0,
+                    height_weights: vec![1.0],
+                    tabbed: false,
+                    active: None,
+                },
+            ];
             state.selected = Some(a1);
         }
 
-        // A non-tabbed vertical stack still extracts the focused window on a
-        // horizontal move (undo-accidental-stack ergonomics preserved).
+        // A non-tabbed vertical stack also moves as a whole; use consume/expel to
+        // move a window out of a column.
         assert!(system.move_selection(layout, Direction::Right));
 
         let state = system.layouts.get(layout).expect("layout state");
-        assert_eq!(state.columns.len(), 2, "focused window extracted into its own column");
-        assert!(state.columns.iter().any(|c| c.windows == vec![a1]));
-        assert!(state.columns.iter().any(|c| c.windows == vec![a2]));
+        assert_eq!(state.columns.len(), 2, "no window extracted");
+        assert_eq!(state.columns[0].windows, vec![b]);
+        assert_eq!(state.columns[1].windows, vec![a1, a2], "stack stayed intact");
+        assert_eq!(state.selected, Some(a1), "selection preserved");
     }
 }
