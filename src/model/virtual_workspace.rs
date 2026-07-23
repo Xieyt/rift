@@ -1202,6 +1202,30 @@ impl WorkspaceStore {
 
         stats
     }
+
+    /// For each virtual workspace in `space`, in order: (index, name,
+    /// is_active, distinct app pids of its windows in first-seen order).
+    /// Backs the hint bar's workspace-overview rail.
+    pub fn workspace_app_pids(
+        &self,
+        window_store: &WindowStore,
+        space: SpaceId,
+    ) -> Vec<(usize, String, bool, Vec<pid_t>)> {
+        let active = self.active_workspace(space);
+        self.existing_workspaces(space)
+            .into_iter()
+            .enumerate()
+            .map(|(idx, (id, name))| {
+                let mut pids: Vec<pid_t> = Vec::new();
+                for w in self.workspace_windows(window_store, space, id) {
+                    if !pids.contains(&w.pid) {
+                        pids.push(w.pid);
+                    }
+                }
+                (idx, name, Some(id) == active, pids)
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]

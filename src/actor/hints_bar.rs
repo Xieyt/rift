@@ -17,10 +17,13 @@ use tracing::{instrument, warn};
 
 use crate::actor::reactor::{Command, ReactorCommand};
 use crate::actor::{self, reactor};
+use crate::layout_engine::LayoutCommand;
 use crate::common::config::{Config, HintsBarVisibility};
 use crate::sys::screen::SpaceId;
 use crate::sys::timer::Timer;
-use crate::ui::hints_bar::{ColumnCell, HintsBar as HintsBarWindow, HintsBarData, HintsBarStyle};
+use crate::ui::hints_bar::{
+    ColumnCell, HintsBar as HintsBarWindow, HintsBarData, HintsBarStyle, WorkspaceCell,
+};
 use crate::ui::stack_line::point_hits_indicator_frame;
 
 /// Bar frames published for the event tap to hit-test clicks against.
@@ -36,8 +39,8 @@ pub struct Snapshot {
     /// Full display rect the bar is on (for right-edge pill placement).
     pub screen_frame: CGRect,
     pub cells: Vec<ColumnCell>,
-    /// Active workspace badge label (empty = don't show).
-    pub workspace: String,
+    /// Occupied workspaces for the overview rail.
+    pub workspaces: Vec<WorkspaceCell>,
 }
 
 #[derive(Debug)]
@@ -54,7 +57,10 @@ pub enum Event {
 pub type Sender = actor::Sender<Event>;
 pub type Receiver = actor::Receiver<Event>;
 
-type CellSig = (Vec<(String, bool, bool, bool, usize, usize, String)>, String);
+type CellSig = (
+    Vec<(String, bool, bool, bool, usize, usize, String)>,
+    Vec<(String, bool, Vec<crate::sys::app::pid_t>)>,
+);
 
 pub struct HintsBar {
     config: Config,
@@ -173,7 +179,7 @@ impl HintsBar {
         }
     }
 
-    fn signature(cells: &[ColumnCell], workspace: &str) -> CellSig {
+    fn signature(cells: &[ColumnCell], workspaces: &[WorkspaceCell]) -> CellSig {
         let entries = cells
             .iter()
             .map(|c| {
@@ -193,7 +199,11 @@ impl HintsBar {
                 )
             })
             .collect();
-        (entries, workspace.to_string())
+        let ws = workspaces
+            .iter()
+            .map(|w| (w.label.clone(), w.active, w.pids.clone()))
+            .collect();
+        (entries, ws)
     }
 
     fn on_snapshot(&mut self, snapshot: Snapshot) {
@@ -201,7 +211,7 @@ impl HintsBar {
             self.teardown();
             return;
         }
-        let sig = Self::signature(&snapshot.cells, &snapshot.workspace);
+        let sig = Self::signature(&snapshot.cells, &snapshot.workspaces);
         let changed = self.last_sig.as_ref() != Some(&sig);
         self.last_sig = Some(sig);
         self.last_snapshot = Some(snapshot);
@@ -262,7 +272,7 @@ impl HintsBar {
                     snapshot.bar_frame,
                     snapshot.screen_frame,
                     snapshot.cells,
-                    snapshot.workspace,
+                    snapshot.workspaces,
                 );
             }
         } else {
@@ -280,7 +290,13 @@ impl HintsBar {
         NSScreen::mainScreen(self.mtm).map(|s| s.backingScaleFactor()).unwrap_or(2.0)
     }
 
-    fn render(&mut self, frame: CGRect, screen: CGRect, cells: Vec<ColumnCell>, workspace: String) {
+    fn render(
+        &mut self,
+        frame: CGRect,
+        screen: CGRect,
+        cells: Vec<ColumnCell>,
+        workspaces: Vec<WorkspaceCell>,
+    ) {
         tracing::trace!(target: "hbbench", "hb_render");
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
 
@@ -305,7 +321,7 @@ impl HintsBar {
             },
         };
 
-        if let Err(err) = bar.update(style, HintsBarData { cells, workspace, screen }) {
+        if let Err(err) = bar.update(style, HintsBarData { cells, screen, workspaces }) {
             warn!(?err, "hints_bar: update failed");
         }
         self.sync_hit_rects();
@@ -352,6 +368,13 @@ impl HintsBar {
             return;
         }
         let local = CGPoint::new(point.x - frame.origin.x, point.y - frame.origin.y);
+        if let Some(ws_index) = bar.workspace_at_point(local) {
+            tracing::debug!(ws_index, "hints_bar: switch workspace via click");
+            let _ = self.reactor_tx.send(reactor::Event::Command(Command::Layout(
+                LayoutCommand::SwitchToWorkspace(ws_index),
+            )));
+            return;
+        }
         let Some(index) = bar.column_at_point(local) else {
             return;
         };

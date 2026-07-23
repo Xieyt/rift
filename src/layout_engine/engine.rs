@@ -2901,6 +2901,16 @@ impl LayoutEngine {
         self.virtual_workspace_manager.get_stats(window_store)
     }
 
+    /// Per-workspace app summary for the hint bar rail: (index, name,
+    /// is_active, distinct app pids). See `WorkspaceStore::workspace_app_pids`.
+    pub fn workspace_app_summaries(
+        &self,
+        window_store: &WindowStore,
+        space: SpaceId,
+    ) -> Vec<(usize, String, bool, Vec<crate::sys::app::pid_t>)> {
+        self.virtual_workspace_manager.workspace_app_pids(window_store, space)
+    }
+
     pub fn is_window_floating(&self, window_id: WindowId) -> bool {
         self.floating.is_floating(window_id)
     }

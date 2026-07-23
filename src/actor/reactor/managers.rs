@@ -310,12 +310,11 @@ fn build_hints_bar_cells(
 /// re-sending an identical bar (nothing downstream would change).
 fn hints_bar_sig(
     cells: &[crate::ui::hints_bar::ColumnCell],
-    workspace: &str,
+    workspaces: &[crate::ui::hints_bar::WorkspaceCell],
     frame: CGRect,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    workspace.hash(&mut h);
     frame.origin.x.to_bits().hash(&mut h);
     frame.origin.y.to_bits().hash(&mut h);
     frame.size.width.to_bits().hash(&mut h);
@@ -331,6 +330,11 @@ fn hints_bar_sig(
             m.label.hash(&mut h);
             m.title.hash(&mut h);
         }
+    }
+    for w in workspaces {
+        w.label.hash(&mut h);
+        w.active.hash(&mut h);
+        w.pids.hash(&mut h);
     }
     h.finish()
 }
@@ -562,20 +566,30 @@ impl LayoutManager {
                                 )
                             }
                         };
-                        let workspace = if show_workspace {
-                            reactor
-                                .layout_manager
-                                .layout_engine
-                                .active_workspace_idx(space)
-                                .map(|i| (i + 1).to_string())
-                                .unwrap_or_default()
-                        } else {
-                            String::new()
-                        };
+                        let workspaces: Vec<crate::ui::hints_bar::WorkspaceCell> =
+                            if show_workspace {
+                                reactor
+                                    .layout_manager
+                                    .layout_engine
+                                    .workspace_app_summaries(&reactor.state.windows, space)
+                                    .into_iter()
+                                    .filter(|(_, _, _, pids)| !pids.is_empty())
+                                    .map(|(idx, _name, active, pids)| {
+                                        crate::ui::hints_bar::WorkspaceCell {
+                                            label: (idx + 1).to_string(),
+                                            index: idx,
+                                            active,
+                                            pids,
+                                        }
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
 
                         // Skip redundant sends: nothing downstream changes when the
                         // signature matches the last one we pushed for this space.
-                        let sig = hints_bar_sig(&cells, &workspace, bar_frame);
+                        let sig = hints_bar_sig(&cells, &workspaces, bar_frame);
                         let unchanged =
                             reactor.communication_manager.hints_bar_last_sig.get(&space)
                                 == Some(&sig);
@@ -587,7 +601,7 @@ impl LayoutManager {
                                 bar_frame,
                                 screen_frame,
                                 cells,
-                                workspace,
+                                workspaces,
                             }));
                         }
                     }

@@ -91,11 +91,21 @@ impl ColumnCell {
 #[derive(Debug, Clone, Default)]
 pub struct HintsBarData {
     pub cells: Vec<ColumnCell>,
-    /// Active workspace badge label (empty = none).
-    pub workspace: String,
     /// Full display rect (CGS top-left coords) the bar is on; lets a docked
     /// `bar` detail pin to a screen edge. Zero when unset.
     pub screen: CGRect,
+    /// Occupied workspaces for the overview rail (empty = no rail).
+    pub workspaces: Vec<WorkspaceCell>,
+}
+
+/// One workspace in the overview rail: its label, index (for switching), and
+/// the distinct app pids open in it (for icons).
+#[derive(Debug, Clone)]
+pub struct WorkspaceCell {
+    pub label: String,
+    pub index: usize,
+    pub active: bool,
+    pub pids: Vec<pid_t>,
 }
 
 /// Resolved visual style, derived from `HintsBarSettings`.
@@ -178,6 +188,8 @@ struct BarState {
     visible: bool,
     /// Chip frames from the last render, used for click hit-testing.
     chip_rects: Vec<CGRect>,
+    /// Workspace-pill frames from the last render, for click hit-testing.
+    ws_rects: Vec<CGRect>,
 }
 
 pub struct HintsBar {
@@ -235,6 +247,7 @@ impl HintsBar {
                 data: HintsBarData::default(),
                 visible: false,
                 chip_rects: Vec::new(),
+                ws_rects: Vec::new(),
             }),
             detail: RefCell::new(None),
             notch_cache: RefCell::new(None),
@@ -297,6 +310,17 @@ impl HintsBar {
 
     pub fn window_id_at(&self, index: usize) -> Option<WindowId> {
         self.state.borrow().data.cells.get(index).and_then(|c| c.window_id())
+    }
+
+    /// Map a window-local point to the workspace index to switch to, if it hits
+    /// a workspace pill in the rail.
+    pub fn workspace_at_point(&self, point: CGPoint) -> Option<usize> {
+        let state = self.state.borrow();
+        let i = state
+            .ws_rects
+            .iter()
+            .position(|r| point_hits_indicator_frame(point, *r))?;
+        state.data.workspaces.get(i).map(|w| w.index)
     }
 
     fn bounds(&self) -> CGRect { CGRect::new(CGPoint::new(0.0, 0.0), self.frame.borrow().size) }
@@ -475,7 +499,7 @@ impl HintsBar {
         let style = state.style;
         let bounds = self.bounds();
         let cells = state.data.cells.clone();
-        let workspace = state.data.workspace.clone();
+        let workspaces = state.data.workspaces.clone();
 
         with_disabled_actions(|| {
             unsafe { self.root_layer.setSublayers(None) };
@@ -489,15 +513,27 @@ impl HintsBar {
             let vertical = style.position.is_vertical();
             let dots = matches!(style.density, HintsBarDensity::Dots);
 
-            let mut widths = Self::natural_widths(&cells, &style, fs);
-            // A leading workspace badge is laid out as an extra slot before the
-            // chips (not a click target); dots density skips it.
-            let show_ws = !workspace.is_empty() && !dots;
-            if show_ws {
-                let ws_w = (Self::approx_text_width(&workspace, fs) + 2.0 * PAD_X)
-                    .max(style.height * 0.9);
-                widths.insert(0, ws_w);
-            }
+            let chip_widths = Self::natural_widths(&cells, &style, fs);
+            // Workspace overview rail: one clickable pill per occupied workspace,
+            // laid out as leading slots before the column chips. Dots density
+            // (position pips only) skips it.
+            let show_ws = !workspaces.is_empty() && !dots;
+            let ws_icon_w = fs + 2.0;
+            let ws_widths: Vec<f64> = if show_ws {
+                workspaces
+                    .iter()
+                    .map(|w| {
+                        let label_w = Self::approx_text_width(&w.label, fs);
+                        let icons_w = w.pids.len() as f64 * (ws_icon_w + 2.0);
+                        (PAD_X + label_w + BADGE_GAP + icons_w + PAD_X).max(style.height * 0.9)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let n_ws = ws_widths.len();
+            let mut widths = ws_widths;
+            widths.extend(chip_widths);
 
             let frame = *self.frame.borrow();
             // Notch gap (bar-local) for a top bar that sits on the notch row.
@@ -588,12 +624,12 @@ impl HintsBar {
                 }
             }
 
-            // Separate the workspace badge slot from the column chips.
-            let (ws_rect, chip_rects): (Option<CGRect>, Vec<CGRect>) =
-                if show_ws && !rects.is_empty() {
-                    (Some(rects[0]), rects[1..].to_vec())
+            // Separate the workspace rail pills from the column chips.
+            let (ws_rects_now, chip_rects): (Vec<CGRect>, Vec<CGRect>) =
+                if show_ws && rects.len() >= n_ws {
+                    (rects[..n_ws].to_vec(), rects[n_ws..].to_vec())
                 } else {
-                    (None, rects.clone())
+                    (Vec::new(), rects.clone())
                 };
 
             // Capsule background per contiguous run of badge+chips. A large gap
@@ -651,8 +687,8 @@ impl HintsBar {
                 self.add_rounded(vp, style.viewport_color, r);
             }
 
-            if let Some(wr) = ws_rect {
-                self.render_workspace(wr, &workspace, &style, fs);
+            for (w, wr) in workspaces.iter().zip(ws_rects_now.iter()) {
+                self.render_workspace_pill(*wr, w, &style, fs);
             }
 
             let chip_notch = if matches!(style.notch, HintsBarNotch::Flow) { notch } else { None };
@@ -665,11 +701,19 @@ impl HintsBar {
             }
 
             state.chip_rects = chip_rects;
+            state.ws_rects = ws_rects_now;
         });
     }
 
-    /// Leading badge showing the active workspace (amber pill + label).
-    fn render_workspace(&self, rect: CGRect, label: &str, style: &HintsBarStyle, fs: f64) {
+    /// One workspace-rail pill: accent fill when active (dim backing otherwise),
+    /// the workspace number, then an icon for each app open in that workspace.
+    fn render_workspace_pill(
+        &self,
+        rect: CGRect,
+        cell: &WorkspaceCell,
+        style: &HintsBarStyle,
+        fs: f64,
+    ) {
         let inset = 2.0;
         let pill = CGRect::new(
             CGPoint::new(rect.origin.x + inset, rect.origin.y + inset),
@@ -678,14 +722,35 @@ impl HintsBar {
                 (rect.size.height - 2.0 * inset).max(1.0),
             ),
         );
-        self.add_rounded(pill, style.hint_color, pill.size.height * 0.35);
+        let (bg, label_color) = if cell.active {
+            (style.hint_color, Color::new(0.1, 0.1, 0.12, 1.0))
+        } else {
+            (
+                Color::new(style.label_color.r, style.label_color.g, style.label_color.b, 0.14),
+                style.label_color,
+            )
+        };
+        self.add_rounded(pill, bg, pill.size.height * 0.35);
+
+        let icon_sz = (fs + 2.0).min(rect.size.height - 4.0).max(1.0);
+        let mut cursor = rect.origin.x + PAD_X;
+        let label_w = Self::approx_text_width(&cell.label, fs);
         self.root_layer.addSublayer(&self.text_layer(
-            label,
-            rect,
+            &cell.label,
+            CGRect::new(
+                CGPoint::new(cursor, rect.origin.y),
+                CGSize::new(label_w, rect.size.height),
+            ),
             fs,
-            Color::new(0.1, 0.1, 0.12, 1.0),
-            true,
+            label_color,
+            false,
         ));
+        cursor += label_w + BADGE_GAP;
+        let opacity = if cell.active { 1.0 } else { 0.85 };
+        for &pid in &cell.pids {
+            self.render_icon(cursor, rect, pid, icon_sz, opacity);
+            cursor += icon_sz + 2.0;
+        }
     }
 
     /// `dots` density: a centered pill per column (wider + accent when focused).
