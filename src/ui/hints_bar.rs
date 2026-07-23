@@ -8,6 +8,7 @@
 //! Rendered like `ui/stack_line`: a borderless CGS window whose content is a
 //! flipped `CALayer` tree, re-flushed on every update.
 use std::cell::RefCell;
+use std::collections::HashMap;
 
 use objc2::msg_send;
 use objc2::rc::Retained;
@@ -18,7 +19,7 @@ use objc2_quartz_core::{CALayer, CATextLayer};
 use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
-use crate::common::config::{HintsBarDensity, HintsBarSettings};
+use crate::common::config::{HintsBarDensity, HintsBarPosition, HintsBarSettings};
 use crate::sys::app::NSRunningApplicationExt;
 use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
 use crate::ui::common::{render_layer_to_cgs_window, with_disabled_actions};
@@ -88,6 +89,8 @@ pub struct HintsBarStyle {
     pub viewport_color: Color,
     pub label_color: Color,
     pub hint_color: Color,
+    pub position: HintsBarPosition,
+    pub blur: u32,
 }
 
 impl Default for HintsBarStyle {
@@ -101,6 +104,8 @@ impl Default for HintsBarStyle {
             viewport_color: Color::new(1.0, 1.0, 1.0, 0.09),
             label_color: Color::new(0.95, 0.95, 0.97, 1.0),
             hint_color: Color::new(1.0, 0.82, 0.44, 1.0),
+            position: HintsBarPosition::Bottom,
+            blur: 0,
         }
     }
 }
@@ -120,6 +125,8 @@ impl From<&HintsBarSettings> for HintsBarStyle {
             viewport_color: hex(&c.viewport_color, d.viewport_color),
             label_color: hex(&c.label_color, d.label_color),
             hint_color: hex(&c.hint_color, d.hint_color),
+            position: c.position,
+            blur: c.blur,
         }
     }
 }
@@ -171,6 +178,9 @@ impl HintsBar {
         if let Err(err) = cgs_window.set_tags(1 << 3) {
             warn!(error=?err, "hints_bar: set_tags failed");
         }
+        if style.blur > 0 {
+            let _ = cgs_window.set_blur(style.blur as i32, None);
+        }
 
         Ok(Self {
             frame: RefCell::new(frame),
@@ -212,6 +222,9 @@ impl HintsBar {
             state.data = data;
             state.visible = true;
         }
+        // Apply blur every update so it tracks config hot-reloads (0 = off,
+        // plain alpha transparency shows straight through).
+        let _ = self.cgs_window.set_blur(style.blur as i32, None);
         self.rebuild_layers();
         self.present();
         let result = self.cgs_window.order_above(None);
@@ -304,20 +317,64 @@ impl HintsBar {
         rects
     }
 
+    /// Vertical variant: uniform-width chips stacked top -> bottom and centered
+    /// along the edge (`align_right` hugs the right edge). Pure for testing.
+    pub fn layout_chips_vertical(
+        bounds: CGRect,
+        widths: &[f64],
+        row_h: f64,
+        align_right: bool,
+    ) -> Vec<CGRect> {
+        let n = widths.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let max_w = (bounds.size.width - 2.0 * MARGIN).max(1.0);
+        let chip_w = widths.iter().cloned().fold(MIN_CHIP_W, f64::max).min(max_w);
+        let avail = (bounds.size.height - 2.0 * MARGIN).max(1.0);
+        let natural = n as f64 * row_h + CHIP_GAP * (n - 1) as f64;
+        let scale = if natural > avail { avail / natural } else { 1.0 };
+        let rh = row_h * scale;
+        let gap = CHIP_GAP * scale;
+        let total = n as f64 * rh + gap * (n - 1) as f64;
+        let x = if align_right {
+            bounds.origin.x + bounds.size.width - MARGIN - chip_w
+        } else {
+            bounds.origin.x + MARGIN
+        };
+        let mut y = bounds.origin.y + MARGIN + (avail - total) / 2.0;
+        let mut rects = Vec::with_capacity(n);
+        for _ in 0..n {
+            rects.push(CGRect::new(CGPoint::new(x, y), CGSize::new(chip_w, rh)));
+            y += rh + gap;
+        }
+        rects
+    }
+
     /// The rounded rect bracketing the contiguous run of visible chips.
-    fn viewport_backing(rects: &[CGRect], visible: &[bool]) -> Option<CGRect> {
+    fn viewport_backing(rects: &[CGRect], visible: &[bool], vertical: bool) -> Option<CGRect> {
         let first = visible.iter().position(|v| *v)?;
         let last = visible.iter().rposition(|v| *v)?;
         let l = rects.get(first)?;
         let r = rects.get(last)?;
         let pad = 3.0;
-        Some(CGRect::new(
-            CGPoint::new(l.origin.x - pad, l.origin.y - pad),
-            CGSize::new(
-                (r.origin.x + r.size.width + pad) - (l.origin.x - pad),
-                l.size.height + 2.0 * pad,
-            ),
-        ))
+        if vertical {
+            Some(CGRect::new(
+                CGPoint::new(l.origin.x - pad, l.origin.y - pad),
+                CGSize::new(
+                    l.size.width + 2.0 * pad,
+                    (r.origin.y + r.size.height + pad) - (l.origin.y - pad),
+                ),
+            ))
+        } else {
+            Some(CGRect::new(
+                CGPoint::new(l.origin.x - pad, l.origin.y - pad),
+                CGSize::new(
+                    (r.origin.x + r.size.width + pad) - (l.origin.x - pad),
+                    l.size.height + 2.0 * pad,
+                ),
+            ))
+        }
     }
 
     fn present(&self) {
@@ -350,23 +407,36 @@ impl HintsBar {
 
             let fs = style.font_size.unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
             let widths = Self::natural_widths(&cells, &style, fs);
-            let rects = Self::layout_chips(bounds, &widths);
+            let vertical = style.position.is_vertical();
+            let rects = if vertical {
+                let align_right = matches!(style.position, HintsBarPosition::Right);
+                Self::layout_chips_vertical(bounds, &widths, style.height, align_right)
+            } else {
+                Self::layout_chips(bounds, &widths)
+            };
             let dots = matches!(style.density, HintsBarDensity::Dots);
 
-            // Capsule background hugging the chip row (not the full bar width),
-            // so the bar reads as an intentional pill regardless of column count.
+            // Capsule background hugging the chips (a pill regardless of count).
             if let (Some(first), Some(last)) = (rects.first(), rects.last()) {
                 let cap_pad = 6.0;
-                let x0 = (first.origin.x - cap_pad).max(0.0);
-                let x1 = (last.origin.x + last.size.width + cap_pad).min(bounds.size.width);
-                let cap = self.add_rounded(
+                let cap_rect = if vertical {
+                    let x0 = (first.origin.x - cap_pad).max(0.0);
+                    let y0 = (first.origin.y - cap_pad).max(0.0);
+                    let y1 = (last.origin.y + last.size.height + cap_pad).min(bounds.size.height);
+                    CGRect::new(
+                        CGPoint::new(x0, y0),
+                        CGSize::new(first.size.width + 2.0 * cap_pad, (y1 - y0).max(1.0)),
+                    )
+                } else {
+                    let x0 = (first.origin.x - cap_pad).max(0.0);
+                    let x1 = (last.origin.x + last.size.width + cap_pad).min(bounds.size.width);
                     CGRect::new(
                         CGPoint::new(x0, 0.0),
                         CGSize::new((x1 - x0).max(1.0), bounds.size.height),
-                    ),
-                    style.background,
-                    bounds.size.height * 0.5,
-                );
+                    )
+                };
+                let radius = (cap_rect.size.width.min(cap_rect.size.height) * 0.5).min(14.0);
+                let cap = self.add_rounded(cap_rect, style.background, radius);
                 cap.setShadowColor(Some(&objc2_app_kit::NSColor::blackColor().CGColor()));
                 cap.setShadowOpacity(0.22);
                 cap.setShadowRadius(4.0);
@@ -375,8 +445,9 @@ impl HintsBar {
 
             // Viewport grouping behind the on-screen columns.
             let visible: Vec<bool> = cells.iter().map(|c| c.visible).collect();
-            if let Some(vp) = Self::viewport_backing(&rects, &visible) {
-                self.add_rounded(vp, style.viewport_color, vp.size.height * 0.5);
+            if let Some(vp) = Self::viewport_backing(&rects, &visible, vertical) {
+                let r = (vp.size.width.min(vp.size.height) * 0.5).min(10.0);
+                self.add_rounded(vp, style.viewport_color, r);
             }
 
             for (cell, rect) in cells.iter().zip(rects.iter()) {
@@ -649,15 +720,29 @@ impl HintsBar {
             .min(300.0);
         let pill_w = (pad + 4.0 + icon_sz + 6.0 + name_w + pad).clamp(150.0, 380.0);
         let pill_h = cell.members.len() as f64 * row_h + 2.0 * pad;
-        let cx = bar.origin.x + chip.origin.x + chip.size.width / 2.0;
-        let max_x = (bar.origin.x + bar.size.width - pill_w - 4.0).max(bar.origin.x + 4.0);
-        let px = (cx - pill_w / 2.0).clamp(bar.origin.x + 4.0, max_x);
-        let py = (bar.origin.y - pill_h - 6.0).max(0.0);
+        let (px, py) = if style.position.is_vertical() {
+            // Pill beside the chip: left of a right-edge bar, right of a left-edge bar.
+            let chip_x = bar.origin.x + chip.origin.x;
+            let cy = bar.origin.y + chip.origin.y + chip.size.height / 2.0;
+            let py = (cy - pill_h / 2.0).max(0.0);
+            let px = if matches!(style.position, HintsBarPosition::Right) {
+                (chip_x - pill_w - 6.0).max(0.0)
+            } else {
+                chip_x + chip.size.width + 6.0
+            };
+            (px, py)
+        } else {
+            let cx = bar.origin.x + chip.origin.x + chip.size.width / 2.0;
+            let max_x = (bar.origin.x + bar.size.width - pill_w - 4.0).max(bar.origin.x + 4.0);
+            let px = (cx - pill_w / 2.0).clamp(bar.origin.x + 4.0, max_x);
+            let py = (bar.origin.y - pill_h - 6.0).max(0.0);
+            (px, py)
+        };
         let frame = CGRect::new(CGPoint::new(px, py), CGSize::new(pill_w, pill_h));
 
         let mut pill = self.pill.borrow_mut();
         if pill.is_none() {
-            match PillWindow::new(frame, self.scale) {
+            match PillWindow::new(frame, self.scale, style.blur) {
                 Ok(p) => *pill = Some(p),
                 Err(err) => {
                     warn!(?err, "hints_bar: failed to create pill window");
@@ -710,10 +795,27 @@ fn make_text_layer(
     layer
 }
 
+thread_local! {
+    /// App-icon layer contents cached by pid. Resolving an icon
+    /// (`NSRunningApplication` + `layerContentsForContentsScale`) is not free,
+    /// and every focus move rebuilds the bar — without this cache that
+    /// re-rasterized every icon on the main thread each move, making focus feel
+    /// clunky. Icons rarely change, so cache them for the process lifetime.
+    static ICON_CACHE: RefCell<HashMap<pid_t, Retained<objc2::runtime::AnyObject>>> =
+        RefCell::new(HashMap::new());
+}
+
 fn make_icon_layer(pid: pid_t, frame: CGRect, opacity: f32) -> Option<Retained<CALayer>> {
-    let app = NSRunningApplication::with_process_id(pid)?;
-    let image = app.icon()?;
-    let contents = image.layerContentsForContentsScale(2.0);
+    let contents = ICON_CACHE.with(|cache| {
+        if let Some(c) = cache.borrow().get(&pid) {
+            return Some(c.clone());
+        }
+        let app = NSRunningApplication::with_process_id(pid)?;
+        let image = app.icon()?;
+        let contents = image.layerContentsForContentsScale(2.0);
+        cache.borrow_mut().insert(pid, contents.clone());
+        Some(contents)
+    })?;
     let layer = CALayer::layer();
     layer.setFrame(frame);
     layer.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
@@ -735,7 +837,7 @@ struct PillWindow {
 }
 
 impl PillWindow {
-    fn new(frame: CGRect, scale: f64) -> Result<Self, CgsWindowError> {
+    fn new(frame: CGRect, scale: f64, blur: u32) -> Result<Self, CgsWindowError> {
         let root = CALayer::layer();
         root.setGeometryFlipped(true);
         root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
@@ -746,6 +848,9 @@ impl PillWindow {
         let _ = cgs.set_alpha(1.0);
         let _ = cgs.set_level(NSStatusWindowLevel as i32);
         let _ = cgs.set_tags(1 << 3);
+        if blur > 0 {
+            let _ = cgs.set_blur(blur as i32, None);
+        }
         Ok(Self { cgs, root })
     }
 
@@ -875,9 +980,9 @@ mod tests {
         let widths = vec![120.0; 6];
         let rects = HintsBar::layout_chips(b, &widths);
         let visible = [false, false, true, true, true, false];
-        let vp = HintsBar::viewport_backing(&rects, &visible).expect("viewport present");
+        let vp = HintsBar::viewport_backing(&rects, &visible, false).expect("viewport present");
         assert!(vp.origin.x < rects[2].origin.x);
         assert!(vp.origin.x + vp.size.width > rects[4].origin.x + rects[4].size.width);
-        assert!(HintsBar::viewport_backing(&rects, &[false; 6]).is_none());
+        assert!(HintsBar::viewport_backing(&rects, &[false; 6], false).is_none());
     }
 }

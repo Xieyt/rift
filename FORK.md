@@ -179,10 +179,12 @@ indicator method, one trait default, one engine arm + command.
   `tab_groups` (`collect_group_containers`). Independent of `stack_line` —
   `[settings.ui.hints_bar] enabled` and `[settings.ui.stack_line] enabled` are
   separate flags; run either, both, or neither.
-- Config `[settings.ui.hints_bar]`: `enabled`, `position` (bottom/top),
-  `placement` (`overlay` floats over windows / `reserve` shrinks the scrolling
-  tiling area), `visibility` (`always` / `on_demand` / `auto` flash), `density`
-  (compact/full/dots), `height`, `auto_hide_ms`, `keys`, hex colors.
+- Config `[settings.ui.hints_bar]`: `enabled`, `position` (`bottom`/`top`
+  horizontal, `left`/`right` vertical — vertical stacks chips down an edge and
+  is overlay-only), `placement` (`overlay` floats over windows / `reserve`
+  shrinks the scrolling tiling area, horizontal only), `visibility` (`always` /
+  `on_demand` / `auto` flash), `density` (compact/full/dots), `height` (chip
+  thickness / row height), `auto_hide_ms`, `keys`, hex colors.
   Hot-reloadable. Toggle command `toggle_hints_bar` (`WmCmd` →
   `ReactorCommand::ToggleHintsBar`).
 - **Crisp rendering (CRITICAL):** the CGS window + root layer must set

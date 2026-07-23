@@ -219,17 +219,18 @@ show_titles = false
 # that column. only shown while a scrolling workspace is active.
 [settings.ui.hints_bar]
 enabled = false
-# which edge: "bottom" or "top"
+# which edge: "bottom" / "top" (horizontal), or "left" / "right" (vertical —
+# columns stacked top->bottom, chips hug the edge; overlay only)
 position = "bottom"
 # "overlay" floats over the windows (no reflow); "reserve" shrinks the tiling
-# area so windows never sit under the bar
+# area so windows never sit under the bar (horizontal positions only)
 placement = "overlay"
 # "always" = passive minimap while scrolling; "on_demand" = hidden until the
 # `toggle_hints_bar` command; "auto" = hidden, flashes on strip changes
 visibility = "always"
 # per-column detail: "compact" (letter + app), "full" (+ title), "dots" (pills)
 density = "compact"
-# bar height in px
+# chip thickness in px (row height); for vertical bars the width auto-fits content
 height = 26.0
 # auto-hide delay in ms after the strip changes (visibility = "auto")
 auto_hide_ms = 1000

@@ -668,6 +668,15 @@ pub enum HintsBarPosition {
     #[default]
     Bottom,
     Top,
+    Left,
+    Right,
+}
+
+impl HintsBarPosition {
+    /// True for the left/right edges — the bar stacks columns vertically.
+    pub fn is_vertical(&self) -> bool {
+        matches!(self, HintsBarPosition::Left | HintsBarPosition::Right)
+    }
 }
 
 /// How much per-column detail the hint bar renders.
@@ -725,6 +734,10 @@ pub struct HintsBarSettings {
     /// Text size in points; unset scales to the bar height.
     #[serde(default)]
     pub font_size: Option<f64>,
+    /// Background blur radius (frosted glass). 0 disables. Pair with a
+    /// translucent `background` alpha (e.g. "#1f1f24aa") for a see-through bar.
+    #[serde(default = "default_hints_bar_blur")]
+    pub blur: u32,
 }
 
 impl Default for HintsBarSettings {
@@ -744,6 +757,7 @@ impl Default for HintsBarSettings {
             label_color: None,
             hint_color: None,
             font_size: None,
+            blur: default_hints_bar_blur(),
         }
     }
 }
@@ -752,7 +766,11 @@ impl HintsBarSettings {
     /// Vertical space the bar removes from the scrolling tiling area: only
     /// non-zero when enabled AND reserving its own strip.
     pub fn reserved_thickness(&self) -> f64 {
-        if self.enabled && self.placement == HintsBarPlacement::Reserve {
+        // Reserve is horizontal-only for now (bottom/top); vertical bars float.
+        if self.enabled
+            && self.placement == HintsBarPlacement::Reserve
+            && !self.position.is_vertical()
+        {
             self.height.max(0.0)
         } else {
             0.0
@@ -763,6 +781,7 @@ impl HintsBarSettings {
 fn default_hints_bar_height() -> f64 { 26.0 }
 fn default_hints_bar_auto_hide_ms() -> u64 { 1000 }
 fn default_hints_bar_keys() -> String { "asdfghjkl;".to_string() }
+fn default_hints_bar_blur() -> u32 { 0 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]

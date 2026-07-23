@@ -500,17 +500,35 @@ impl LayoutManager {
                     } else {
                         Vec::new()
                     };
+                    use crate::common::config::HintsBarPosition as HbPos;
                     let h = hb.height.max(1.0);
-                    let y = match hb.position {
-                        crate::common::config::HintsBarPosition::Bottom => {
-                            screen_frame.origin.y + screen_frame.size.height - h
+                    let bar_frame = match hb.position {
+                        HbPos::Bottom => CGRect::new(
+                            CGPoint::new(
+                                screen_frame.origin.x,
+                                screen_frame.origin.y + screen_frame.size.height - h,
+                            ),
+                            CGSize::new(screen_frame.size.width, h),
+                        ),
+                        HbPos::Top => CGRect::new(
+                            CGPoint::new(screen_frame.origin.x, screen_frame.origin.y),
+                            CGSize::new(screen_frame.size.width, h),
+                        ),
+                        // Vertical: a full-height column at the edge; the UI sizes
+                        // the capsule to content within it and hugs the edge.
+                        HbPos::Right | HbPos::Left => {
+                            let w = (screen_frame.size.width * 0.35).clamp(160.0, 360.0);
+                            let x = if matches!(hb.position, HbPos::Right) {
+                                screen_frame.origin.x + screen_frame.size.width - w
+                            } else {
+                                screen_frame.origin.x
+                            };
+                            CGRect::new(
+                                CGPoint::new(x, screen_frame.origin.y),
+                                CGSize::new(w, screen_frame.size.height),
+                            )
                         }
-                        crate::common::config::HintsBarPosition::Top => screen_frame.origin.y,
                     };
-                    let bar_frame = CGRect::new(
-                        CGPoint::new(screen_frame.origin.x, y),
-                        CGSize::new(screen_frame.size.width, h),
-                    );
                     let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
                         space_id: space,
                         bar_frame,
