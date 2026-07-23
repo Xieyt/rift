@@ -82,6 +82,9 @@ pub enum LayoutCommand {
     NextWindow,
     PrevWindow,
     MoveFocus(MoveFocusArgs),
+    /// Focus the Nth top-level column (0-indexed, left->right), matching the
+    /// hint-bar letters. Scrolling/niri only; other layouts ignore it.
+    FocusColumn(usize),
     Ascend,
     Descend,
     MoveNode(Direction),
@@ -1847,6 +1850,26 @@ impl LayoutEngine {
                     response.activate = true;
                 }
                 return response;
+            }
+            LayoutCommand::FocusColumn(index) => {
+                let (focus_window_raw, raise_windows) =
+                    self.workspace_tree_mut(workspace_id).focus_column(layout, index);
+                let focus_window =
+                    self.filter_active_workspace_window(window_store, space, focus_window_raw);
+                let raise_windows =
+                    self.filter_active_workspace_windows(window_store, space, raise_windows);
+                if focus_window.is_some() {
+                    let response = EventResponse {
+                        focus_window,
+                        raise_windows,
+                        boundary_hit: None,
+                        activate: true,
+                    };
+                    self.apply_focus_response(window_store, space, workspace_id, layout, &response);
+                    response
+                } else {
+                    EventResponse::default()
+                }
             }
             LayoutCommand::Ascend => {
                 if is_floating {

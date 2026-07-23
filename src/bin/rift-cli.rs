@@ -321,6 +321,8 @@ enum LayoutCommands {
     /// Toggle centering of the selected column in scrolling layout.
     /// If invoked again on the same selection, centering is removed.
     CenterSelection,
+    /// Focus the Nth column left->right (0-indexed) in the scrolling layout
+    FocusColumn { index: usize },
 }
 
 #[derive(Subcommand)]
@@ -886,6 +888,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<RiftCommand, String> {
         LayoutCommands::CenterSelection => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::CenterSelection,
         ))),
+        LayoutCommands::FocusColumn { index } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::FocusColumn(index)),
+        )),
     }
 }
 

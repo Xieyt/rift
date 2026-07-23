@@ -1153,6 +1153,47 @@ impl LayoutSystem for ScrollingLayoutSystem {
         (new_sel, raise)
     }
 
+    fn focus_column(
+        &mut self,
+        layout: LayoutId,
+        index: usize,
+    ) -> (Option<WindowId>, Vec<WindowId>) {
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
+        let Some(state) = self.layout_state_mut(layout) else {
+            return (None, vec![]);
+        };
+        let Some(column) = state.columns.get(index) else {
+            return (None, vec![]);
+        };
+        if column.windows.is_empty() {
+            return (None, vec![]);
+        }
+        // Restore the column's last-focused tab; fall back to its first row.
+        let new_sel = column
+            .active
+            .filter(|w| column.windows.contains(w))
+            .unwrap_or(column.windows[0]);
+        state.selected = Some(new_sel);
+        state.columns[index].active = Some(new_sel);
+        if niri_navigation {
+            state.reveal_selected_without_direction();
+        } else {
+            state.align_scroll_to_selected();
+        }
+        let raise = {
+            let col = &state.columns[index];
+            if col.tabbed && col.windows.len() > 1 {
+                vec![new_sel]
+            } else {
+                col.windows.clone()
+            }
+        };
+        (Some(new_sel), raise)
+    }
+
     fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId> {
         let state = self.layout_state(layout)?;
         let (col_idx, row_idx) = state.selected_location()?;

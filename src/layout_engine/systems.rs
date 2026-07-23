@@ -123,6 +123,15 @@ pub trait LayoutSystem: Serialize + for<'de> Deserialize<'de> {
         direction: Direction,
     ) -> (Option<WindowId>, Vec<WindowId>);
     fn window_in_direction(&self, layout: LayoutId, direction: Direction) -> Option<WindowId>;
+    /// Focus the Nth top-level column (0-indexed, left->right), revealing it.
+    /// Scrolling/niri only; other layouts return `(None, vec![])`.
+    fn focus_column(
+        &mut self,
+        _layout: LayoutId,
+        _index: usize,
+    ) -> (Option<WindowId>, Vec<WindowId>) {
+        (None, Vec::new())
+    }
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId);
     /// Replace a window identity in-place without changing its layout position.
     fn replace_window(&mut self, from: WindowId, to: WindowId);
