@@ -18,10 +18,9 @@ Read this before syncing with upstream or adding new local features.
 
 Branches:
 
-- **`udpate/to-latest`** — the working branch. Upstream's `main` + our local
-  changes, rebased on top. This is what we build and ship.
-  *(The name is a typo for `update/to-latest`; kept for continuity. Rename with
-  `git branch -m` + re-push if it ever bothers you.)*
+- **`xieyt/4`** — the working branch: `upstream/main` **merged** with our local
+  changes on top. This is what we build and ship. (Older notes here called it
+  `udpate/to-latest`; the live branch is `xieyt/4`.)
 - **`main`** — kept in sync with `upstream/main` as a clean mirror. No local work
   lands here.
 
@@ -239,7 +238,23 @@ event-tap click route).
 
 ---
 
-## 3. Syncing with upstream (the routine)
+## 3. Syncing with upstream (rebase vs merge)
+
+**Use `merge`, not `rebase`, for routine syncs.** We carry a large feature set
+(~26 commits, see §2) and sync periodically, so upstream deltas are non-trivial.
+A merge resolves the overlap **once** per sync, keeps commit hashes stable (no
+force-push, safe for a shared branch), and — with `git rerere` — replays a
+resolution you've already done. Rebase only wins if you sync *very* frequently
+(tiny deltas) or want a linear history to open an upstream PR; then force-pushing
+the fork branch is expected. That is **not** our normal flow — rebasing ~26
+commits over a real upstream delta is a per-commit conflict marathon; merging is
+one pass.
+
+`git rerere` is enabled (`git config rerere.enabled true`) so each conflict you
+resolve is recorded and auto-applied next time — the §4 resolutions are already
+recorded.
+
+**Routine (merge):**
 
 ```bash
 git fetch upstream
@@ -247,24 +262,32 @@ git fetch upstream
 # keep the clean mirror in sync (fast-forward, never conflicts)
 git push origin upstream/main:main
 
-# rebase our work onto the new upstream tip
-git checkout udpate/to-latest
-git rebase upstream/main
+git checkout xieyt/4                 # our working branch
+git merge upstream/main
 # ...resolve conflicts if any (see §4), then:
-cargo check                       # must pass
-git push --force-with-lease origin udpate/to-latest
+git add -A
+cargo build --lib                    # must compile (catches merged-symbol clashes)
+just test                            # our curated suite must pass
+git commit                           # finalize the merge commit
+git push origin xieyt/4              # no --force needed
 ```
 
-`--force-with-lease` is required because rebasing rewrites our commits. It is
-safe here: this is our branch on our fork, and it refuses to clobber unexpected
-remote changes.
+**Rebase alternative** (only for upstreaming / a linear history):
+
+```bash
+git checkout xieyt/4
+git rebase upstream/main             # resolve per-commit; rerere still helps
+git push --force-with-lease origin xieyt/4
+```
 
 ---
 
 ## 4. Conflict-resolution playbook
 
-Conflicts land almost exclusively in **feature B** (§2). The pattern is always
-the same: upstream refactors a core file, and our `activate` threading collides.
+Conflicts land in the files our churny features touch. Historically that's
+**feature B**'s `activate` threading; the last sync instead hit the **layout
+engine** (upstream refactored persistence into `engine/persistence/` and added
+restore/query APIs).
 
 Resolution principles that worked last time:
 
@@ -287,8 +310,23 @@ Resolution principles that worked last time:
    rely on upstream's path (e.g. layout focus sync now flows through
    `outcome.focused_window`).
 
-After resolving: `git add -A && git rebase --continue`, then **always**
-`cargo check`.
+After resolving: `git add -A`, then `cargo build --lib` — **merge:** `git commit`;
+**rebase:** `git rebase --continue`. Always build before committing.
+
+### Recorded resolutions (rerere has these)
+
+The last sync conflicted **only in the layout engine**. If they recur, `rerere`
+replays them; the intended resolutions are:
+
+- **`src/layout_engine.rs`** re-export → the **union**: keep our `MoveFocusArgs`
+  *and* upstream's `RestoreReport`/`RestoreRequest`/`RestoreScope`/`RestoreSource`/
+  `RestoreWarning`.
+- **`src/layout_engine/engine.rs`** → **drop** our `serialize_to_string`; upstream
+  moved it to `engine/persistence/storage.rs`. Keeping ours is a duplicate
+  definition *and* won't compile (`LayoutEngine` no longer derives `Serialize`).
+- **`src/layout_engine/systems/scrolling.rs`** → keep **both** our
+  `toggle_selection_tabbed`/`cycle_column_width_preset` and upstream's
+  `contains_layout`.
 
 ---
 
@@ -492,12 +530,12 @@ fixed workload and diff — lower CPU-time for the same work = win.
 ```bash
 # how far are we from upstream?
 git fetch upstream
-git rev-list --left-right --count upstream/main...udpate/to-latest
+git rev-list --left-right --count upstream/main...xieyt/4
 #  -> "<N behind>  <M ahead>"   ; M = number of commits we carry on top
 
 # what exactly do we carry on top of upstream?
-git log --oneline upstream/main..udpate/to-latest
-git diff --stat upstream/main..udpate/to-latest
+git log --oneline upstream/main..xieyt/4
+git diff --stat upstream/main..xieyt/4
 ```
 
 ---
