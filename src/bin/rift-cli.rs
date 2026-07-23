@@ -5,7 +5,7 @@ use std::process::{self};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rift_wm::actor::app::WindowId;
 use rift_wm::actor::reactor::{self, DisplaySelector};
-use rift_wm::common::config::LayoutMode;
+use rift_wm::common::config::{LayoutMode, WorkspaceSelector};
 use rift_wm::ipc::{RiftCommand, RiftMachClient, RiftRequest, RiftResponse};
 use rift_wm::layout_engine as layout;
 use rift_wm::sys::window_server::WindowServerId;
@@ -182,9 +182,17 @@ enum WindowCommands {
     /// Toggle fullscreen within configured outer gaps (respects outer gaps / fills tiling area)
     ToggleFullscreenWithinGaps,
     /// Grow the current window size (increments by ~5%).
-    ResizeGrow,
+    ResizeGrow {
+        /// Axis to resize; smart chooses the nearest applicable split.
+        #[arg(long, value_enum, default_value_t = CliResizeOrientation::Horizontal)]
+        orientation: CliResizeOrientation,
+    },
     /// Shrink the current window size (decrements by ~5%).
-    ResizeShrink,
+    ResizeShrink {
+        /// Axis to resize; smart chooses the nearest applicable split.
+        #[arg(long, value_enum, default_value_t = CliResizeOrientation::Horizontal)]
+        orientation: CliResizeOrientation,
+    },
     /// Resize the selected window by a fractional amount.
     /// - Pass a signed floating value: positive to grow, negative to shrink.
     /// - The value is a fraction of the current size (e.g. `0.05` = 5%).
@@ -204,6 +212,23 @@ enum WindowCommands {
 enum CliRestoreScope {
     Workspace,
     Space,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliResizeOrientation {
+    Horizontal,
+    Vertical,
+    Smart,
+}
+
+impl From<CliResizeOrientation> for rift_wm::layout_engine::ResizeOrientation {
+    fn from(value: CliResizeOrientation) -> Self {
+        match value {
+            CliResizeOrientation::Horizontal => Self::Horizontal,
+            CliResizeOrientation::Vertical => Self::Vertical,
+            CliResizeOrientation::Smart => Self::Smart,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -588,10 +613,18 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
             }))
         }
         ExecuteCommands::LoadLayout { file, scope } => {
-            let path = if file.master {
-                rift_wm::common::config::restore_file()
+            let (path, source) = if file.master {
+                (
+                    rift_wm::common::config::restore_file(),
+                    layout::RestoreSource::CurrentSpace,
+                )
             } else {
-                absolute_layout_path(file.path.expect("clap requires either PATH or --master"))?
+                (
+                    absolute_layout_path(
+                        file.path.expect("clap requires either PATH or --master"),
+                    )?,
+                    layout::RestoreSource::SavedActiveSpace,
+                )
             };
             layout::LayoutEngine::load(path.clone()).map_err(|error| {
                 format!("could not load layout file at {}: {error}", path.display())
@@ -601,7 +634,7 @@ fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String
                 CliRestoreScope::Space => layout::RestoreScope::Space,
             };
             RiftCommand::Reactor(reactor::Command::Reactor(
-                reactor::ReactorCommand::RestoreLayout { path, scope },
+                reactor::ReactorCommand::RestoreLayout { path, scope, source },
             ))
         }
         ExecuteCommands::Debug => {
@@ -700,12 +733,12 @@ fn map_window_command(cmd: WindowCommands) -> Result<RiftCommand, String> {
         WindowCommands::ToggleFullscreenWithinGaps => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::ToggleFullscreenWithinGaps),
         )),
-        WindowCommands::ResizeGrow => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::ResizeWindowGrow,
-        ))),
-        WindowCommands::ResizeShrink => Ok(RiftCommand::Reactor(reactor::Command::Layout(
-            LC::ResizeWindowShrink,
-        ))),
+        WindowCommands::ResizeGrow { orientation } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::ResizeWindowGrow(orientation.into())),
+        )),
+        WindowCommands::ResizeShrink { orientation } => Ok(RiftCommand::Reactor(
+            reactor::Command::Layout(LC::ResizeWindowShrink(orientation.into())),
+        )),
         WindowCommands::ResizeBy { amount } => Ok(RiftCommand::Reactor(reactor::Command::Layout(
             LC::ResizeWindowBy { amount },
         ))),
@@ -776,7 +809,7 @@ fn map_workspace_command(cmd: WorkspaceCommands) -> Result<RiftCommand, String> 
         )),
         WorkspaceCommands::MoveWindow { workspace_id, window_id } => Ok(RiftCommand::Reactor(
             reactor::Command::Layout(LC::MoveWindowToWorkspace {
-                workspace: workspace_id,
+                workspace: WorkspaceSelector::Index(workspace_id),
                 window_id,
             }),
         )),

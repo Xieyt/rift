@@ -161,7 +161,6 @@ pub enum Event {
         menu_bar_space: Option<SpaceId>,
         command_space: Option<SpaceId>,
     },
-
     /// An application was launched. This event is also sent for every running
     /// application on startup.
     ///
@@ -1515,38 +1514,50 @@ impl Reactor {
                 );
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveAndExit)) => {
+                let active_space = self.active_display_space();
                 return command_workflow::handle_command_reactor_save_and_exit(
                     &self.state,
                     &mut self.layout_manager,
+                    active_space,
                 );
             }
             Event::Command(Command::Reactor(ReactorCommand::SaveLayout { path })) => {
+                let active_space = self.active_display_space();
                 return command_workflow::handle_command_reactor_save_layout(
                     &self.state,
                     &mut self.layout_manager,
                     path,
+                    active_space,
                 );
             }
-            Event::Command(Command::Reactor(ReactorCommand::RestoreLayout { path, scope })) => {
+            Event::Command(Command::Reactor(ReactorCommand::RestoreLayout {
+                path,
+                scope,
+                source,
+            })) => {
                 let Some(active_space) = self.active_display_space() else {
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::finalized_event(None, false, false, false)
+                        .with_stdout_line(
+                            "Could not restore saved layout: no active macOS space is available"
+                                .into(),
+                        ));
                 };
-                match self.layout_manager.layout_engine.restore_saved_layout(
+                let request = layout::RestoreRequest { scope, active_space, source };
+                let outcome = EventOutcome::finalized_event(None, false, false, true);
+                let report = self.layout_manager.layout_engine.restore_layout(
                     path,
-                    scope,
-                    active_space,
+                    request,
                     &mut self.state.windows,
                     &self.config.virtual_workspaces,
                     &self.config.settings.layout,
-                ) {
-                    Ok(matched) => {
-                        tracing::info!(?scope, matched, "Restored saved layout");
-                    }
+                );
+                return Ok(match report {
+                    Ok(report) => outcome.with_stdout_line(report.summary()),
                     Err(error) => {
                         tracing::error!(?scope, %error, "Could not restore saved layout");
+                        outcome.with_stdout_line(format!("Could not restore saved layout: {error}"))
                     }
-                }
-                return Ok(EventOutcome::finalized_event(None, false, false, true));
+                });
             }
             Event::Command(Command::Reactor(ReactorCommand::Serialize)) => {
                 let serialized = self.serialize_state();
@@ -2431,6 +2442,16 @@ impl Reactor {
             command_space_only_update,
             invalidates_pending_targets,
         } = analysis;
+
+        let current_display_spaces = screens
+            .iter()
+            .filter_map(|screen| screen.space.map(|space| (space, screen.display_uuid.clone())))
+            .collect::<Vec<_>>();
+        self.layout_manager.layout_engine.reconcile_startup_spaces(
+            &mut self.state.windows,
+            &current_display_spaces,
+            screens.len(),
+        );
 
         self.space_state.has_seen_display_set = has_seen_display_set;
         self.space_state.fullscreen_spaces = fullscreen_spaces;
