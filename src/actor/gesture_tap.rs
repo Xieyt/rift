@@ -128,6 +128,7 @@ struct ScrollConfig {
     vertical_tolerance: f64,
     fingers: usize,
     distance_pct: f64,
+    speed: f64,
 }
 
 impl ScrollConfig {
@@ -147,6 +148,7 @@ impl ScrollConfig {
             vertical_tolerance: vt_norm,
             fingers: g.fingers.max(1),
             distance_pct: g.distance_pct.clamp(0.01, 1.0),
+            speed: g.scroll_speed.clamp(0.1, 20.0),
         }
     }
 }
@@ -588,11 +590,12 @@ impl GestureTap {
                 st.accum_dx += dx;
                 let step = cfg.distance_pct;
                 if st.accum_dx.abs() >= step {
-                    let delta = if cfg.invert_horizontal {
-                        -st.accum_dx
-                    } else {
-                        st.accum_dx
-                    };
+                    let delta = cfg.speed
+                        * if cfg.invert_horizontal {
+                            -st.accum_dx
+                        } else {
+                            st.accum_dx
+                        };
                     let cmd = LC::ScrollStrip { delta };
 
                     self.wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(
@@ -620,11 +623,12 @@ impl GestureTap {
                     st.accum_dx += dx;
                     let step = cfg.distance_pct;
                     if st.accum_dx.abs() >= step {
-                        let delta = if cfg.invert_horizontal {
-                            -st.accum_dx
-                        } else {
-                            st.accum_dx
-                        };
+                        let delta = cfg.speed
+                            * if cfg.invert_horizontal {
+                                -st.accum_dx
+                            } else {
+                                st.accum_dx
+                            };
                         let cmd = LC::ScrollStrip { delta };
 
                         self.wm_sender.send(WmEvent::Command(WmCommand::ReactorCommand(

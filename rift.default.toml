@@ -123,6 +123,8 @@ enabled = false
 invert_horizontal = false
 # Number of fingers required for gesture
 fingers = 3
+# Horizontal scroll speed multiplier (>1 = faster strip movement per swipe)
+scroll_speed = 1.0
 # If true, scrolling past the end of the strip will trigger a workspace switch
 #
 # This enables a seemingly endless scroll experience through each workspace's
