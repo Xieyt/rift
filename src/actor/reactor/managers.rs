@@ -529,10 +529,21 @@ impl LayoutManager {
                             )
                         }
                     };
+                    let workspace = if hb.show_workspace {
+                        reactor
+                            .layout_manager
+                            .layout_engine
+                            .active_workspace_idx(space)
+                            .map(|i| (i + 1).to_string())
+                            .unwrap_or_default()
+                    } else {
+                        String::new()
+                    };
                     let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
                         space_id: space,
                         bar_frame,
                         cells,
+                        workspace,
                     }));
                 }
 

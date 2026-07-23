@@ -738,6 +738,12 @@ pub struct HintsBarSettings {
     /// translucent `background` alpha (e.g. "#1f1f24aa") for a see-through bar.
     #[serde(default = "default_hints_bar_blur")]
     pub blur: u32,
+    /// Show each window's title instead of its app name on the chips/pill.
+    #[serde(default = "no")]
+    pub show_titles: bool,
+    /// Show a leading badge with the active workspace index.
+    #[serde(default = "no")]
+    pub show_workspace: bool,
 }
 
 impl Default for HintsBarSettings {
@@ -758,6 +764,8 @@ impl Default for HintsBarSettings {
             hint_color: None,
             font_size: None,
             blur: default_hints_bar_blur(),
+            show_titles: false,
+            show_workspace: false,
         }
     }
 }

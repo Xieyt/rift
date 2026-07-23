@@ -70,12 +70,26 @@ impl ColumnCell {
     fn label(&self) -> &str { self.active_member().map(|m| m.label.as_str()).unwrap_or("") }
 
     fn title(&self) -> &str { self.active_member().map(|m| m.title.as_str()).unwrap_or("") }
+
+    /// Text for the chip label: window title when `show_titles`, else app name
+    /// (falls back to the app name when the title is empty).
+    fn primary(&self, show_titles: bool) -> &str {
+        if show_titles {
+            let t = self.title();
+            if !t.is_empty() {
+                return t;
+            }
+        }
+        self.label()
+    }
 }
 
 /// Full render payload for the bar: the ordered columns of one workspace.
 #[derive(Debug, Clone, Default)]
 pub struct HintsBarData {
     pub cells: Vec<ColumnCell>,
+    /// Active workspace badge label (empty = none).
+    pub workspace: String,
 }
 
 /// Resolved visual style, derived from `HintsBarSettings`.
@@ -91,6 +105,7 @@ pub struct HintsBarStyle {
     pub hint_color: Color,
     pub position: HintsBarPosition,
     pub blur: u32,
+    pub show_titles: bool,
 }
 
 impl Default for HintsBarStyle {
@@ -106,6 +121,7 @@ impl Default for HintsBarStyle {
             hint_color: Color::new(1.0, 0.82, 0.44, 1.0),
             position: HintsBarPosition::Bottom,
             blur: 0,
+            show_titles: false,
         }
     }
 }
@@ -127,6 +143,7 @@ impl From<&HintsBarSettings> for HintsBarStyle {
             hint_color: hex(&c.hint_color, d.hint_color),
             position: c.position,
             blur: c.blur,
+            show_titles: c.show_titles,
         }
     }
 }
@@ -277,7 +294,8 @@ impl HintsBar {
                 } else {
                     keycap_w + BADGE_GAP
                 };
-                let text_w = Self::approx_text_width(c.label(), font_size).min(MAX_TEXT_W);
+                let text_w =
+                    Self::approx_text_width(c.primary(style.show_titles), font_size).min(MAX_TEXT_W);
                 let badge = if c.members.len() > 1 {
                     font_size + 4.0 + BADGE_GAP
                 } else {
@@ -396,6 +414,7 @@ impl HintsBar {
         let style = state.style;
         let bounds = self.bounds();
         let cells = state.data.cells.clone();
+        let workspace = state.data.workspace.clone();
 
         with_disabled_actions(|| {
             unsafe { self.root_layer.setSublayers(None) };
@@ -406,17 +425,35 @@ impl HintsBar {
             }
 
             let fs = style.font_size.unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
-            let widths = Self::natural_widths(&cells, &style, fs);
             let vertical = style.position.is_vertical();
+            let dots = matches!(style.density, HintsBarDensity::Dots);
+
+            let mut widths = Self::natural_widths(&cells, &style, fs);
+            // A leading workspace badge is laid out as an extra slot before the
+            // chips (not a click target); dots density skips it.
+            let show_ws = !workspace.is_empty() && !dots;
+            if show_ws {
+                let ws_w = (Self::approx_text_width(&workspace, fs) + 2.0 * PAD_X)
+                    .max(style.height * 0.9);
+                widths.insert(0, ws_w);
+            }
+
             let rects = if vertical {
                 let align_right = matches!(style.position, HintsBarPosition::Right);
                 Self::layout_chips_vertical(bounds, &widths, style.height, align_right)
             } else {
                 Self::layout_chips(bounds, &widths)
             };
-            let dots = matches!(style.density, HintsBarDensity::Dots);
 
-            // Capsule background hugging the chips (a pill regardless of count).
+            // Separate the workspace badge slot from the column chips.
+            let (ws_rect, chip_rects): (Option<CGRect>, Vec<CGRect>) =
+                if show_ws && !rects.is_empty() {
+                    (Some(rects[0]), rects[1..].to_vec())
+                } else {
+                    (None, rects.clone())
+                };
+
+            // Capsule background hugging everything (badge + chips).
             if let (Some(first), Some(last)) = (rects.first(), rects.last()) {
                 let cap_pad = 6.0;
                 let cap_rect = if vertical {
@@ -445,12 +482,16 @@ impl HintsBar {
 
             // Viewport grouping behind the on-screen columns.
             let visible: Vec<bool> = cells.iter().map(|c| c.visible).collect();
-            if let Some(vp) = Self::viewport_backing(&rects, &visible, vertical) {
+            if let Some(vp) = Self::viewport_backing(&chip_rects, &visible, vertical) {
                 let r = (vp.size.width.min(vp.size.height) * 0.5).min(10.0);
                 self.add_rounded(vp, style.viewport_color, r);
             }
 
-            for (cell, rect) in cells.iter().zip(rects.iter()) {
+            if let Some(wr) = ws_rect {
+                self.render_workspace(wr, &workspace, &style, fs);
+            }
+
+            for (cell, rect) in cells.iter().zip(chip_rects.iter()) {
                 if dots {
                     self.render_dot(*rect, cell, &style);
                 } else {
@@ -458,8 +499,28 @@ impl HintsBar {
                 }
             }
 
-            state.chip_rects = rects;
+            state.chip_rects = chip_rects;
         });
+    }
+
+    /// Leading badge showing the active workspace (amber pill + label).
+    fn render_workspace(&self, rect: CGRect, label: &str, style: &HintsBarStyle, fs: f64) {
+        let inset = 2.0;
+        let pill = CGRect::new(
+            CGPoint::new(rect.origin.x + inset, rect.origin.y + inset),
+            CGSize::new(
+                (rect.size.width - 2.0 * inset).max(1.0),
+                (rect.size.height - 2.0 * inset).max(1.0),
+            ),
+        );
+        self.add_rounded(pill, style.hint_color, pill.size.height * 0.35);
+        self.root_layer.addSublayer(&self.text_layer(
+            label,
+            rect,
+            fs,
+            Color::new(0.1, 0.1, 0.12, 1.0),
+            true,
+        ));
     }
 
     /// `dots` density: a centered pill per column (wider + accent when focused).
@@ -568,7 +629,7 @@ impl HintsBar {
             ));
         } else {
             self.root_layer.addSublayer(&self.text_layer(
-                cell.label(),
+                cell.primary(style.show_titles),
                 CGRect::new(
                     CGPoint::new(cursor, rect.origin.y),
                     CGSize::new(text_w, rect.size.height),
@@ -715,7 +776,10 @@ impl HintsBar {
         let name_w = cell
             .members
             .iter()
-            .map(|m| Self::approx_text_width(&m.label, fs))
+            .map(|m| {
+                let t = if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+                Self::approx_text_width(t, fs)
+            })
             .fold(0.0_f64, f64::max)
             .min(300.0);
         let pill_w = (pad + 4.0 + icon_sz + 6.0 + name_w + pad).clamp(150.0, 380.0);
@@ -901,7 +965,7 @@ impl PillWindow {
                     style.label_color
                 };
                 self.root.addSublayer(&make_text_layer(
-                    &m.label,
+                    if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label },
                     CGRect::new(CGPoint::new(tx, ry), CGSize::new(tw, row_h)),
                     fs,
                     tc,

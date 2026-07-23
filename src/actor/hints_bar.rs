@@ -34,6 +34,8 @@ pub struct Snapshot {
     pub space_id: SpaceId,
     pub bar_frame: CGRect,
     pub cells: Vec<ColumnCell>,
+    /// Active workspace badge label (empty = don't show).
+    pub workspace: String,
 }
 
 #[derive(Debug)]
@@ -50,7 +52,7 @@ pub enum Event {
 pub type Sender = actor::Sender<Event>;
 pub type Receiver = actor::Receiver<Event>;
 
-type CellSig = Vec<(String, bool, bool, bool, usize, usize, String)>;
+type CellSig = (Vec<(String, bool, bool, bool, usize, usize, String)>, String);
 
 pub struct HintsBar {
     config: Config,
@@ -130,12 +132,15 @@ impl HintsBar {
         }
     }
 
-    fn signature(cells: &[ColumnCell]) -> CellSig {
-        cells
+    fn signature(cells: &[ColumnCell], workspace: &str) -> CellSig {
+        let entries = cells
             .iter()
             .map(|c| {
-                let active_label =
-                    c.members.get(c.active).map(|m| m.label.clone()).unwrap_or_default();
+                let active_label = c
+                    .members
+                    .get(c.active)
+                    .map(|m| format!("{}\u{1}{}", m.label, m.title))
+                    .unwrap_or_default();
                 (
                     c.hint.clone(),
                     c.focused,
@@ -146,7 +151,8 @@ impl HintsBar {
                     active_label,
                 )
             })
-            .collect()
+            .collect();
+        (entries, workspace.to_string())
     }
 
     fn on_snapshot(&mut self, snapshot: Snapshot) {
@@ -154,7 +160,7 @@ impl HintsBar {
             self.teardown();
             return;
         }
-        let sig = Self::signature(&snapshot.cells);
+        let sig = Self::signature(&snapshot.cells, &snapshot.workspace);
         let changed = self.last_sig.as_ref() != Some(&sig);
         self.last_sig = Some(sig);
         self.last_snapshot = Some(snapshot);
@@ -210,7 +216,7 @@ impl HintsBar {
         };
 
         if show {
-            self.render(snapshot.bar_frame, snapshot.cells);
+            self.render(snapshot.bar_frame, snapshot.cells, snapshot.workspace);
         } else {
             self.hide();
         }
@@ -226,7 +232,7 @@ impl HintsBar {
         NSScreen::mainScreen(self.mtm).map(|s| s.backingScaleFactor()).unwrap_or(2.0)
     }
 
-    fn render(&mut self, frame: CGRect, cells: Vec<ColumnCell>) {
+    fn render(&mut self, frame: CGRect, cells: Vec<ColumnCell>, workspace: String) {
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
 
         let bar = match &self.bar {
@@ -250,7 +256,7 @@ impl HintsBar {
             },
         };
 
-        if let Err(err) = bar.update(style, HintsBarData { cells }) {
+        if let Err(err) = bar.update(style, HintsBarData { cells, workspace }) {
             warn!(?err, "hints_bar: update failed");
         }
         self.sync_hit_rects();
