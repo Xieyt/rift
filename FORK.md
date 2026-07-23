@@ -51,6 +51,9 @@ Everything we carry lives in a **handful of single-purpose commits** on top of
   (~705 MB), rust-analyzer, and rust-src. ~864 MB closure vs ~1.6 GB for the
   full `stable.toolchain`. The devShell also brings a matched macOS SDK +
   libiconv, so ambient `cargo`/`just` link inside it (see §6).
+  - **rustfmt is pinned to nightly** (`latest.rustfmt`), not stable: `rustfmt.toml`
+    enables unstable options, so stable `cargo fmt` would silently reflow the
+    whole tree. See §6 "Formatting".
 
 **Why:** upstream ships no Nix support at all.
 **Conflict risk:** ~zero. These are almost entirely *new files* upstream doesn't
@@ -154,6 +157,48 @@ file. Kept minimal: one `Column` field, one `calculate_layout` branch, one
 indicator method, one trait default, one engine arm + command.
 **Verify:** `just test` (`tabbed_column_overlaps_windows_and_emits_one_group`,
 `toggle_selection_tabbed_flips_the_column_flag`). Visuals need `just install`.
+
+### E. `feat: scrolling-strip hint bar`
+**Files:** `src/ui/hints_bar.rs` (new), `src/actor/hints_bar.rs` (new),
+`src/ui.rs`, `src/actor.rs`, `src/common/config.rs`, `rift.default.toml`,
+`src/actor/reactor.rs`, `src/actor/reactor/managers.rs`,
+`src/actor/wm_controller.rs`, `src/actor/event_tap.rs`, `src/bin/rift.rs`,
+`src/model/reactor.rs`.
+
+- A bottom (or top) **hint bar** for the scrolling (niri) layout: a centered
+  capsule of per-column chips (`keycap · app-icon · app-name`), focused column
+  filled with the accent, on-screen columns grouped under a brighter viewport
+  tint, off-screen columns dimmed. Multi-window columns get a count badge; the
+  focused multi-window column gets a **detail pill** above it listing each
+  window's icon + name (active highlighted). Click a chip to focus that column
+  (routes through the existing `ReactorCommand::FocusWindow`).
+- Own subsystem mirroring `stack_line`: a `hints_bar` actor owns one CGS window
+  (+ a second popover window for the pill); the reactor feeds a snapshot per
+  layout apply from `managers.rs` (`build_hints_bar_cells`), grouping columns
+  from window frames by x and pulling tab/stack detail from the engine's
+  `tab_groups` (`collect_group_containers`). Independent of `stack_line` —
+  `[settings.ui.hints_bar] enabled` and `[settings.ui.stack_line] enabled` are
+  separate flags; run either, both, or neither.
+- Config `[settings.ui.hints_bar]`: `enabled`, `position` (bottom/top),
+  `placement` (`overlay` floats over windows / `reserve` shrinks the scrolling
+  tiling area), `visibility` (`always` / `on_demand` / `auto` flash), `density`
+  (compact/full/dots), `height`, `auto_hide_ms`, `keys`, hex colors.
+  Hot-reloadable. Toggle command `toggle_hints_bar` (`WmCmd` →
+  `ReactorCommand::ToggleHintsBar`).
+- **Crisp rendering (CRITICAL):** the CGS window + root layer must set
+  `contentsScale` **and** `set_resolution` to the display `backingScaleFactor`
+  (like `ui/mission_control.rs`), else the layer tree rasterizes at 1x and
+  upscales on Retina (grainy). The `auto`-flash timer uses `sys::timer::Timer`
+  (CFRunLoop), **not** `tokio::time` — actors run on a custom CFRunLoop executor
+  with no tokio runtime, so `tokio::time::sleep` panics at runtime.
+
+**Why:** a niri-style "where am I in the strip + what's in each column" HUD; it
+also supersedes the stack-line tab bar for scrolling (turn `stack_line` off).
+**Conflict risk:** LOW — almost all new files; touched core files get small,
+localized additions (one feed block, one command arm, one actor spawn, one
+event-tap click route).
+**Verify:** `just test` (`ui::hints_bar` geometry/click tests). Visuals need
+`just install` on a real Mac (SkyLight windows can't render headless).
 
 ### Dropped / superseded (do NOT re-add)
 - **scrolling off-left snap** — a per-column `x` clamp in `scrolling.rs`. Reverted:
@@ -306,6 +351,41 @@ signs with it, so Accessibility persists across rebuilds out of the box. The
 `just setup-signing-cert` step above is only for the local `just install` dev loop.
 Note: rift only manages *activated* spaces — if focus/layout commands are ignored,
 run `rift-cli execute toggle-space-activated` (or your `hyper+Z` bind).
+
+### Formatting (use nightly rustfmt — important)
+
+`rustfmt.toml` turns on **unstable** options (`unstable_features = true`,
+`overflow_delimited_expr`, `brace_style = 'PreferSameLine'`, `fn_single_line`,
+`where_single_line`, ...). Those only apply on **nightly** rustfmt. **Stable**
+rustfmt parses the file, warns *"unstable features are only available in nightly
+channel"*, and **silently ignores them** — so a stable `cargo fmt` reflows the
+*entire* tree to stable defaults, i.e. a massive spurious cross-file diff.
+
+To make the right thing the default, the devShell toolchain pins rustfmt to
+nightly (`latest.rustfmt`, see `nix/package.nix`). So **inside `nix develop` /
+direnv**:
+
+```bash
+just fmt          # cargo fmt --all (nightly) — the only correct way
+just fmt-check    # cargo fmt --all --check (matches CI)
+```
+
+CI enforces the same via `dtolnay/rust-toolchain@nightly` + `cargo +nightly fmt
+--all --check` (`.github/workflows/rust.yml`).
+
+**Never** run a plain-shell `cargo fmt` — that resolves to system *stable*
+rustfmt and will churn every file. This bit us once: a stable `cargo fmt` (run to
+tidy imports) got swept into the hint-bar commit and reformatted ~40 unrelated
+files. The fix was to reformat with real nightly rustfmt (via
+`nix shell 'github:nix-community/fenix#latest.rustfmt'`) and restore the files we
+never touched: `git checkout <parent> -- <untouched files>`, then
+`git commit --amend`. Keep feature commits to the files the feature actually
+changes.
+
+Note: the baseline isn't guaranteed clean under the *latest* nightly (CI's
+`@nightly` floats; the flake pins one via `flake.lock`), so `fmt-check` may flag
+files you didn't touch. That drift is pre-existing — do **not** reformat them, or
+you recreate the churn.
 
 ---
 

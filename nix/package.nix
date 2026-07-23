@@ -16,6 +16,15 @@
       # rust-docs (~705M), rust-analyzer, and rust-src from the fenix "kitchen
       # sink" stable.toolchain. Shared by both the crane build and the devShell
       # so nothing is duplicated in the store.
+      #
+      # rustfmt comes from the NIGHTLY channel (`latest.rustfmt`) on purpose:
+      # `rustfmt.toml` turns on unstable options (overflow_delimited_expr,
+      # brace_style, fn_single_line, where_single_line, ...) that STABLE rustfmt
+      # silently ignores. A stable `cargo fmt` then reflows the entire tree to
+      # stable defaults — a huge spurious cross-file diff. Nightly rustfmt honours
+      # the config and matches CI (`dtolnay/rust-toolchain@nightly` +
+      # `cargo +nightly fmt`), so `cargo fmt` / `just fmt` in this shell are
+      # correct by default and can't reintroduce that churn.
       toolchain =
         with fenix.packages.${system};
         combine [
@@ -23,7 +32,7 @@
           stable.rustc
           stable.rust-std
           stable.clippy
-          stable.rustfmt
+          latest.rustfmt
         ];
       craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
       root = ../.;

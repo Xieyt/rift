@@ -31,11 +31,15 @@ check:
 clippy:
     cargo clippy --all-targets
 
-# apply / verify formatting
+# apply / verify formatting.
+# NOTE: this uses the dev-shell rustfmt, which is pinned to NIGHTLY (see
+# nix/package.nix) because rustfmt.toml enables unstable options. Run inside
+# `nix develop`/direnv — a plain-shell stable `cargo fmt` reflows the whole tree.
+# `--all` matches CI (`cargo +nightly fmt --all --check`).
 fmt:
-    cargo fmt
+    cargo fmt --all
 fmt-check:
-    cargo fmt --check
+    cargo fmt --all --check
 
 # ---------------------------------------------------------------------------
 # tests — run through `nix develop` so they link (see ENVIRONMENT above).
