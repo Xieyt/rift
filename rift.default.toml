@@ -214,6 +214,35 @@ show_titles = false
 # inactive_title_color = "#b8b8be"    # other tab labels
 # font_size = 13.0                    # title size (default ~60% of thickness)
 
+# scrolling-strip hint bar: a horizontal minimap of every column in the active
+# niri-style (scrolling) workspace, on-screen and off. click a segment to focus
+# that column. only shown while a scrolling workspace is active.
+[settings.ui.hints_bar]
+enabled = false
+# which edge: "bottom" or "top"
+position = "bottom"
+# "overlay" floats over the windows (no reflow); "reserve" shrinks the tiling
+# area so windows never sit under the bar
+placement = "overlay"
+# "always" = passive minimap while scrolling; "on_demand" = hidden until the
+# `toggle_hints_bar` command; "auto" = hidden, flashes on strip changes
+visibility = "always"
+# per-column detail: "compact" (letter + app), "full" (+ title), "dots" (pills)
+density = "compact"
+# bar height in px
+height = 26.0
+# auto-hide delay in ms after the strip changes (visibility = "auto")
+auto_hide_ms = 1000
+# home-row keys dealt across the strip left -> right (click/label order)
+keys = "asdfghjkl;"
+# colors (hex "#RRGGBB" or "#RRGGBBAA"); unset uses built-in defaults. uncomment:
+# background = "#1f1f24ee"       # bar fill
+# focused_color = "#3d7bfaee"    # focused-column fill
+# viewport_color = "#ffffff22"   # on-screen-region tint
+# label_color = "#ffffff"        # app-name text
+# hint_color = "#ffd479"         # hint-letter text
+# font_size = 13.0               # text size (default scales to height)
+
 # experimental mission control
 [settings.ui.mission_control]
 enabled = false

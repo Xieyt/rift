@@ -1,4 +1,4 @@
-use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::trace;
 
 use super::replay::Record;
@@ -10,7 +10,8 @@ use crate::actor::reactor::Reactor;
 use crate::actor::reactor::animation::AnimationManager;
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::{
-    event_tap, gesture_tap, menu_bar, raise_manager, stack_line, window_notify, wm_controller,
+    event_tap, gesture_tap, hints_bar, menu_bar, raise_manager, stack_line, window_notify,
+    wm_controller,
 };
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{LayoutMode, WindowSnappingSettings};
@@ -140,6 +141,7 @@ pub struct CommunicationManager {
     pub event_tap_tx: Option<event_tap::Sender>,
     pub gesture_tap_tx: Option<gesture_tap::Sender>,
     pub stack_line_tx: Option<stack_line::Sender>,
+    pub hints_bar_tx: Option<hints_bar::Sender>,
     pub raise_manager_tx: raise_manager::Sender,
     pub event_broadcaster: BroadcastSender,
     pub wm_sender: Option<wm_controller::Sender>,
@@ -196,6 +198,113 @@ fn bound_scrolling_tiled_frames_to_screen(
     }
 }
 
+/// Build the scrolling strip cells: group the active workspace's tiled windows
+/// into columns by x-origin (ordered left -> right), then decorate each with a
+/// hint letter, its app, focus, and whether it lies inside the screen viewport.
+fn build_hints_bar_cells(
+    reactor: &Reactor,
+    layout: &[(WindowId, CGRect)],
+    screen: CGRect,
+    hb: &crate::common::config::HintsBarSettings,
+    groups: &[crate::layout_engine::engine::GroupContainerInfo],
+) -> Vec<crate::ui::hints_bar::ColumnCell> {
+    let focused = reactor.layout_manager.layout_engine.focused_window();
+    let resolve = |wid: WindowId| -> (String, String) {
+        let label = reactor
+            .app_manager
+            .apps
+            .get(&wid.pid)
+            .and_then(|a| a.info.localized_name.clone())
+            .unwrap_or_default();
+        let title = reactor
+            .state
+            .windows
+            .window(wid)
+            .map(|w| w.info.title.clone())
+            .unwrap_or_default();
+        (label, title)
+    };
+
+    // BTreeMap keeps columns ordered left -> right by rounded x-origin.
+    let mut columns: std::collections::BTreeMap<i64, Vec<(WindowId, CGRect)>> =
+        std::collections::BTreeMap::new();
+    for (wid, frame) in layout {
+        if reactor.layout_manager.layout_engine.is_window_floating(*wid) {
+            continue;
+        }
+        columns.entry(frame.origin.x.round() as i64).or_default().push((*wid, *frame));
+    }
+
+    let keys: Vec<char> = hb.keys.chars().collect();
+    let screen_left = screen.origin.x;
+    let screen_right = screen.origin.x + screen.size.width;
+
+    let mut cells = Vec::with_capacity(columns.len());
+    for (i, (_x, wins)) in columns.into_iter().enumerate() {
+        let focused_here = focused.is_some_and(|f| wins.iter().any(|(w, _)| *w == f));
+
+        // A tabbed column shows up in `groups` (from the engine's tab_groups),
+        // carrying the full window list + active tab even when the hidden tabs
+        // aren't in the visible frame list. Stacks aren't grouped, so fall back
+        // to the windows sharing this column's x.
+        let group = groups
+            .iter()
+            .find(|g| g.window_ids.iter().any(|w| wins.iter().any(|(x, _)| x == w)));
+        let (member_ids, active, tabbed) = if let Some(g) = group {
+            let count = g.window_ids.len().max(1);
+            let active = if focused_here {
+                g.window_ids
+                    .iter()
+                    .position(|w| Some(*w) == focused)
+                    .unwrap_or(g.selected_index)
+            } else {
+                g.selected_index
+            };
+            (g.window_ids.clone(), active.min(count - 1), true)
+        } else {
+            let ids: Vec<WindowId> = wins.iter().map(|(w, _)| *w).collect();
+            let active = if focused_here {
+                ids.iter().position(|w| Some(*w) == focused).unwrap_or(0)
+            } else {
+                0
+            };
+            (ids, active, false)
+        };
+
+        let members: Vec<crate::ui::hints_bar::WindowMember> = member_ids
+            .iter()
+            .map(|w| {
+                let (label, title) = resolve(*w);
+                crate::ui::hints_bar::WindowMember { window_id: *w, label, title }
+            })
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        let active = active.min(members.len() - 1);
+
+        let xmin = wins.iter().map(|(_, f)| f.origin.x).fold(f64::INFINITY, f64::min);
+        let xmax = wins
+            .iter()
+            .map(|(_, f)| f.origin.x + f.size.width)
+            .fold(f64::NEG_INFINITY, f64::max);
+        let overlap = (xmax.min(screen_right) - xmin.max(screen_left)).max(0.0);
+        // On screen if a usable strip is showing; > a parked sliver (~10px),
+        // and partial columns (a half-revealed neighbour) still count.
+        let visible = overlap > 24.0;
+
+        cells.push(crate::ui::hints_bar::ColumnCell {
+            hint: keys.get(i).map(|c| c.to_string()).unwrap_or_default(),
+            members,
+            active,
+            tabbed,
+            focused: focused_here,
+            visible,
+        });
+    }
+    cells
+}
+
 impl LayoutManager {
     pub fn update_layout(
         reactor: &mut Reactor,
@@ -237,11 +346,30 @@ impl LayoutManager {
                 .layout_manager
                 .layout_engine
                 .update_space_display(space, display_uuid_opt.clone());
+            // Reserve strip space for the hint bar (scrolling only): shrink the
+            // tiling frame so tiled windows never sit under the bar.
+            let reserve = reactor.config.settings.ui.hints_bar.reserved_thickness();
+            let tiling_frame = if reserve > 0.0
+                && reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                    == LayoutMode::Scrolling
+            {
+                let mut f = screen.frame;
+                f.size.height = (f.size.height - reserve).max(1.0);
+                if matches!(
+                    reactor.config.settings.ui.hints_bar.position,
+                    crate::common::config::HintsBarPosition::Top
+                ) {
+                    f.origin.y += reserve;
+                }
+                f
+            } else {
+                screen.frame
+            };
             let mut layout =
                 reactor.layout_manager.layout_engine.calculate_layout_with_virtual_workspaces(
                     &reactor.state.windows,
                     space,
-                    screen.frame.clone(),
+                    tiling_frame,
                     &gaps,
                     reactor.config.settings.ui.stack_line.thickness(),
                     reactor.config.settings.ui.stack_line.horiz_placement,
@@ -356,6 +484,38 @@ impl LayoutManager {
                     }) {
                         tracing::warn!("Failed to send groups update to stack_line: {}", e);
                     }
+                }
+
+                // Feed the scrolling-strip hint bar for the active display space.
+                if reactor.config.settings.ui.hints_bar.enabled
+                    && active_space == Some(space)
+                    && let Some(tx) = &reactor.communication_manager.hints_bar_tx
+                {
+                    let hb = &reactor.config.settings.ui.hints_bar;
+                    let is_scrolling =
+                        reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                            == LayoutMode::Scrolling;
+                    let cells = if is_scrolling {
+                        build_hints_bar_cells(reactor, &layout, screen_frame, hb, &group_infos)
+                    } else {
+                        Vec::new()
+                    };
+                    let h = hb.height.max(1.0);
+                    let y = match hb.position {
+                        crate::common::config::HintsBarPosition::Bottom => {
+                            screen_frame.origin.y + screen_frame.size.height - h
+                        }
+                        crate::common::config::HintsBarPosition::Top => screen_frame.origin.y,
+                    };
+                    let bar_frame = CGRect::new(
+                        CGPoint::new(screen_frame.origin.x, y),
+                        CGSize::new(screen_frame.size.width, h),
+                    );
+                    let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
+                        space_id: space,
+                        bar_frame,
+                        cells,
+                    }));
                 }
 
                 if let Some(workspace_id) =

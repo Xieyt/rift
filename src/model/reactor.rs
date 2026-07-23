@@ -66,6 +66,7 @@ pub enum ReactorCommand {
     CloseWindow {
         window_server_id: Option<WindowServerId>,
     },
+    ToggleHintsBar,
     MoveWindowToDisplay {
         selector: DisplaySelector,
         window_id: Option<u32>,

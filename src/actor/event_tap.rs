@@ -29,7 +29,7 @@ use objc2_core_graphics::{
 use tracing::{debug, error, trace, warn};
 
 use super::reactor::{self, Event};
-use super::stack_line;
+use super::{hints_bar, stack_line};
 use crate::actor;
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
@@ -77,6 +77,8 @@ pub struct EventTap {
     wm_sender: wm_controller::Sender,
     stack_line_tx: stack_line::Sender,
     stack_line_hit_rects: stack_line::SharedHitRects,
+    hints_bar_tx: hints_bar::Sender,
+    hints_bar_hit_rects: hints_bar::SharedHitRects,
 }
 
 // SAFETY: EventTap is constructed on the input thread and all access occurs on
@@ -222,6 +224,8 @@ impl EventTap {
         wm_sender: wm_controller::Sender,
         stack_line_tx: stack_line::Sender,
         stack_line_hit_rects: stack_line::SharedHitRects,
+        hints_bar_tx: hints_bar::Sender,
+        hints_bar_hit_rects: hints_bar::SharedHitRects,
     ) -> Self {
         let disable_hotkey = config
             .settings
@@ -258,6 +262,8 @@ impl EventTap {
             wm_sender,
             stack_line_tx,
             stack_line_hit_rects,
+            hints_bar_tx,
+            hints_bar_hit_rects,
         }
     }
 
@@ -498,6 +504,16 @@ impl EventTap {
                     .any(|frame| point_hits_indicator_frame(loc, frame));
                 if hits_stack_line && !window_server::is_point_occluded_by_external_window(loc) {
                     let _ = self.stack_line_tx.try_send(stack_line::Event::MouseDown(loc));
+                    return false;
+                }
+                let hits_hints_bar = self
+                    .hints_bar_hit_rects
+                    .load()
+                    .iter()
+                    .copied()
+                    .any(|frame| point_hits_indicator_frame(loc, frame));
+                if hits_hints_bar && !window_server::is_point_occluded_by_external_window(loc) {
+                    let _ = self.hints_bar_tx.try_send(hints_bar::Event::MouseDown(loc));
                     return false;
                 }
             }

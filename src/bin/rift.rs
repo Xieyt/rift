@@ -9,6 +9,7 @@ use rift_wm::actor::config::ConfigActor;
 use rift_wm::actor::config_watcher::ConfigWatcher;
 use rift_wm::actor::event_tap::EventTap;
 use rift_wm::actor::gesture_tap::GestureTap;
+use rift_wm::actor::hints_bar::HintsBar;
 use rift_wm::actor::menu_bar::Menu;
 use rift_wm::actor::mission_control::MissionControlActor;
 use rift_wm::actor::mission_control_observer::NativeMissionControl;
@@ -144,10 +145,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         match Config::read(&config_path) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!(
-                    "rift: failed to read config at {}: {e}",
-                    config_path.display()
-                );
+                eprintln!("rift: failed to read config at {}: {e}", config_path.display());
                 eprintln!("rift: falling back to built-in defaults");
                 Config::default()
             }
@@ -205,6 +203,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let (event_tap_tx, event_tap_rx) = rift_wm::actor::channel();
     let (menu_tx, menu_rx) = rift_wm::actor::channel();
     let (stack_line_tx, stack_line_rx) = rift_wm::actor::channel();
+    let (hints_bar_tx, hints_bar_rx) = rift_wm::actor::channel();
     let (wnd_tx, wnd_rx) = rift_wm::actor::channel();
     let window_tx_store = WindowTxStore::new();
     let (gesture_tap_tx, gesture_tap_rx) = rift_wm::actor::channel();
@@ -216,6 +215,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         broadcast_tx.clone(),
         menu_tx.clone(),
         stack_line_tx.clone(),
+        hints_bar_tx.clone(),
         Some((wnd_tx.clone(), window_tx_store.clone())),
         Some(gesture_tap_tx.clone()),
         opt.one,
@@ -308,6 +308,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let process_actor = ProcessActor::new(wm_controller_sender.clone());
 
     let stack_line_hit_rects = rift_wm::actor::stack_line::new_shared_hit_rects();
+    let hints_bar_hit_rects = rift_wm::actor::hints_bar::new_shared_hit_rects();
     let event_tap = EventTap::new(
         config.clone(),
         events_tx.clone(),
@@ -315,6 +316,8 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         wm_controller_sender.clone(),
         stack_line_tx.clone(),
         stack_line_hit_rects.clone(),
+        hints_bar_tx.clone(),
+        hints_bar_hit_rects.clone(),
     );
     let gesture_tap = GestureTap::new(config.clone(), wm_controller_sender.clone(), gesture_tap_rx);
     let menu = Menu::new(
@@ -331,6 +334,13 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         events_tx.clone(),
         CoordinateConverter::default(),
         stack_line_hit_rects,
+    );
+    let hints_bar = HintsBar::new(
+        config.clone(),
+        hints_bar_rx,
+        mtm,
+        events_tx.clone(),
+        hints_bar_hit_rects,
     );
 
     let mission_control = MissionControlActor::new(config.clone(), mc_rx, reactor.clone(), mtm);
@@ -370,6 +380,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             supervise("gesture_tap", gesture_tap.run()),
             supervise("menu", menu.run()),
             supervise("stack_line", stack_line.run()),
+            supervise("hints_bar", hints_bar.run()),
             supervise("window_notify", wn_actor.run()),
             supervise("mc_native", mission_control_native.run()),
             supervise("mission_control", mission_control.run()),

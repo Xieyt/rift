@@ -86,7 +86,7 @@ use crate::actor::app::{AppInfo, AppThreadHandle, Quiet, Request, WindowId, Wind
 use crate::actor::raise_manager::{self, RaiseManager, RaiseRequest};
 use crate::actor::reactor::events::window_discovery;
 use crate::actor::spaces::{ForwardedSpaceState, TopologyWindowDelta};
-use crate::actor::{self, menu_bar, stack_line};
+use crate::actor::{self, hints_bar, menu_bar, stack_line};
 use crate::common::collections::{BTreeMap, HashMap, HashSet};
 use crate::common::config::Config;
 use crate::layout_engine::{self as layout, Direction, LayoutEngine, LayoutEvent};
@@ -328,6 +328,7 @@ impl Reactor {
         broadcast_tx: BroadcastSender,
         menu_tx: menu_bar::Sender,
         stack_line_tx: stack_line::Sender,
+        hints_bar_tx: hints_bar::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         gesture_tap_tx: Option<gesture_tap::Sender>,
         one_space: bool,
@@ -345,6 +346,7 @@ impl Reactor {
         reactor.communication_manager.event_tap_tx = Some(event_tap_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
+        reactor.communication_manager.hints_bar_tx = Some(hints_bar_tx);
         reactor.communication_manager.gesture_tap_tx = gesture_tap_tx;
         reactor.communication_manager.events_tx = Some(events_tx_clone.clone());
         let query_handle = ReactorQueryHandle::new(events_tx_clone.clone());
@@ -400,6 +402,7 @@ impl Reactor {
                 event_tap_tx: None,
                 gesture_tap_tx: None,
                 stack_line_tx: None,
+                hints_bar_tx: None,
                 raise_manager_tx,
                 event_broadcaster: broadcast_tx,
                 wm_sender: None,
@@ -1564,6 +1567,12 @@ impl Reactor {
                     command_workflow::ToggleSpacePayload { config, space, display_uuid },
                 );
             }
+            Event::Command(Command::Reactor(ReactorCommand::ToggleHintsBar)) => {
+                if let Some(tx) = &self.communication_manager.hints_bar_tx {
+                    let _ = tx.try_send(hints_bar::Event::Toggle);
+                }
+                return Ok(EventOutcome::default());
+            }
             Event::Command(Command::Reactor(ReactorCommand::ShowMissionControlAll)) => {
                 return command_workflow::handle_mission_control_command(
                     crate::actor::wm_controller::WmCmd::ShowMissionControlAll,
@@ -1998,6 +2007,11 @@ impl Reactor {
                 && let Err(error) = tx.try_send(stack_line::Event::ConfigUpdated(config.clone()))
             {
                 warn!(%error, "failed to update stack line config");
+            }
+            if let Some(tx) = &self.communication_manager.hints_bar_tx
+                && let Err(error) = tx.try_send(hints_bar::Event::ConfigUpdated(config.clone()))
+            {
+                warn!(%error, "failed to update hints bar config");
             }
             if let Some(tx) = &self.menu_manager.menu_tx
                 && let Err(error) = tx.try_send(menu_bar::Event::ConfigUpdated(config.clone()))

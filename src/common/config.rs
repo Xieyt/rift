@@ -59,9 +59,7 @@ pub enum ConfigCommand {
 fn home_dir() -> PathBuf { dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp")) }
 pub fn data_dir() -> PathBuf { home_dir().join(".rift") }
 pub fn restore_file() -> PathBuf { data_dir().join("layout.ron") }
-pub fn config_file() -> PathBuf {
-    home_dir().join(".config").join("rift").join("config.toml")
-}
+pub fn config_file() -> PathBuf { home_dir().join(".config").join("rift").join("config.toml") }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
@@ -429,6 +427,8 @@ pub struct UiSettings {
     pub stack_line: StackLineSettings,
     #[serde(default)]
     pub mission_control: MissionControlSettings,
+    #[serde(default)]
+    pub hints_bar: HintsBarSettings,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
@@ -636,6 +636,133 @@ pub enum VerticalPlacement {
 impl StackLineSettings {
     pub fn thickness(&self) -> f64 { if self.enabled { self.thickness } else { 0.0 } }
 }
+
+/// When the scrolling-strip hint bar is shown.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarVisibility {
+    /// Passive minimap shown whenever a scrolling workspace is active.
+    #[default]
+    Always,
+    /// Hidden until toggled on with the `toggle_hints_bar` command.
+    OnDemand,
+    /// Hidden, but flashes for `auto_hide_ms` whenever the strip changes.
+    Auto,
+}
+
+/// How the hint bar occupies vertical space.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarPlacement {
+    /// Floats over the bottom edge of the tiled windows (no reflow).
+    #[default]
+    Overlay,
+    /// Reserves its own strip; the scrolling tiling area shrinks to fit.
+    Reserve,
+}
+
+/// Which edge the hint bar sits on.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarPosition {
+    #[default]
+    Bottom,
+    Top,
+}
+
+/// How much per-column detail the hint bar renders.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarDensity {
+    /// Hint letter + app name on one row.
+    #[default]
+    Compact,
+    /// Hint letter, app name, and window title.
+    Full,
+    /// Position pills only, no text.
+    Dots,
+}
+
+/// Scrolling-strip hint bar: a horizontal minimap of every column in the
+/// active niri-style workspace, on-screen and off. Click a segment to focus
+/// that column.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HintsBarSettings {
+    #[serde(default = "no")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub position: HintsBarPosition,
+    #[serde(default)]
+    pub placement: HintsBarPlacement,
+    #[serde(default)]
+    pub visibility: HintsBarVisibility,
+    #[serde(default)]
+    pub density: HintsBarDensity,
+    /// Bar height in points.
+    #[serde(default = "default_hints_bar_height")]
+    pub height: f64,
+    /// Auto-hide delay (ms) after the strip last changed, for `visibility = auto`.
+    #[serde(default = "default_hints_bar_auto_hide_ms")]
+    pub auto_hide_ms: u64,
+    /// Home-row keys dealt across the strip left -> right (also the click order).
+    #[serde(default = "default_hints_bar_keys")]
+    pub keys: String,
+    /// Colors as hex ("#RRGGBB" or "#RRGGBBAA"); unset uses built-in defaults.
+    /// `background` = bar fill, `focused_color` = focused-column fill,
+    /// `viewport_color` = on-screen-region tint, `label_color` / `hint_color`
+    /// = app-name and hint-letter text.
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub focused_color: Option<String>,
+    #[serde(default)]
+    pub viewport_color: Option<String>,
+    #[serde(default)]
+    pub label_color: Option<String>,
+    #[serde(default)]
+    pub hint_color: Option<String>,
+    /// Text size in points; unset scales to the bar height.
+    #[serde(default)]
+    pub font_size: Option<f64>,
+}
+
+impl Default for HintsBarSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            position: HintsBarPosition::default(),
+            placement: HintsBarPlacement::default(),
+            visibility: HintsBarVisibility::default(),
+            density: HintsBarDensity::default(),
+            height: default_hints_bar_height(),
+            auto_hide_ms: default_hints_bar_auto_hide_ms(),
+            keys: default_hints_bar_keys(),
+            background: None,
+            focused_color: None,
+            viewport_color: None,
+            label_color: None,
+            hint_color: None,
+            font_size: None,
+        }
+    }
+}
+
+impl HintsBarSettings {
+    /// Vertical space the bar removes from the scrolling tiling area: only
+    /// non-zero when enabled AND reserving its own strip.
+    pub fn reserved_thickness(&self) -> f64 {
+        if self.enabled && self.placement == HintsBarPlacement::Reserve {
+            self.height.max(0.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+fn default_hints_bar_height() -> f64 { 26.0 }
+fn default_hints_bar_auto_hide_ms() -> u64 { 1000 }
+fn default_hints_bar_keys() -> String { "asdfghjkl;".to_string() }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]

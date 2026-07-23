@@ -71,6 +71,7 @@ pub enum WmCmd {
     ShowMissionControlCurrent,
     DismissMissionControl,
     CloseWindow,
+    ToggleHintsBar,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -383,6 +384,11 @@ impl WmController {
             Command(Wm(CloseWindow)) => {
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Reactor(
                     reactor::ReactorCommand::CloseWindow { window_server_id: None },
+                )));
+            }
+            Command(Wm(ToggleHintsBar)) => {
+                self.events_tx.send(reactor::Event::Command(reactor::Command::Reactor(
+                    reactor::ReactorCommand::ToggleHintsBar,
                 )));
             }
             Command(Wm(Exec(cmd))) => {
