@@ -10,9 +10,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use objc2::msg_send;
+use objc2::{MainThreadMarker, msg_send};
 use objc2::rc::Retained;
-use objc2_app_kit::{NSRunningApplication, NSStatusWindowLevel};
+use objc2_app_kit::{NSRunningApplication, NSScreen, NSStatusWindowLevel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::NSString;
 use objc2_quartz_core::{CALayer, CATextLayer};
@@ -20,7 +20,7 @@ use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::config::{
-    HintsBarAlign, HintsBarDensity, HintsBarDetailStyle, HintsBarPad, HintsBarPosition,
+    HintsBarAlign, HintsBarDensity, HintsBarDetailStyle, HintsBarNotch, HintsBarPad, HintsBarPosition,
     HintsBarSettings,
 };
 use crate::sys::app::NSRunningApplicationExt;
@@ -111,6 +111,7 @@ pub struct HintsBarStyle {
     pub hint_color: Color,
     pub position: HintsBarPosition,
     pub align: HintsBarAlign,
+    pub notch: HintsBarNotch,
     pub blur: u32,
     pub show_titles: bool,
     pub detail_style: HintsBarDetailStyle,
@@ -132,6 +133,7 @@ impl Default for HintsBarStyle {
             hint_color: Color::new(1.0, 0.82, 0.44, 1.0),
             position: HintsBarPosition::Bottom,
             align: HintsBarAlign::Center,
+            notch: HintsBarNotch::Flow,
             blur: 0,
             show_titles: false,
             detail_style: HintsBarDetailStyle::Popover,
@@ -159,6 +161,7 @@ impl From<&HintsBarSettings> for HintsBarStyle {
             hint_color: hex(&c.hint_color, d.hint_color),
             position: c.position,
             align: c.align,
+            notch: c.notch,
             blur: c.blur,
             show_titles: c.show_titles,
             detail_style: c.detail.style,
@@ -186,6 +189,9 @@ pub struct HintsBar {
     scale: f64,
     /// Focused-column detail overlay (popover, or a docked bar).
     detail: RefCell<Option<DetailWindow>>,
+    /// Cached notch geometry (static per display config) to avoid an NSScreen
+    /// query on every render; keyed by the display rect.
+    notch_cache: RefCell<Option<(CGRect, Option<(f64, f64, f64)>)>>,
 }
 
 impl HintsBar {
@@ -231,6 +237,7 @@ impl HintsBar {
                 chip_rects: Vec::new(),
             }),
             detail: RefCell::new(None),
+            notch_cache: RefCell::new(None),
             scale,
         })
     }
@@ -430,6 +437,39 @@ impl HintsBar {
         layer
     }
 
+    /// Notch gap for the display holding `disp`, cached (the notch is static):
+    /// `(left_x, right_x, height)` in display coordinates, or `None` if none.
+    fn display_notch_gap(&self, disp: CGRect) -> Option<(f64, f64, f64)> {
+        if let Some((cached_disp, cached)) = *self.notch_cache.borrow() {
+            if cached_disp == disp {
+                return cached;
+            }
+        }
+        let result = Self::compute_notch_gap(disp);
+        *self.notch_cache.borrow_mut() = Some((disp, result));
+        result
+    }
+
+    fn compute_notch_gap(disp: CGRect) -> Option<(f64, f64, f64)> {
+        let mtm = MainThreadMarker::new()?;
+        let cx = disp.origin.x + disp.size.width / 2.0;
+        for s in NSScreen::screens(mtm).iter() {
+            let f = s.frame();
+            if cx < f.origin.x || cx >= f.origin.x + f.size.width {
+                continue;
+            }
+            let top = s.safeAreaInsets().top;
+            if top <= 0.0 {
+                return None;
+            }
+            let atl = s.auxiliaryTopLeftArea();
+            let atr = s.auxiliaryTopRightArea();
+            let (left, right) = (atl.origin.x + atl.size.width, atr.origin.x);
+            return (right > left).then_some((left, right, top));
+        }
+        None
+    }
+
     fn rebuild_layers(&self) {
         let mut state = self.state.borrow_mut();
         let style = state.style;
@@ -459,11 +499,42 @@ impl HintsBar {
                 widths.insert(0, ws_w);
             }
 
+            let frame = *self.frame.borrow();
+            // Notch gap (bar-local) for a top bar that sits on the notch row.
+            let notch = if vertical {
+                None
+            } else {
+                self.display_notch_gap(state.data.screen).and_then(|(nl, nr, nh)| {
+                    (frame.origin.y < nh).then_some((nl - frame.origin.x, nr - frame.origin.x))
+                })
+            };
+
+            // `notch = "stop"`: shrink the layout region to the aligned side so
+            // chips never cross the notch.
+            let mut layout_bounds = bounds;
+            if matches!(style.notch, HintsBarNotch::Stop) {
+                if let Some((nl, nr)) = notch {
+                    match style.align {
+                        HintsBarAlign::Start => {
+                            layout_bounds.size.width =
+                                (nl - bounds.origin.x).clamp(1.0, bounds.size.width);
+                        }
+                        HintsBarAlign::End => {
+                            let x = nr.max(bounds.origin.x);
+                            layout_bounds.origin.x = x;
+                            layout_bounds.size.width =
+                                (bounds.origin.x + bounds.size.width - x).max(1.0);
+                        }
+                        HintsBarAlign::Center => {}
+                    }
+                }
+            }
+
             let mut rects = if vertical {
                 let align_right = matches!(style.position, HintsBarPosition::Right);
                 Self::layout_chips_vertical(bounds, &widths, style.height, align_right)
             } else {
-                Self::layout_chips(bounds, &widths)
+                Self::layout_chips(layout_bounds, &widths)
             };
             // The pure layout functions center the row/column; shift it to hug
             // the near (`start`) or far (`end`) end per `align`.
@@ -482,8 +553,8 @@ impl HintsBar {
                         }
                     }
                 } else {
-                    let near = bounds.origin.x + MARGIN;
-                    let far = bounds.origin.x + bounds.size.width - MARGIN;
+                    let near = layout_bounds.origin.x + MARGIN;
+                    let far = layout_bounds.origin.x + layout_bounds.size.width - MARGIN;
                     let dx = match style.align {
                         HintsBarAlign::Start => near - first.origin.x,
                         HintsBarAlign::End => far - (last.origin.x + last.size.width),
@@ -497,6 +568,26 @@ impl HintsBar {
                 }
             }
 
+            // `notch = "flow"`: the first chip that meets the notch stretches
+            // across it — the physical notch hides the middle slice, so the chip's
+            // tail resumes on the right; following chips shift along by the gap.
+            if matches!(style.notch, HintsBarNotch::Flow) {
+                if let Some((nl, nr)) = notch {
+                    if let Some(i) = rects
+                        .iter()
+                        .position(|r| r.origin.x + r.size.width > nl && r.origin.x < nr)
+                    {
+                        let gap = nr - nl;
+                        if gap > 0.0 {
+                            rects[i].size.width += gap;
+                            for c in &mut rects[(i + 1)..] {
+                                c.origin.x += gap;
+                            }
+                        }
+                    }
+                }
+            }
+
             // Separate the workspace badge slot from the column chips.
             let (ws_rect, chip_rects): (Option<CGRect>, Vec<CGRect>) =
                 if show_ws && !rects.is_empty() {
@@ -505,31 +596,52 @@ impl HintsBar {
                     (None, rects.clone())
                 };
 
-            // Capsule background hugging everything (badge + chips).
-            if let (Some(first), Some(last)) = (rects.first(), rects.last()) {
-                let cap_pad = 6.0;
-                let cap_rect = if vertical {
-                    let x0 = (first.origin.x - cap_pad).max(0.0);
-                    let y0 = (first.origin.y - cap_pad).max(0.0);
-                    let y1 = (last.origin.y + last.size.height + cap_pad).min(bounds.size.height);
-                    CGRect::new(
-                        CGPoint::new(x0, y0),
-                        CGSize::new(first.size.width + 2.0 * cap_pad, (y1 - y0).max(1.0)),
-                    )
-                } else {
-                    let x0 = (first.origin.x - cap_pad).max(0.0);
-                    let x1 = (last.origin.x + last.size.width + cap_pad).min(bounds.size.width);
-                    CGRect::new(
-                        CGPoint::new(x0, 0.0),
-                        CGSize::new((x1 - x0).max(1.0), bounds.size.height),
-                    )
-                };
-                let radius = (cap_rect.size.width.min(cap_rect.size.height) * 0.5).min(14.0);
-                let cap = self.add_rounded(cap_rect, style.background, radius);
-                cap.setShadowColor(Some(&objc2_app_kit::NSColor::blackColor().CGColor()));
-                cap.setShadowOpacity(0.22);
-                cap.setShadowRadius(4.0);
-                cap.setShadowOffset(CGSize::new(0.0, 1.5));
+            // Capsule background per contiguous run of badge+chips. A large gap
+            // (chips flowing around a notch) splits it into separate capsules so
+            // no empty background spans the gap.
+            let cap_pad = 6.0;
+            if !rects.is_empty() {
+                let mut start = 0usize;
+                for k in 1..=rects.len() {
+                    let split = k == rects.len() || {
+                        let prev = rects[k - 1];
+                        let gap = if vertical {
+                            rects[k].origin.y - (prev.origin.y + prev.size.height)
+                        } else {
+                            rects[k].origin.x - (prev.origin.x + prev.size.width)
+                        };
+                        gap > 40.0
+                    };
+                    if split {
+                        let first = rects[start];
+                        let last = rects[k - 1];
+                        let cap_rect = if vertical {
+                            let x0 = (first.origin.x - cap_pad).max(0.0);
+                            let y0 = (first.origin.y - cap_pad).max(0.0);
+                            let y1 = (last.origin.y + last.size.height + cap_pad)
+                                .min(bounds.size.height);
+                            CGRect::new(
+                                CGPoint::new(x0, y0),
+                                CGSize::new(first.size.width + 2.0 * cap_pad, (y1 - y0).max(1.0)),
+                            )
+                        } else {
+                            let x0 = (first.origin.x - cap_pad).max(0.0);
+                            let x1 = (last.origin.x + last.size.width + cap_pad)
+                                .min(bounds.size.width);
+                            CGRect::new(
+                                CGPoint::new(x0, 0.0),
+                                CGSize::new((x1 - x0).max(1.0), bounds.size.height),
+                            )
+                        };
+                        let radius = (cap_rect.size.width.min(cap_rect.size.height) * 0.5).min(14.0);
+                        let cap = self.add_rounded(cap_rect, style.background, radius);
+                        cap.setShadowColor(Some(&objc2_app_kit::NSColor::blackColor().CGColor()));
+                        cap.setShadowOpacity(0.22);
+                        cap.setShadowRadius(4.0);
+                        cap.setShadowOffset(CGSize::new(0.0, 1.5));
+                        start = k;
+                    }
+                }
             }
 
             // Viewport grouping behind the on-screen columns.
@@ -543,11 +655,12 @@ impl HintsBar {
                 self.render_workspace(wr, &workspace, &style, fs);
             }
 
+            let chip_notch = if matches!(style.notch, HintsBarNotch::Flow) { notch } else { None };
             for (cell, rect) in cells.iter().zip(chip_rects.iter()) {
                 if dots {
                     self.render_dot(*rect, cell, &style);
                 } else {
-                    self.render_chip(*rect, cell, &style, fs);
+                    self.render_chip(*rect, cell, &style, fs, chip_notch);
                 }
             }
 
@@ -605,7 +718,14 @@ impl HintsBar {
     }
 
     /// `compact` / `full` density: focus fill + hint keycap + app icon + label.
-    fn render_chip(&self, rect: CGRect, cell: &ColumnCell, style: &HintsBarStyle, fs: f64) {
+    fn render_chip(
+        &self,
+        rect: CGRect,
+        cell: &ColumnCell,
+        style: &HintsBarStyle,
+        fs: f64,
+        notch: Option<(f64, f64)>,
+    ) {
         if cell.focused {
             self.root_layer.addSublayer(&make_selection_layer(
                 rect,
@@ -684,22 +804,71 @@ impl HintsBar {
                 false,
             ));
         } else {
-            self.root_layer.addSublayer(&self.text_layer(
+            self.add_label(
                 cell.primary(style.show_titles),
-                CGRect::new(
-                    CGPoint::new(cursor, rect.origin.y),
-                    CGSize::new(text_w, rect.size.height),
-                ),
+                cursor,
+                cursor + text_w,
+                rect.origin.y,
+                rect.size.height,
                 fs,
                 label_color,
-                false,
-            ));
+                notch,
+            );
         }
 
         if count > 1 {
             let bx = rect.origin.x + rect.size.width - PAD_X - badge_w;
             self.render_count_badge(bx, rect, count, cell.focused, style, fs, badge_w);
         }
+    }
+
+    /// Render a chip label; if it spans a notch, split it so the tail continues
+    /// just past the notch instead of vanishing under it.
+    #[allow(clippy::too_many_arguments)]
+    fn add_label(
+        &self,
+        text: &str,
+        tx: f64,
+        label_right: f64,
+        y: f64,
+        h: f64,
+        fs: f64,
+        color: Color,
+        notch: Option<(f64, f64)>,
+    ) {
+        if let Some((nl, nr)) = notch {
+            if tx < nl - 2.0 && label_right > nr + 2.0 {
+                let per = (fs * 0.56).max(1.0);
+                let n = text.chars().count();
+                let fit = (((nl - tx) / per).floor() as usize).min(n);
+                let left: String = text.chars().take(fit).collect();
+                let right: String = text.chars().skip(fit).collect();
+                self.root_layer.addSublayer(&self.text_layer(
+                    &left,
+                    CGRect::new(CGPoint::new(tx, y), CGSize::new((nl - tx).max(1.0), h)),
+                    fs,
+                    color,
+                    false,
+                ));
+                if !right.is_empty() {
+                    self.root_layer.addSublayer(&self.text_layer(
+                        &right,
+                        CGRect::new(CGPoint::new(nr, y), CGSize::new((label_right - nr).max(1.0), h)),
+                        fs,
+                        color,
+                        false,
+                    ));
+                }
+                return;
+            }
+        }
+        self.root_layer.addSublayer(&self.text_layer(
+            text,
+            CGRect::new(CGPoint::new(tx, y), CGSize::new((label_right - tx).max(1.0), h)),
+            fs,
+            color,
+            false,
+        ));
     }
 
     /// Small pill showing the window count of a multi-window column.

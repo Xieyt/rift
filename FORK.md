@@ -184,9 +184,12 @@ indicator method, one trait default, one engine arm + command.
   is overlay-only), `placement` (`overlay` floats over windows / `reserve`
   shrinks the scrolling tiling area, horizontal only), `visibility` (`always` /
   `on_demand` / `auto` flash), `density` (compact/full/dots), `height` (chip
-  thickness / row height), `auto_hide_ms`, `keys`, hex colors, and `pad`
-  (per-side `{ top, bottom, left, right }` px insetting the whole bar from the
-  display edges — shared `HintsBarPad` type). The focused-column
+  thickness / row height), `auto_hide_ms`, `keys`, hex colors, `pad` (per-side
+  `{ top, bottom, left, right }` px insetting the whole bar — shared `HintsBarPad`),
+  `align` (`start`/`center`/`end` along the edge), and `notch` (`flow` = the
+  crossing chip stretches across the notch with its label continuing past it /
+  `stop` = end before it / `ignore`; only acts when a top
+  bar sits on the notch row). The focused-column
   detail is its own sub-table `[settings.ui.hints_bar.detail]`: `style` =
   `popover` (card next to the focused chip) or `bar` (a second hint-bar strip of
   the column's windows). For `bar`: `position` (`bottom`/`top` horizontal,
@@ -211,6 +214,12 @@ indicator method, one trait default, one engine arm + command.
   are left in for benchmarking; see §6 "Benchmarking a perf change". A naive
   build re-rendered on every layout apply (~1,649 renders for 100 focus moves);
   this is ~15× fewer.
+- **External-bar reservation:** `[settings.layout] external_bar_top` /
+  `external_bar_bottom` (px) inset the tiling frame at the top/bottom so tiled
+  windows never sit under an external bar like **sketchybar** — every layout,
+  independent of the hint bar (`managers.rs` shrinks `tiling_frame`). Pair with a
+  `hints_bar` `placement = "overlay"` + `align = "start"` to float rift's bar on
+  the left of that strip while sketchybar owns the right.
 
 **Why:** a niri-style "where am I in the strip + what's in each column" HUD; it
 also supersedes the stack-line tab bar for scrolling (turn `stack_line` off).

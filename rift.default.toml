@@ -250,6 +250,12 @@ keys = "asdfghjkl;"
 # label_color = "#ffffff"        # app-name text
 # hint_color = "#ffd479"         # hint-letter text
 # font_size = 13.0               # text size (default scales to height)
+# which end of the bar the chips sit at: "start" (left), "center", "end" (right)
+align = "center"
+# how the bar handles a display notch when it sits on the notch row (e.g. lifted
+# over sketchybar via a negative pad.top): "flow" (crossing chip stretches across
+# the notch, label continuing past it), "stop" (chips stop before it), "ignore"
+notch = "flow"
 # per-side padding (px) insetting the whole bar from the display edges
 pad = { top = 0.0, bottom = 0.0, left = 0.0, right = 0.0 }
 

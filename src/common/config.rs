@@ -717,6 +717,19 @@ pub enum HintsBarAlign {
     End,
 }
 
+/// How a top bar handles a display notch when it sits on the notch row.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarNotch {
+    /// Chips flow around it: fill left, skip the notch, resume on the right.
+    #[default]
+    Flow,
+    /// Chips stop before the notch (clamped to the aligned side).
+    Stop,
+    /// Ignore the notch; chips may render under it.
+    Ignore,
+}
+
 /// The focused-column detail: how it's shown, and (for `bar`) which edge it
 /// docks to, where it sits along that edge, and its padding.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
@@ -808,6 +821,10 @@ pub struct HintsBarSettings {
     /// Which end of the bar the chips sit at: `start`/`center`/`end`.
     #[serde(default = "default_align_center")]
     pub align: HintsBarAlign,
+    /// How the bar handles a display notch when it sits on the notch row:
+    /// `flow` (around it), `stop` (before it), or `ignore`.
+    #[serde(default)]
+    pub notch: HintsBarNotch,
     /// Focused-column detail: `[settings.ui.hints_bar.detail]` — `style`
     /// (`popover`/`bar`), plus `position`/`align`/`pad` for `bar`.
     #[serde(default)]
@@ -836,6 +853,7 @@ impl Default for HintsBarSettings {
             show_workspace: false,
             pad: HintsBarPad::default(),
             align: HintsBarAlign::Center,
+            notch: HintsBarNotch::default(),
             detail: HintsBarDetailSettings::default(),
         }
     }
