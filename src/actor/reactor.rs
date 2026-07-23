@@ -403,6 +403,7 @@ impl Reactor {
                 gesture_tap_tx: None,
                 stack_line_tx: None,
                 hints_bar_tx: None,
+                hints_bar_last_sig: crate::common::collections::HashMap::default(),
                 raise_manager_tx,
                 event_broadcaster: broadcast_tx,
                 wm_sender: None,

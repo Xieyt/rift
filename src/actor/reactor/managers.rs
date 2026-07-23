@@ -142,6 +142,7 @@ pub struct CommunicationManager {
     pub gesture_tap_tx: Option<gesture_tap::Sender>,
     pub stack_line_tx: Option<stack_line::Sender>,
     pub hints_bar_tx: Option<hints_bar::Sender>,
+    pub hints_bar_last_sig: HashMap<SpaceId, u64>,
     pub raise_manager_tx: raise_manager::Sender,
     pub event_broadcaster: BroadcastSender,
     pub wm_sender: Option<wm_controller::Sender>,
@@ -303,6 +304,35 @@ fn build_hints_bar_cells(
         });
     }
     cells
+}
+
+/// Cheap content signature of a hint-bar snapshot, so the reactor can skip
+/// re-sending an identical bar (nothing downstream would change).
+fn hints_bar_sig(
+    cells: &[crate::ui::hints_bar::ColumnCell],
+    workspace: &str,
+    frame: CGRect,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    workspace.hash(&mut h);
+    frame.origin.x.to_bits().hash(&mut h);
+    frame.origin.y.to_bits().hash(&mut h);
+    frame.size.width.to_bits().hash(&mut h);
+    frame.size.height.to_bits().hash(&mut h);
+    for c in cells {
+        c.hint.hash(&mut h);
+        c.active.hash(&mut h);
+        c.tabbed.hash(&mut h);
+        c.focused.hash(&mut h);
+        c.visible.hash(&mut h);
+        for m in &c.members {
+            m.window_id.hash(&mut h);
+            m.label.hash(&mut h);
+            m.title.hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 impl LayoutManager {
@@ -487,64 +517,75 @@ impl LayoutManager {
                 }
 
                 // Feed the scrolling-strip hint bar for the active display space.
-                if reactor.config.settings.ui.hints_bar.enabled
-                    && active_space == Some(space)
-                    && let Some(tx) = &reactor.communication_manager.hints_bar_tx
-                {
-                    let hb = &reactor.config.settings.ui.hints_bar;
-                    let is_scrolling =
-                        reactor.layout_manager.layout_engine.active_layout_mode_at(space)
-                            == LayoutMode::Scrolling;
-                    let cells = if is_scrolling {
-                        build_hints_bar_cells(reactor, &layout, screen_frame, hb, &group_infos)
-                    } else {
-                        Vec::new()
-                    };
-                    use crate::common::config::HintsBarPosition as HbPos;
-                    let h = hb.height.max(1.0);
-                    let bar_frame = match hb.position {
-                        HbPos::Bottom => CGRect::new(
-                            CGPoint::new(
-                                screen_frame.origin.x,
-                                screen_frame.origin.y + screen_frame.size.height - h,
+                if reactor.config.settings.ui.hints_bar.enabled && active_space == Some(space) {
+                    if let Some(tx) = reactor.communication_manager.hints_bar_tx.clone() {
+                        let is_scrolling =
+                            reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                                == LayoutMode::Scrolling;
+                        let cells = if is_scrolling {
+                            let hb = &reactor.config.settings.ui.hints_bar;
+                            build_hints_bar_cells(reactor, &layout, screen_frame, hb, &group_infos)
+                        } else {
+                            Vec::new()
+                        };
+
+                        use crate::common::config::HintsBarPosition as HbPos;
+                        let hb = &reactor.config.settings.ui.hints_bar;
+                        let h = hb.height.max(1.0);
+                        let show_workspace = hb.show_workspace;
+                        let bar_frame = match hb.position {
+                            HbPos::Bottom => CGRect::new(
+                                CGPoint::new(
+                                    screen_frame.origin.x,
+                                    screen_frame.origin.y + screen_frame.size.height - h,
+                                ),
+                                CGSize::new(screen_frame.size.width, h),
                             ),
-                            CGSize::new(screen_frame.size.width, h),
-                        ),
-                        HbPos::Top => CGRect::new(
-                            CGPoint::new(screen_frame.origin.x, screen_frame.origin.y),
-                            CGSize::new(screen_frame.size.width, h),
-                        ),
-                        // Vertical: a full-height column at the edge; the UI sizes
-                        // the capsule to content within it and hugs the edge.
-                        HbPos::Right | HbPos::Left => {
-                            let w = (screen_frame.size.width * 0.35).clamp(160.0, 360.0);
-                            let x = if matches!(hb.position, HbPos::Right) {
-                                screen_frame.origin.x + screen_frame.size.width - w
-                            } else {
-                                screen_frame.origin.x
-                            };
-                            CGRect::new(
-                                CGPoint::new(x, screen_frame.origin.y),
-                                CGSize::new(w, screen_frame.size.height),
-                            )
+                            HbPos::Top => CGRect::new(
+                                CGPoint::new(screen_frame.origin.x, screen_frame.origin.y),
+                                CGSize::new(screen_frame.size.width, h),
+                            ),
+                            HbPos::Right | HbPos::Left => {
+                                let w = (screen_frame.size.width * 0.35).clamp(160.0, 360.0);
+                                let x = if matches!(hb.position, HbPos::Right) {
+                                    screen_frame.origin.x + screen_frame.size.width - w
+                                } else {
+                                    screen_frame.origin.x
+                                };
+                                CGRect::new(
+                                    CGPoint::new(x, screen_frame.origin.y),
+                                    CGSize::new(w, screen_frame.size.height),
+                                )
+                            }
+                        };
+                        let workspace = if show_workspace {
+                            reactor
+                                .layout_manager
+                                .layout_engine
+                                .active_workspace_idx(space)
+                                .map(|i| (i + 1).to_string())
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+
+                        // Skip redundant sends: nothing downstream changes when the
+                        // signature matches the last one we pushed for this space.
+                        let sig = hints_bar_sig(&cells, &workspace, bar_frame);
+                        let unchanged =
+                            reactor.communication_manager.hints_bar_last_sig.get(&space)
+                                == Some(&sig);
+                        if !unchanged {
+                            reactor.communication_manager.hints_bar_last_sig.insert(space, sig);
+                            tracing::trace!(target: "hbbench", "hb_sent");
+                            let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
+                                space_id: space,
+                                bar_frame,
+                                cells,
+                                workspace,
+                            }));
                         }
-                    };
-                    let workspace = if hb.show_workspace {
-                        reactor
-                            .layout_manager
-                            .layout_engine
-                            .active_workspace_idx(space)
-                            .map(|i| (i + 1).to_string())
-                            .unwrap_or_default()
-                    } else {
-                        String::new()
-                    };
-                    let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
-                        space_id: space,
-                        bar_frame,
-                        cells,
-                        workspace,
-                    }));
+                    }
                 }
 
                 if let Some(workspace_id) =

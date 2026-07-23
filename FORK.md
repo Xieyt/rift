@@ -193,6 +193,15 @@ indicator method, one trait default, one engine arm + command.
   upscales on Retina (grainy). The `auto`-flash timer uses `sys::timer::Timer`
   (CFRunLoop), **not** `tokio::time` — actors run on a custom CFRunLoop executor
   with no tokio runtime, so `tokio::time::sleep` panics at runtime.
+- **Performance (unconditional):** the bar only re-renders when its content
+  actually changes — reactor-side snapshot **dedup** (skip identical), a 12 ms
+  **debounce** (coalesce bursts, e.g. a scroll gesture), **render-gating** (skip
+  unchanged so idle/redundant applies do nothing), and a per-pid **icon cache**
+  (icons resolved once, not re-rasterized each render). No config knob — these
+  are always on. `trace!(target: "hbbench", …)` counters (`hb_sent`/`hb_render`)
+  are left in for benchmarking; see §6 "Benchmarking a perf change". A naive
+  build re-rendered on every layout apply (~1,649 renders for 100 focus moves);
+  this is ~15× fewer.
 
 **Why:** a niri-style "where am I in the strip + what's in each column" HUD; it
 also supersedes the stack-line tab bar for scrolling (turn `stack_line` off).
@@ -388,6 +397,75 @@ Note: the baseline isn't guaranteed clean under the *latest* nightly (CI's
 `@nightly` floats; the flake pins one via `flake.lock`), so `fmt-check` may flag
 files you didn't touch. That drift is pre-existing — do **not** reformat them, or
 you recreate the churn.
+
+### Benchmarking a perf change (counter-based A/B)
+
+We caught a real CPU hog this way: the hint bar re-rendered on *every* layout
+apply, and one focus move fans out to ~16 applies inside the WM — so 100 focus
+moves = ~1,649 bar renders. The fix (skip-unchanged render + debounce + reactor
+dedup) cut that ~15×. This is the repeatable method for any "is it actually
+faster?" question — counting discrete events beats eyeballing `%CPU`.
+
+**1. Instrument with counters.** Emit one `trace!` per event on a dedicated
+target, so you can count from the log with zero noise at normal levels:
+
+- `src/actor/reactor/managers.rs` — `trace!(target: "hbbench", "hb_sent")` per
+  snapshot the reactor pushes to the bar.
+- `src/actor/hints_bar.rs` — `trace!(target: "hbbench", "hb_render")` per actual
+  render.
+
+They are `trace!`, hence silent by default. Enable by adding `hbbench=trace` to
+`RUST_LOG` (the nix module `services.rift.logLevel`, or the launch plist env)
+then `just restart`. (While actively benchmarking it's fine to bump them to
+`info!` temporarily so they show under the default `info` level.)
+
+**2. A/B the two versions.** These three optimizations are now *unconditional* —
+we removed the `coalesce` toggle once it was validated (they're strictly better;
+see the numbers below). To compare a *future* change, either temporarily gate it
+behind a throwaway hot-reloadable config flag (flip it + re-run the same workload,
+no rebuild — what we did here), or build two git revisions and run the identical
+workload against each.
+
+**3. Run identical workloads, diff the counts.** Drive deterministic load with
+`rift-cli` (each command triggers one layout apply) and count with `grep -c`:
+
+```bash
+CLI=./target/release-fast/rift-cli            # or ./result/bin/rift-cli
+count() { grep -c "$1" /tmp/rift.err.log; }
+bench() { local l="$1"; shift; local r0 s0
+  r0=$(count hb_render); s0=$(count hb_sent)
+  "$@"; sleep 0.7
+  echo "$l: sent=$(( $(count hb_sent)-s0 )) render=$(( $(count hb_render)-r0 ))"; }
+
+# redundant applies (scroll clamps to the same spot) + genuine changes (focus)
+redundant() { for _ in $(seq 100); do $CLI execute layout scroll-strip 999 >/dev/null; done; }
+focus()     { for _ in $(seq 50);  do $CLI execute window focus left >/dev/null
+                                       $CLI execute window focus right >/dev/null; done; }
+
+bench "redundant" redundant
+bench "focus"     focus
+# then swap in the other build (or flip the temp flag) and re-run the same two
+```
+
+Results we measured (sent / render):
+
+| workload       | naive       | optimized |
+|----------------|-------------|-----------|
+| idle (3 s)     | 1 / 2       | 0 / 0     |
+| redundant ×100 | 106 / 106   | 1 / 1     |
+| focus ×100     | 1649 / 1649 | 146 / 107 |
+
+The focus row is the tell: the naive bar rendered on all ~1,649 fan-out applies;
+the fix collapses it via reactor dedup (skip identical snapshots) + a 12 ms
+debounce (coalesce bursts) + render-gating (skip unchanged, so idle/redundant →
+~0).
+
+**Generalize it:** for any subsystem — (a) add `trace!(target: "<name>bench", …)`
+counters at the hot points, (b) put the optimization behind a hot-reloadable
+config flag, (c) A/B the same `rift-cli`-driven workload and diff the counts. One
+build covers both sides. For a wall-clock cross-check, sample the process instead:
+`ps -o cputime= -p "$(pgrep -f Rift.app/Contents/MacOS/rift)"` before/after a
+fixed workload and diff — lower CPU-time for the same work = win.
 
 ---
 

@@ -70,6 +70,10 @@ pub struct HintsBar {
     auto_pending: bool,
     /// Delay to (re)arm the hide timer with on the next run-loop turn.
     pending_arm: Option<Duration>,
+    /// Newest snapshot awaiting the debounce window (coalesces bursts).
+    pending: Option<Snapshot>,
+    /// Whether the debounce timer is currently armed.
+    debounce_armed: bool,
 }
 
 impl HintsBar {
@@ -92,22 +96,37 @@ impl HintsBar {
             user_shown: false,
             auto_pending: false,
             pending_arm: None,
+            pending: None,
+            debounce_armed: false,
         }
     }
 
     pub async fn run(mut self) {
-        // CFRunLoop-backed timer for the `auto`-mode flash; re-armed via
-        // `set_next_fire` whenever `pending_arm` is set by event handling.
+        // Auto-flash hide timer + a short debounce that coalesces bursts of
+        // snapshots (e.g. during a scroll gesture) into a single render.
+        const DEBOUNCE_MS: u64 = 12;
         let mut hide_timer = Timer::manual();
+        let mut debounce_timer = Timer::manual();
         loop {
             tokio::select! {
                 msg = self.rx.recv() => match msg {
                     Some((span, event)) => {
                         let _guard = span.enter();
-                        self.handle_event(event);
-                        if let Some(delay) = self.pending_arm.take() {
-                            hide_timer.set_next_fire(delay);
-                            self.auto_pending = true;
+                        match event {
+                            Event::Snapshot(s) => {
+                                // Keep only the newest; render after the window.
+                                self.pending = Some(s);
+                                if !self.debounce_armed {
+                                    debounce_timer
+                                        .set_next_fire(Duration::from_millis(DEBOUNCE_MS));
+                                    self.debounce_armed = true;
+                                }
+                            }
+                            other => {
+                                self.flush_pending();
+                                self.handle_event(other);
+                                self.arm_hide(&mut hide_timer);
+                            }
                         }
                     }
                     None => break,
@@ -116,9 +135,29 @@ impl HintsBar {
                     self.auto_pending = false;
                     self.hide();
                 }
+                _ = debounce_timer.next(), if self.debounce_armed => {
+                    self.debounce_armed = false;
+                    self.flush_pending();
+                    self.arm_hide(&mut hide_timer);
+                }
             }
         }
     }
+
+    fn flush_pending(&mut self) {
+        if let Some(snapshot) = self.pending.take() {
+            self.on_snapshot(snapshot);
+        }
+    }
+
+    fn arm_hide(&mut self, hide_timer: &mut Timer) {
+        if let Some(delay) = self.pending_arm.take() {
+            hide_timer.set_next_fire(delay);
+            self.auto_pending = true;
+        }
+    }
+
+    fn bar_visible(&self) -> bool { self.bar.as_ref().is_some_and(|b| b.is_visible()) }
 
     fn is_enabled(&self) -> bool { self.config.settings.ui.hints_bar.enabled }
 
@@ -216,7 +255,9 @@ impl HintsBar {
         };
 
         if show {
-            self.render(snapshot.bar_frame, snapshot.cells, snapshot.workspace);
+            if changed || !self.bar_visible() {
+                self.render(snapshot.bar_frame, snapshot.cells, snapshot.workspace);
+            }
         } else {
             self.hide();
         }
@@ -233,6 +274,7 @@ impl HintsBar {
     }
 
     fn render(&mut self, frame: CGRect, cells: Vec<ColumnCell>, workspace: String) {
+        tracing::trace!(target: "hbbench", "hb_render");
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
 
         let bar = match &self.bar {
