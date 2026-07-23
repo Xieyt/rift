@@ -151,6 +151,18 @@ dev-install profile="release-fast" config="dev-config.toml":
       echo "!! {{app}} missing — run \`just install\` once to create the bundle." >&2
       exit 1
     fi
+    # Snapshot the running layout BEFORE rebuilding, using the current rift-cli
+    # (matches the running rift), so the post-restart `--restore` reloads it.
+    # `FRESH=1` (or `just dev-install-fresh`) skips the snapshot and clears the
+    # master file for a clean slate (e.g. to escape a scrambled layout).
+    if [ "${FRESH:-0}" = "1" ]; then
+      rm -f "$HOME/.rift/layout.ron"
+      echo "==> fresh: cleared ~/.rift/layout.ron (clean layout on restart)"
+    elif [ -x "target/{{profile}}/rift-cli" ]; then
+      target/{{profile}}/rift-cli execute save-layout --master 2>/dev/null \
+        && echo "==> saved layout snapshot (~/.rift/layout.ron)" \
+        || echo "note: no running rift to snapshot (fresh start?)"
+    fi
     echo "==> cargo build (--profile {{profile}}, incremental)"
     nix develop -c cargo build --profile {{profile}} --bin rift --bin rift-cli
     bin="target/{{profile}}/rift"
@@ -167,27 +179,45 @@ dev-install profile="release-fast" config="dev-config.toml":
     sudo mv -f "$tmp" "{{app}}/Contents/MacOS/rift"
     sudo /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "{{app}}/Contents/MacOS/rift"
     sudo /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "{{app}}"
-    # Point the launch agent at a repo-local test config via `--config`, so you can
-    # iterate on keybinds/settings without touching your real ~/.config. Editing the
-    # file hot-reloads (hot_reload=true in it); only a config-PATH change needs the
-    # bootout/bootstrap below (kickstart won't pick up new ProgramArguments).
+    # Ensure the launch agent runs [--restore --config <cfg>] and has
+    # /opt/homebrew/bin on PATH so run_on_start scripts resolve `sketchybar`
+    # (temporary shim until `just fern` bakes PATH into the nix module). Any
+    # plist change needs a bootout/bootstrap — kickstart won't pick up edits.
     plist="$HOME/Library/LaunchAgents/git.acsandmann.rift.plist"
+    hb="/opt/homebrew/bin"
     cfg=""
     if [ -n "{{config}}" ] && [ -f "{{config}}" ]; then
       cfg="$(cd "$(dirname "{{config}}")" && pwd)/$(basename "{{config}}")"
     fi
     if [ -n "$cfg" ] && [ -f "$plist" ]; then
-      current="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:2' "$plist" 2>/dev/null || echo '')"
-      if [ "$current" != "$cfg" ]; then
-        echo "==> pointing launch agent at $cfg (reloading agent)"
-        chmod u+w "$plist"
-        /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' "$plist"
+      chmod u+w "$plist" 2>/dev/null || true
+      need_reload=0
+      cur_restore="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:1' "$plist" 2>/dev/null || echo '')"
+      cur_cfg="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$plist" 2>/dev/null || echo '')"
+      if [ "$cur_restore" != "--restore" ] || [ "$cur_cfg" != "$cfg" ]; then
+        /usr/libexec/PlistBuddy -c 'Delete :ProgramArguments' "$plist" 2>/dev/null || true
         /usr/libexec/PlistBuddy -c 'Add :ProgramArguments array' "$plist"
         /usr/libexec/PlistBuddy -c "Add :ProgramArguments:0 string {{app}}/Contents/MacOS/rift" "$plist"
-        /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:1 string --config' "$plist"
-        /usr/libexec/PlistBuddy -c "Add :ProgramArguments:2 string $cfg" "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:1 string --restore' "$plist"
+        /usr/libexec/PlistBuddy -c 'Add :ProgramArguments:2 string --config' "$plist"
+        /usr/libexec/PlistBuddy -c "Add :ProgramArguments:3 string $cfg" "$plist"
+        echo "==> set launch agent args [--restore --config $cfg]"
+        need_reload=1
+      fi
+      cur_path="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:PATH' "$plist" 2>/dev/null || echo '')"
+      case ":$cur_path:" in
+        *":$hb:"*) : ;;
+        *)
+          new_path="$hb${cur_path:+:$cur_path}"
+          /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:PATH $new_path" "$plist" 2>/dev/null \
+            || { /usr/libexec/PlistBuddy -c 'Add :EnvironmentVariables dict' "$plist" 2>/dev/null || true; \
+                 /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:PATH string $new_path" "$plist"; }
+          echo "==> added $hb to agent PATH"
+          need_reload=1
+          ;;
+      esac
+      if [ "$need_reload" = 1 ]; then
         # bootout is async; bootstrapping before teardown finishes returns EIO(5).
-        # Poll until the service is gone, then bootstrap (retry once on a lingering race).
         launchctl bootout {{agent}} 2>/dev/null || true
         for _ in $(seq 1 50); do
           launchctl print {{agent}} >/dev/null 2>&1 || break
@@ -198,7 +228,7 @@ dev-install profile="release-fast" config="dev-config.toml":
         echo "✓ rift swapped ({{profile}}), config=$cfg, agent reloaded."
       else
         just restart
-        echo "✓ rift swapped ({{profile}}), config=$cfg, restarted."
+        echo "✓ rift swapped ({{profile}}), config=$cfg, layout restored, restarted."
       fi
     else
       [ -n "{{config}}" ] && [ -z "$cfg" ] && echo "note: config '{{config}}' not found; using the agent's existing --config."
@@ -209,6 +239,10 @@ dev-install profile="release-fast" config="dev-config.toml":
     # Reload hyperkey launch agent (workaround for it not restarting cleanly)
     launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
     launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
+
+# Like `dev-install` but discards the saved layout snapshot for a clean slate.
+dev-install-fresh profile="release-fast" config="dev-config.toml":
+    @FRESH=1 just dev-install {{profile}} {{config}}
 
 # one-time: create a stable self-signed code-signing cert in the System keychain
 # so the Accessibility grant survives rebuilds. Requires admin.
