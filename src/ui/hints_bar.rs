@@ -19,7 +19,10 @@ use objc2_quartz_core::{CALayer, CATextLayer};
 use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
-use crate::common::config::{HintsBarDensity, HintsBarPosition, HintsBarSettings};
+use crate::common::config::{
+    HintsBarAlign, HintsBarDensity, HintsBarDetailStyle, HintsBarPad, HintsBarPosition,
+    HintsBarSettings,
+};
 use crate::sys::app::NSRunningApplicationExt;
 use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
 use crate::ui::common::{render_layer_to_cgs_window, with_disabled_actions};
@@ -90,6 +93,9 @@ pub struct HintsBarData {
     pub cells: Vec<ColumnCell>,
     /// Active workspace badge label (empty = none).
     pub workspace: String,
+    /// Full display rect (CGS top-left coords) the bar is on; lets a docked
+    /// `bar` detail pin to a screen edge. Zero when unset.
+    pub screen: CGRect,
 }
 
 /// Resolved visual style, derived from `HintsBarSettings`.
@@ -104,8 +110,13 @@ pub struct HintsBarStyle {
     pub label_color: Color,
     pub hint_color: Color,
     pub position: HintsBarPosition,
+    pub align: HintsBarAlign,
     pub blur: u32,
     pub show_titles: bool,
+    pub detail_style: HintsBarDetailStyle,
+    pub detail_position: HintsBarPosition,
+    pub detail_align: HintsBarAlign,
+    pub detail_pad: HintsBarPad,
 }
 
 impl Default for HintsBarStyle {
@@ -120,8 +131,13 @@ impl Default for HintsBarStyle {
             label_color: Color::new(0.95, 0.95, 0.97, 1.0),
             hint_color: Color::new(1.0, 0.82, 0.44, 1.0),
             position: HintsBarPosition::Bottom,
+            align: HintsBarAlign::Center,
             blur: 0,
             show_titles: false,
+            detail_style: HintsBarDetailStyle::Popover,
+            detail_position: HintsBarPosition::Bottom,
+            detail_align: HintsBarAlign::End,
+            detail_pad: HintsBarPad::default(),
         }
     }
 }
@@ -142,8 +158,13 @@ impl From<&HintsBarSettings> for HintsBarStyle {
             label_color: hex(&c.label_color, d.label_color),
             hint_color: hex(&c.hint_color, d.hint_color),
             position: c.position,
+            align: c.align,
             blur: c.blur,
             show_titles: c.show_titles,
+            detail_style: c.detail.style,
+            detail_position: c.detail.position,
+            detail_align: c.detail.align,
+            detail_pad: c.detail.pad,
         }
     }
 }
@@ -163,8 +184,8 @@ pub struct HintsBar {
     state: RefCell<BarState>,
     /// Display backing scale (2.0 on Retina) — drives crisp rasterization.
     scale: f64,
-    /// Detail popover shown above the focused multi-window column.
-    pill: RefCell<Option<PillWindow>>,
+    /// Focused-column detail overlay (popover, or a docked bar).
+    detail: RefCell<Option<DetailWindow>>,
 }
 
 impl HintsBar {
@@ -209,7 +230,7 @@ impl HintsBar {
                 visible: false,
                 chip_rects: Vec::new(),
             }),
-            pill: RefCell::new(None),
+            detail: RefCell::new(None),
             scale,
         })
     }
@@ -245,15 +266,15 @@ impl HintsBar {
         self.rebuild_layers();
         self.present();
         let result = self.cgs_window.order_above(None);
-        self.update_pill();
+        self.update_detail();
         result
     }
 
     /// Hide the bar without discarding its data.
     pub fn hide(&self) -> Result<(), CgsWindowError> {
         self.state.borrow_mut().visible = false;
-        if let Some(pill) = self.pill.borrow().as_ref() {
-            pill.hide();
+        if let Some(detail) = self.detail.borrow().as_ref() {
+            detail.hide();
         }
         self.cgs_window.order_out()
     }
@@ -438,12 +459,43 @@ impl HintsBar {
                 widths.insert(0, ws_w);
             }
 
-            let rects = if vertical {
+            let mut rects = if vertical {
                 let align_right = matches!(style.position, HintsBarPosition::Right);
                 Self::layout_chips_vertical(bounds, &widths, style.height, align_right)
             } else {
                 Self::layout_chips(bounds, &widths)
             };
+            // The pure layout functions center the row/column; shift it to hug
+            // the near (`start`) or far (`end`) end per `align`.
+            if let (Some(first), Some(last)) = (rects.first().copied(), rects.last().copied()) {
+                if vertical {
+                    let near = bounds.origin.y + MARGIN;
+                    let far = bounds.origin.y + bounds.size.height - MARGIN;
+                    let dy = match style.align {
+                        HintsBarAlign::Start => near - first.origin.y,
+                        HintsBarAlign::End => far - (last.origin.y + last.size.height),
+                        HintsBarAlign::Center => 0.0,
+                    };
+                    if dy.abs() > 0.01 {
+                        for c in &mut rects {
+                            c.origin.y += dy;
+                        }
+                    }
+                } else {
+                    let near = bounds.origin.x + MARGIN;
+                    let far = bounds.origin.x + bounds.size.width - MARGIN;
+                    let dx = match style.align {
+                        HintsBarAlign::Start => near - first.origin.x,
+                        HintsBarAlign::End => far - (last.origin.x + last.size.width),
+                        HintsBarAlign::Center => 0.0,
+                    };
+                    if dx.abs() > 0.01 {
+                        for c in &mut rects {
+                            c.origin.x += dx;
+                        }
+                    }
+                }
+            }
 
             // Separate the workspace badge slot from the column chips.
             let (ws_rect, chip_rects): (Option<CGRect>, Vec<CGRect>) =
@@ -555,7 +607,11 @@ impl HintsBar {
     /// `compact` / `full` density: focus fill + hint keycap + app icon + label.
     fn render_chip(&self, rect: CGRect, cell: &ColumnCell, style: &HintsBarStyle, fs: f64) {
         if cell.focused {
-            self.add_rounded(rect, style.focused_color, rect.size.height * 0.42);
+            self.root_layer.addSublayer(&make_selection_layer(
+                rect,
+                style.hint_color,
+                rect.size.height * 0.42,
+            ));
         }
 
         let dim = !cell.visible && !cell.focused;
@@ -748,9 +804,9 @@ impl HintsBar {
         layer
     }
 
-    /// Show/refresh (or hide) the detail pill above the focused multi-window
-    /// column, listing each window's icon + name with the active one filled.
-    fn update_pill(&self) {
+    /// Show/refresh (or hide) the focused-column detail overlay (popover card or
+    /// docked bar), listing each window's icon + name with the active one filled.
+    fn update_detail(&self) {
         let picked = {
             let st = self.state.borrow();
             let style = st.style;
@@ -759,33 +815,92 @@ impl HintsBar {
                 .iter()
                 .enumerate()
                 .find(|(_, c)| c.focused && c.members.len() > 1)
-                .and_then(|(i, c)| st.chip_rects.get(i).map(|r| (*r, c.clone(), style)))
+                .and_then(|(i, c)| {
+                    st.chip_rects.get(i).map(|r| (*r, c.clone(), style, st.data.screen))
+                })
         };
-        let Some((chip, cell, style)) = picked else {
-            if let Some(pill) = self.pill.borrow().as_ref() {
-                pill.hide();
+        let Some((chip, cell, style, screen)) = picked else {
+            if let Some(detail) = self.detail.borrow().as_ref() {
+                detail.hide();
             }
             return;
         };
 
         let bar = *self.frame.borrow();
         let fs = style.font_size.unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
-        let pad = 6.0;
-        let row_h = fs + 12.0;
-        let icon_sz = fs + 2.0;
-        let name_w = cell
-            .members
-            .iter()
-            .map(|m| {
-                let t = if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
-                Self::approx_text_width(t, fs)
-            })
-            .fold(0.0_f64, f64::max)
-            .min(300.0);
-        let pill_w = (pad + 4.0 + icon_sz + 6.0 + name_w + pad).clamp(150.0, 380.0);
-        let pill_h = cell.members.len() as f64 * row_h + 2.0 * pad;
-        let (px, py) = if style.position.is_vertical() {
-            // Pill beside the chip: left of a right-edge bar, right of a left-edge bar.
+        let (pill_w, pill_h) = if matches!(style.detail_style, HintsBarDetailStyle::Popover) {
+            let pad = 6.0;
+            let row_h = fs + 12.0;
+            let icon_sz = fs + 2.0;
+            let name_w = cell
+                .members
+                .iter()
+                .map(|m| {
+                    let t =
+                        if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+                    Self::approx_text_width(t, fs)
+                })
+                .fold(0.0_f64, f64::max)
+                .min(300.0);
+            let pill_w = (pad + 4.0 + icon_sz + 6.0 + name_w + pad).clamp(150.0, 380.0);
+            let pill_h = cell.members.len() as f64 * row_h + 2.0 * pad;
+            (pill_w, pill_h)
+        } else if style.detail_position.is_vertical() {
+            // Bar docked to a side: a vertical stack of window chips.
+            let n = cell.members.len();
+            let row_h = fs + 12.0;
+            let widest = cell
+                .members
+                .iter()
+                .map(|m| member_chip_w(m, &style, fs))
+                .fold(0.0_f64, f64::max);
+            (widest + 12.0, n as f64 * row_h + 12.0)
+        } else {
+            // Bar docked to bottom/top: a horizontal row of window chips.
+            let n = cell.members.len();
+            let total: f64 = cell.members.iter().map(|m| member_chip_w(m, &style, fs)).sum::<f64>()
+                + CHIP_GAP * n.saturating_sub(1) as f64;
+            (total + 12.0, style.height)
+        };
+        let (px, py) = if matches!(style.detail_style, HintsBarDetailStyle::Bar) {
+            // Dock the detail bar to its own edge, positioned along it by `align`.
+            let disp =
+                if screen.size.width > 1.0 && screen.size.height > 1.0 { screen } else { bar };
+            let l = disp.origin.x;
+            let t = disp.origin.y;
+            let r = l + disp.size.width;
+            let b = t + disp.size.height;
+            let p = style.detail_pad;
+            match style.detail_position {
+                HintsBarPosition::Bottom | HintsBarPosition::Top => {
+                    let x = match style.detail_align {
+                        HintsBarAlign::Start => l + p.left,
+                        HintsBarAlign::Center => l + (disp.size.width - pill_w) / 2.0,
+                        HintsBarAlign::End => r - pill_w - p.right,
+                    };
+                    let y = if matches!(style.detail_position, HintsBarPosition::Bottom) {
+                        b - pill_h - p.bottom
+                    } else {
+                        t + p.top
+                    };
+                    (x.max(l), y)
+                }
+                HintsBarPosition::Left | HintsBarPosition::Right => {
+                    let y = match style.detail_align {
+                        HintsBarAlign::Start => t + p.top,
+                        HintsBarAlign::Center => t + (disp.size.height - pill_h) / 2.0,
+                        HintsBarAlign::End => b - pill_h - p.bottom,
+                    };
+                    let x = if matches!(style.detail_position, HintsBarPosition::Right) {
+                        r - pill_w - p.right
+                    } else {
+                        l + p.left
+                    };
+                    (x, y.max(t))
+                }
+            }
+        } else if style.position.is_vertical() {
+            // Popover beside the chip: left of a right-edge bar, right of a left-edge bar.
             let chip_x = bar.origin.x + chip.origin.x;
             let cy = bar.origin.y + chip.origin.y + chip.size.height / 2.0;
             let py = (cy - pill_h / 2.0).max(0.0);
@@ -804,17 +919,17 @@ impl HintsBar {
         };
         let frame = CGRect::new(CGPoint::new(px, py), CGSize::new(pill_w, pill_h));
 
-        let mut pill = self.pill.borrow_mut();
-        if pill.is_none() {
-            match PillWindow::new(frame, self.scale, style.blur) {
-                Ok(p) => *pill = Some(p),
+        let mut detail = self.detail.borrow_mut();
+        if detail.is_none() {
+            match DetailWindow::new(frame, self.scale, style.blur) {
+                Ok(p) => *detail = Some(p),
                 Err(err) => {
-                    warn!(?err, "hints_bar: failed to create pill window");
+                    warn!(?err, "hints_bar: failed to create detail window");
                     return;
                 }
             }
         }
-        if let Some(p) = pill.as_ref() {
+        if let Some(p) = detail.as_ref() {
             p.show(frame, &cell, &style, fs);
         }
     }
@@ -824,6 +939,17 @@ fn make_rounded_layer(frame: CGRect, color: Color, radius: f64) -> Retained<CALa
     let l = CALayer::layer();
     l.setFrame(frame);
     l.setBackgroundColor(Some(&color.to_nscolor().CGColor()));
+    l.setCornerRadius(radius.min(frame.size.height / 2.0).min(frame.size.width / 2.0));
+    l
+}
+
+/// A non-obscuring selection highlight: a soft translucent tint of the accent,
+/// no border or opaque fill.
+fn make_selection_layer(frame: CGRect, accent: Color, radius: f64) -> Retained<CALayer> {
+    let l = CALayer::layer();
+    l.setFrame(frame);
+    let fill = Color::new(accent.r, accent.g, accent.b, (accent.a * 0.38).min(0.42));
+    l.setBackgroundColor(Some(&fill.to_nscolor().CGColor()));
     l.setCornerRadius(radius.min(frame.size.height / 2.0).min(frame.size.width / 2.0));
     l
 }
@@ -894,13 +1020,23 @@ fn make_icon_layer(pid: pid_t, frame: CGRect, opacity: f32) -> Option<Retained<C
     Some(layer)
 }
 
-/// A borderless popover above the bar listing a column's windows.
-struct PillWindow {
+/// Horizontal chip width for a focused-column window in the `bar` pill style,
+/// mirroring the hint bar's own chip sizing (icon + label, no hint letter).
+fn member_chip_w(m: &WindowMember, style: &HintsBarStyle, fs: f64) -> f64 {
+    let icon_w = fs + 4.0;
+    let text: &str =
+        if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+    let tw = HintsBar::approx_text_width(text, fs).min(MAX_TEXT_W);
+    (PAD_X + icon_w + BADGE_GAP + tw + PAD_X).max(MIN_CHIP_W)
+}
+
+/// A borderless overlay window for the focused-column detail.
+struct DetailWindow {
     cgs: CgsWindow,
     root: Retained<CALayer>,
 }
 
-impl PillWindow {
+impl DetailWindow {
     fn new(frame: CGRect, scale: f64, blur: u32) -> Result<Self, CgsWindowError> {
         let root = CALayer::layer();
         root.setGeometryFlipped(true);
@@ -924,9 +1060,6 @@ impl PillWindow {
         let _ = self.cgs.set_shape(frame);
         self.root.setFrame(CGRect::new(CGPoint::new(0.0, 0.0), frame.size));
         let bounds = CGRect::new(CGPoint::new(0.0, 0.0), frame.size);
-        let pad = 6.0;
-        let row_h = fs + 12.0;
-        let icon_sz = fs + 2.0;
         with_disabled_actions(|| {
             unsafe { self.root.setSublayers(None) };
             let bg = make_rounded_layer(bounds, style.background, 10.0);
@@ -935,46 +1068,144 @@ impl PillWindow {
             bg.setShadowRadius(6.0);
             bg.setShadowOffset(CGSize::new(0.0, 2.0));
             self.root.addSublayer(&bg);
-            for (i, m) in cell.members.iter().enumerate() {
-                let ry = pad + i as f64 * row_h;
-                let active = i == cell.active;
-                if active {
-                    let fill = make_rounded_layer(
-                        CGRect::new(
-                            CGPoint::new(pad - 2.0, ry),
-                            CGSize::new((bounds.size.width - 2.0 * (pad - 2.0)).max(1.0), row_h),
-                        ),
-                        style.focused_color,
-                        6.0,
-                    );
-                    self.root.addSublayer(&fill);
+            match style.detail_style {
+                HintsBarDetailStyle::Popover => self.layout_popover(bounds, cell, style, fs),
+                HintsBarDetailStyle::Bar if style.detail_position.is_vertical() => {
+                    self.layout_bar_vertical(bounds, cell, style, fs)
                 }
-                let iy = ry + (row_h - icon_sz) / 2.0;
-                if let Some(l) = make_icon_layer(
-                    m.window_id.pid,
-                    CGRect::new(CGPoint::new(pad + 4.0, iy), CGSize::new(icon_sz, icon_sz)),
-                    1.0,
-                ) {
-                    self.root.addSublayer(&l);
-                }
-                let tx = pad + 4.0 + icon_sz + 6.0;
-                let tw = (bounds.size.width - tx - pad).max(0.0);
-                let tc = if active {
-                    Color::new(1.0, 1.0, 1.0, 1.0)
-                } else {
-                    style.label_color
-                };
-                self.root.addSublayer(&make_text_layer(
-                    if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label },
-                    CGRect::new(CGPoint::new(tx, ry), CGSize::new(tw, row_h)),
-                    fs,
-                    tc,
-                    false,
-                ));
+                HintsBarDetailStyle::Bar => self.layout_bar(bounds, cell, style, fs),
             }
         });
         render_layer_to_cgs_window(self.cgs.id(), frame.size, &self.root);
         let _ = self.cgs.order_above(None);
+    }
+
+    /// Horizontal rows: icon + app name, active one filled.
+    fn layout_popover(&self, bounds: CGRect, cell: &ColumnCell, style: &HintsBarStyle, fs: f64) {
+        let pad = 6.0;
+        let row_h = fs + 12.0;
+        let icon_sz = fs + 2.0;
+        for (i, m) in cell.members.iter().enumerate() {
+            let ry = pad + i as f64 * row_h;
+            let active = i == cell.active;
+            if active {
+                let fill = make_selection_layer(
+                    CGRect::new(
+                        CGPoint::new(pad - 2.0, ry),
+                        CGSize::new((bounds.size.width - 2.0 * (pad - 2.0)).max(1.0), row_h),
+                    ),
+                    style.focused_color,
+                    6.0,
+                );
+                self.root.addSublayer(&fill);
+            }
+            let iy = ry + (row_h - icon_sz) / 2.0;
+            if let Some(l) = make_icon_layer(
+                m.window_id.pid,
+                CGRect::new(CGPoint::new(pad + 4.0, iy), CGSize::new(icon_sz, icon_sz)),
+                1.0,
+            ) {
+                self.root.addSublayer(&l);
+            }
+            let tx = pad + 4.0 + icon_sz + 6.0;
+            let tw = (bounds.size.width - tx - pad).max(0.0);
+            let tc = if active { Color::new(1.0, 1.0, 1.0, 1.0) } else { style.label_color };
+            self.root.addSublayer(&make_text_layer(
+                if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label },
+                CGRect::new(CGPoint::new(tx, ry), CGSize::new(tw, row_h)),
+                fs,
+                tc,
+                false,
+            ));
+        }
+    }
+
+    /// `bar` style docked to a side: the focused column's windows as a vertical
+    /// stack of chips (icon + label, active filled).
+    fn layout_bar_vertical(
+        &self,
+        bounds: CGRect,
+        cell: &ColumnCell,
+        style: &HintsBarStyle,
+        fs: f64,
+    ) {
+        let cap_pad = 6.0;
+        let row_h = fs + 12.0;
+        let chip_w = (bounds.size.width - 2.0 * cap_pad).max(1.0);
+        let icon_sz = (fs + 4.0).min(row_h - 4.0).max(1.0);
+        for (i, m) in cell.members.iter().enumerate() {
+            let y = cap_pad + i as f64 * row_h;
+            let active = i == cell.active;
+            if active {
+                self.root.addSublayer(&make_selection_layer(
+                    CGRect::new(CGPoint::new(cap_pad, y), CGSize::new(chip_w, row_h)),
+                    style.focused_color,
+                    row_h * 0.42,
+                ));
+            }
+            let iy = y + (row_h - icon_sz) / 2.0;
+            if let Some(l) = make_icon_layer(
+                m.window_id.pid,
+                CGRect::new(CGPoint::new(cap_pad + PAD_X, iy), CGSize::new(icon_sz, icon_sz)),
+                1.0,
+            ) {
+                self.root.addSublayer(&l);
+            }
+            let tx = cap_pad + PAD_X + icon_sz + BADGE_GAP;
+            let tw = (cap_pad + chip_w - PAD_X - tx).max(0.0);
+            let tc = if active { Color::new(1.0, 1.0, 1.0, 1.0) } else { style.label_color };
+            let text: &str =
+                if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+            self.root.addSublayer(&make_text_layer(
+                text,
+                CGRect::new(CGPoint::new(tx, y), CGSize::new(tw, row_h)),
+                fs,
+                tc,
+                false,
+            ));
+        }
+    }
+
+    /// `bar` style: the focused column's windows as horizontal chips (icon +
+    /// label, active filled) in a capsule — the bottom-right sibling of the bar.
+    fn layout_bar(&self, bounds: CGRect, cell: &ColumnCell, style: &HintsBarStyle, fs: f64) {
+        let cap_pad = 6.0;
+        let chip_h = (bounds.size.height - 2.0 * V_INSET).max(1.0);
+        let cy = V_INSET;
+        let icon_sz = (fs + 4.0).min(chip_h - 4.0).max(1.0);
+        let mut x = cap_pad;
+        for (i, m) in cell.members.iter().enumerate() {
+            let active = i == cell.active;
+            let chip_w = member_chip_w(m, style, fs);
+            if active {
+                self.root.addSublayer(&make_selection_layer(
+                    CGRect::new(CGPoint::new(x, cy), CGSize::new(chip_w, chip_h)),
+                    style.focused_color,
+                    chip_h * 0.42,
+                ));
+            }
+            let iy = cy + (chip_h - icon_sz) / 2.0;
+            if let Some(l) = make_icon_layer(
+                m.window_id.pid,
+                CGRect::new(CGPoint::new(x + PAD_X, iy), CGSize::new(icon_sz, icon_sz)),
+                1.0,
+            ) {
+                self.root.addSublayer(&l);
+            }
+            let tx = x + PAD_X + icon_sz + BADGE_GAP;
+            let tw = (x + chip_w - PAD_X - tx).max(0.0);
+            let tc = if active { Color::new(1.0, 1.0, 1.0, 1.0) } else { style.label_color };
+            let text: &str =
+                if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+            self.root.addSublayer(&make_text_layer(
+                text,
+                CGRect::new(CGPoint::new(tx, cy), CGSize::new(tw, chip_h)),
+                fs,
+                tc,
+                false,
+            ));
+            x += chip_w + CHIP_GAP;
+        }
     }
 }
 

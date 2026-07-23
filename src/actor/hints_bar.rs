@@ -33,6 +33,8 @@ pub fn new_shared_hit_rects() -> SharedHitRects { Arc::new(ArcSwap::from_pointee
 pub struct Snapshot {
     pub space_id: SpaceId,
     pub bar_frame: CGRect,
+    /// Full display rect the bar is on (for right-edge pill placement).
+    pub screen_frame: CGRect,
     pub cells: Vec<ColumnCell>,
     /// Active workspace badge label (empty = don't show).
     pub workspace: String,
@@ -256,7 +258,12 @@ impl HintsBar {
 
         if show {
             if changed || !self.bar_visible() {
-                self.render(snapshot.bar_frame, snapshot.cells, snapshot.workspace);
+                self.render(
+                    snapshot.bar_frame,
+                    snapshot.screen_frame,
+                    snapshot.cells,
+                    snapshot.workspace,
+                );
             }
         } else {
             self.hide();
@@ -273,7 +280,7 @@ impl HintsBar {
         NSScreen::mainScreen(self.mtm).map(|s| s.backingScaleFactor()).unwrap_or(2.0)
     }
 
-    fn render(&mut self, frame: CGRect, cells: Vec<ColumnCell>, workspace: String) {
+    fn render(&mut self, frame: CGRect, screen: CGRect, cells: Vec<ColumnCell>, workspace: String) {
         tracing::trace!(target: "hbbench", "hb_render");
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
 
@@ -298,7 +305,7 @@ impl HintsBar {
             },
         };
 
-        if let Err(err) = bar.update(style, HintsBarData { cells, workspace }) {
+        if let Err(err) = bar.update(style, HintsBarData { cells, workspace, screen }) {
             warn!(?err, "hints_bar: update failed");
         }
         self.sync_hit_rects();

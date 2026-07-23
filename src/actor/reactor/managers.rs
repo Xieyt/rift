@@ -533,28 +533,30 @@ impl LayoutManager {
                         let hb = &reactor.config.settings.ui.hints_bar;
                         let h = hb.height.max(1.0);
                         let show_workspace = hb.show_workspace;
+                        let p = hb.pad;
+                        let sx = screen_frame.origin.x;
+                        let sy = screen_frame.origin.y;
+                        let sw = screen_frame.size.width;
+                        let sh = screen_frame.size.height;
                         let bar_frame = match hb.position {
                             HbPos::Bottom => CGRect::new(
-                                CGPoint::new(
-                                    screen_frame.origin.x,
-                                    screen_frame.origin.y + screen_frame.size.height - h,
-                                ),
-                                CGSize::new(screen_frame.size.width, h),
+                                CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
+                                CGSize::new((sw - p.left - p.right).max(1.0), h),
                             ),
                             HbPos::Top => CGRect::new(
-                                CGPoint::new(screen_frame.origin.x, screen_frame.origin.y),
-                                CGSize::new(screen_frame.size.width, h),
+                                CGPoint::new(sx + p.left, sy + p.top),
+                                CGSize::new((sw - p.left - p.right).max(1.0), h),
                             ),
                             HbPos::Right | HbPos::Left => {
-                                let w = (screen_frame.size.width * 0.35).clamp(160.0, 360.0);
+                                let w = (sw * 0.35).clamp(160.0, 360.0);
                                 let x = if matches!(hb.position, HbPos::Right) {
-                                    screen_frame.origin.x + screen_frame.size.width - w
+                                    sx + sw - w - p.right
                                 } else {
-                                    screen_frame.origin.x
+                                    sx + p.left
                                 };
                                 CGRect::new(
-                                    CGPoint::new(x, screen_frame.origin.y),
-                                    CGSize::new(w, screen_frame.size.height),
+                                    CGPoint::new(x, sy + p.top),
+                                    CGSize::new(w, (sh - p.top - p.bottom).max(1.0)),
                                 )
                             }
                         };
@@ -581,6 +583,7 @@ impl LayoutManager {
                             let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
                                 space_id: space,
                                 bar_frame,
+                                screen_frame,
                                 cells,
                                 workspace,
                             }));

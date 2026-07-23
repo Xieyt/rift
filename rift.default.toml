@@ -243,6 +243,23 @@ keys = "asdfghjkl;"
 # label_color = "#ffffff"        # app-name text
 # hint_color = "#ffd479"         # hint-letter text
 # font_size = 13.0               # text size (default scales to height)
+# per-side padding (px) insetting the whole bar from the display edges
+pad = { top = 0.0, bottom = 0.0, left = 0.0, right = 0.0 }
+
+# focused-column detail (its own sub-table): shows the focused column's windows
+[settings.ui.hints_bar.detail]
+# "popover" = floating card next to the focused chip (icon + name rows)
+# "bar"     = a second hint-bar strip of the focused column's windows
+style = "popover"
+# for style="bar", which screen edge it docks to (like the main bar's position):
+#   bottom/top  = horizontal row of window chips
+#   left/right  = vertical stack of window chips
+position = "right"
+# where the bar sits along that edge: "start" (top/left), "center", "end" (bottom/right).
+# on a shared edge, `end` also pushes the column bar to the opposite side.
+align = "end"
+# per-side padding (px) from the display edges, for style="bar"
+pad = { top = 0.0, bottom = 0.0, left = 0.0, right = 0.0 }
 
 # experimental mission control
 [settings.ui.mission_control]

@@ -692,6 +692,64 @@ pub enum HintsBarDensity {
     Dots,
 }
 
+/// How the focused multi-window column's detail is shown.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarDetailStyle {
+    /// A floating card next to the focused chip: icon + name rows.
+    #[default]
+    Popover,
+    /// A second hint-bar-style strip of the focused column's windows, docked to
+    /// its own `position` (left/right render vertically, like the main bar).
+    Bar,
+}
+
+/// Where a bar's content sits along its docked edge.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarAlign {
+    /// Top (left/right edge) or left (bottom/top edge).
+    Start,
+    /// Centered along the edge.
+    Center,
+    /// Bottom (left/right edge) or right (bottom/top edge).
+    #[default]
+    End,
+}
+
+/// The focused-column detail: how it's shown, and (for `bar`) which edge it
+/// docks to, where it sits along that edge, and its padding.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct HintsBarDetailSettings {
+    #[serde(default)]
+    pub style: HintsBarDetailStyle,
+    /// `bar` only: `bottom`/`top` (horizontal) or `left`/`right` (vertical stack).
+    #[serde(default)]
+    pub position: HintsBarPosition,
+    /// `bar` only: where it sits along its edge — `start`/`center`/`end`.
+    #[serde(default)]
+    pub align: HintsBarAlign,
+    /// `bar` only: per-side padding (px) from the display edges.
+    #[serde(default)]
+    pub pad: HintsBarPad,
+}
+
+/// Per-side padding in px (gap from each display edge). Used by the hint bar and
+/// its focused-column detail bar.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct HintsBarPad {
+    #[serde(default)]
+    pub top: f64,
+    #[serde(default)]
+    pub bottom: f64,
+    #[serde(default)]
+    pub left: f64,
+    #[serde(default)]
+    pub right: f64,
+}
+
 /// Scrolling-strip hint bar: a horizontal minimap of every column in the
 /// active niri-style workspace, on-screen and off. Click a segment to focus
 /// that column.
@@ -744,6 +802,16 @@ pub struct HintsBarSettings {
     /// Show a leading badge with the active workspace index.
     #[serde(default = "no")]
     pub show_workspace: bool,
+    /// Per-side padding (px) insetting the whole bar from the display edges.
+    #[serde(default)]
+    pub pad: HintsBarPad,
+    /// Which end of the bar the chips sit at: `start`/`center`/`end`.
+    #[serde(default = "default_align_center")]
+    pub align: HintsBarAlign,
+    /// Focused-column detail: `[settings.ui.hints_bar.detail]` — `style`
+    /// (`popover`/`bar`), plus `position`/`align`/`pad` for `bar`.
+    #[serde(default)]
+    pub detail: HintsBarDetailSettings,
 }
 
 impl Default for HintsBarSettings {
@@ -766,6 +834,9 @@ impl Default for HintsBarSettings {
             blur: default_hints_bar_blur(),
             show_titles: false,
             show_workspace: false,
+            pad: HintsBarPad::default(),
+            align: HintsBarAlign::Center,
+            detail: HintsBarDetailSettings::default(),
         }
     }
 }
@@ -790,6 +861,7 @@ fn default_hints_bar_height() -> f64 { 26.0 }
 fn default_hints_bar_auto_hide_ms() -> u64 { 1000 }
 fn default_hints_bar_keys() -> String { "asdfghjkl;".to_string() }
 fn default_hints_bar_blur() -> u32 { 0 }
+fn default_align_center() -> HintsBarAlign { HintsBarAlign::Center }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]

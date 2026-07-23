@@ -169,11 +169,11 @@ indicator method, one trait default, one engine arm + command.
   capsule of per-column chips (`keycap · app-icon · app-name`), focused column
   filled with the accent, on-screen columns grouped under a brighter viewport
   tint, off-screen columns dimmed. Multi-window columns get a count badge; the
-  focused multi-window column gets a **detail pill** above it listing each
+  focused multi-window column gets a **detail overlay** listing each
   window's icon + name (active highlighted). Click a chip to focus that column
   (routes through the existing `ReactorCommand::FocusWindow`).
 - Own subsystem mirroring `stack_line`: a `hints_bar` actor owns one CGS window
-  (+ a second popover window for the pill); the reactor feeds a snapshot per
+  (+ a second window for the detail overlay); the reactor feeds a snapshot per
   layout apply from `managers.rs` (`build_hints_bar_cells`), grouping columns
   from window frames by x and pulling tab/stack detail from the engine's
   `tab_groups` (`collect_group_containers`). Independent of `stack_line` —
@@ -184,7 +184,16 @@ indicator method, one trait default, one engine arm + command.
   is overlay-only), `placement` (`overlay` floats over windows / `reserve`
   shrinks the scrolling tiling area, horizontal only), `visibility` (`always` /
   `on_demand` / `auto` flash), `density` (compact/full/dots), `height` (chip
-  thickness / row height), `auto_hide_ms`, `keys`, hex colors.
+  thickness / row height), `auto_hide_ms`, `keys`, hex colors, and `pad`
+  (per-side `{ top, bottom, left, right }` px insetting the whole bar from the
+  display edges — shared `HintsBarPad` type). The focused-column
+  detail is its own sub-table `[settings.ui.hints_bar.detail]`: `style` =
+  `popover` (card next to the focused chip) or `bar` (a second hint-bar strip of
+  the column's windows). For `bar`: `position` (`bottom`/`top` horizontal,
+  `left`/`right` vertical chip stack), `align` (`start`/`center`/`end` along that
+  edge — `end` on a shared edge pushes the column bar to the opposite side), and
+  `pad` (per-side `{ top, bottom, left, right }` px from the display edges).
+  Honors `show_titles`.
   Hot-reloadable. Toggle command `toggle_hints_bar` (`WmCmd` →
   `ReactorCommand::ToggleHintsBar`).
 - **Crisp rendering (CRITICAL):** the CGS window + root layer must set
