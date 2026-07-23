@@ -376,14 +376,18 @@ impl LayoutManager {
                 .layout_manager
                 .layout_engine
                 .update_space_display(space, display_uuid_opt.clone());
-            // Reserve strip space for the hint bar (scrolling only): shrink the
-            // tiling frame so tiled windows never sit under the bar.
+            // Reserve space so tiled windows never sit under bars: `external_bar`
+            // insets (all layouts, e.g. sketchybar) plus the hint bar's own strip
+            // (scrolling + reserve placement only).
+            let ext_top = reactor.config.settings.layout.external_bar_top.max(0.0);
+            let ext_bottom = reactor.config.settings.layout.external_bar_bottom.max(0.0);
             let reserve = reactor.config.settings.ui.hints_bar.reserved_thickness();
-            let tiling_frame = if reserve > 0.0
-                && reactor.layout_manager.layout_engine.active_layout_mode_at(space)
-                    == LayoutMode::Scrolling
-            {
-                let mut f = screen.frame;
+            let scrolling = reactor.layout_manager.layout_engine.active_layout_mode_at(space)
+                == LayoutMode::Scrolling;
+            let mut f = screen.frame;
+            f.origin.y += ext_top;
+            f.size.height = (f.size.height - ext_top - ext_bottom).max(1.0);
+            if reserve > 0.0 && scrolling {
                 f.size.height = (f.size.height - reserve).max(1.0);
                 if matches!(
                     reactor.config.settings.ui.hints_bar.position,
@@ -391,10 +395,8 @@ impl LayoutManager {
                 ) {
                     f.origin.y += reserve;
                 }
-                f
-            } else {
-                screen.frame
-            };
+            }
+            let tiling_frame = f;
             let mut layout =
                 reactor.layout_manager.layout_engine.calculate_layout_with_virtual_workspaces(
                     &reactor.state.windows,

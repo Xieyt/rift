@@ -881,6 +881,13 @@ pub struct LayoutSettings {
     /// Scrolling layout configuration (niri-style columns)
     #[serde(default)]
     pub scrolling: ScrollingLayoutSettings,
+    /// Reserve space (px) at the top / bottom of the tiling area for an external
+    /// bar (e.g. sketchybar), so tiled windows never sit under it. Applies to
+    /// every layout, independent of the built-in hint bar.
+    #[serde(default)]
+    pub external_bar_top: f64,
+    #[serde(default)]
+    pub external_bar_bottom: f64,
     /// Bring the focused window's application to the foreground when focus moves
     /// (keyboard focus changes, workspace switches). Per-command `activate` flags
     /// override this upward. Default: true.

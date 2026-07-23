@@ -78,6 +78,13 @@ hot_reload = true
 # You can set different layouts per workspace using `workspace_rules`.
 mode = "traditional"
 
+# reserve space (px) at the top/bottom of the tiling area for an external bar
+# such as sketchybar, so tiled windows never sit under it (all layouts). Pair
+# with a `[settings.ui.hints_bar]` placement = "overlay" to float rift's own bar
+# inside the same strip (e.g. align = "start" on the left, sketchybar on the right).
+external_bar_top = 0.0
+external_bar_bottom = 0.0
+
 # these settings only apply when layout mode == "master_stack"
 [settings.layout.master_stack]
 # Fraction of space reserved for the master area (0.05..0.95)
