@@ -738,6 +738,19 @@ pub enum HintsBarDensity {
     Dots,
 }
 
+/// What the bar does when its natural chip row exceeds `max_width_ratio`.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HintsBarOverflow {
+    /// Compress every chip uniformly so the row always fits (current behavior).
+    #[default]
+    Scale,
+    /// Wrap the overflow onto a second row of the same (taller) top bar.
+    Row,
+    /// Wrap the overflow into a second bar on the opposite edge.
+    Bar,
+}
+
 /// How the focused multi-window column's detail is shown.
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
 #[serde(rename_all = "snake_case")]
@@ -871,6 +884,15 @@ pub struct HintsBarSettings {
     /// `flow` (around it), `stop` (before it), or `ignore`.
     #[serde(default)]
     pub notch: HintsBarNotch,
+    /// Fraction of the display width the chip row may fill before overflowing
+    /// (1.0 = full width, the default). See `overflow`.
+    #[serde(default = "default_hints_bar_max_width_ratio")]
+    pub max_width_ratio: f64,
+    /// What to do when the chips exceed `max_width_ratio`: `scale` (compress,
+    /// default), `row` (second row on the top bar), or `bar` (second bar on the
+    /// opposite edge).
+    #[serde(default)]
+    pub overflow: HintsBarOverflow,
     /// Focused-column detail: `[settings.ui.hints_bar.detail]` — `style`
     /// (`popover`/`bar`), plus `position`/`align`/`pad` for `bar`.
     #[serde(default)]
@@ -900,6 +922,8 @@ impl Default for HintsBarSettings {
             pad: HintsBarPad::default(),
             align: HintsBarAlign::Center,
             notch: HintsBarNotch::default(),
+            max_width_ratio: default_hints_bar_max_width_ratio(),
+            overflow: HintsBarOverflow::default(),
             detail: HintsBarDetailSettings::default(),
         }
     }
@@ -925,6 +949,7 @@ fn default_hints_bar_height() -> f64 { 26.0 }
 fn default_hints_bar_auto_hide_ms() -> u64 { 1000 }
 fn default_hints_bar_keys() -> String { "asdfghjkl;".to_string() }
 fn default_hints_bar_blur() -> u32 { 0 }
+fn default_hints_bar_max_width_ratio() -> f64 { 1.0 }
 fn default_align_center() -> HintsBarAlign { HintsBarAlign::Center }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]

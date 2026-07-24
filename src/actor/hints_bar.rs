@@ -18,7 +18,7 @@ use tracing::{instrument, warn};
 use crate::actor::reactor::{Command, ReactorCommand};
 use crate::actor::{self, reactor};
 use crate::layout_engine::LayoutCommand;
-use crate::common::config::{Config, HintsBarVisibility};
+use crate::common::config::{Config, HintsBarOverflow, HintsBarVisibility};
 use crate::sys::screen::SpaceId;
 use crate::sys::timer::Timer;
 use crate::ui::hints_bar::{
@@ -41,6 +41,12 @@ pub struct Snapshot {
     pub cells: Vec<ColumnCell>,
     /// Occupied workspaces for the overview rail.
     pub workspaces: Vec<WorkspaceCell>,
+    /// Overflow policy resolved from config.
+    pub overflow: HintsBarOverflow,
+    /// Column chips that fit on the top strip (== `cells.len()` if no overflow).
+    pub top_count: usize,
+    /// Frame for the second (overflow) bar in `bar` mode; `None` otherwise.
+    pub overflow_frame: Option<CGRect>,
 }
 
 #[derive(Debug)]
@@ -60,6 +66,7 @@ pub type Receiver = actor::Receiver<Event>;
 type CellSig = (
     Vec<(String, bool, bool, bool, usize, usize, String)>,
     Vec<(String, bool, Vec<crate::sys::app::pid_t>)>,
+    usize,
 );
 
 pub struct HintsBar {
@@ -70,6 +77,8 @@ pub struct HintsBar {
     reactor_tx: reactor::Sender,
     shared_hit_rects: SharedHitRects,
     bar: Option<HintsBarWindow>,
+    /// Second strip for `overflow = "bar"` (opposite edge); `None` otherwise.
+    overflow_bar: Option<HintsBarWindow>,
     last_snapshot: Option<Snapshot>,
     last_sig: Option<CellSig>,
     /// Whether the user toggled the bar on (only meaningful for `on_demand`).
@@ -99,6 +108,7 @@ impl HintsBar {
             reactor_tx,
             shared_hit_rects,
             bar: None,
+            overflow_bar: None,
             last_snapshot: None,
             last_sig: None,
             user_shown: false,
@@ -179,7 +189,7 @@ impl HintsBar {
         }
     }
 
-    fn signature(cells: &[ColumnCell], workspaces: &[WorkspaceCell]) -> CellSig {
+    fn signature(cells: &[ColumnCell], workspaces: &[WorkspaceCell], top_count: usize) -> CellSig {
         let entries = cells
             .iter()
             .map(|c| {
@@ -203,7 +213,7 @@ impl HintsBar {
             .iter()
             .map(|w| (w.label.clone(), w.active, w.pids.clone()))
             .collect();
-        (entries, ws)
+        (entries, ws, top_count)
     }
 
     fn on_snapshot(&mut self, snapshot: Snapshot) {
@@ -211,7 +221,7 @@ impl HintsBar {
             self.teardown();
             return;
         }
-        let sig = Self::signature(&snapshot.cells, &snapshot.workspaces);
+        let sig = Self::signature(&snapshot.cells, &snapshot.workspaces, snapshot.top_count);
         let changed = self.last_sig.as_ref() != Some(&sig);
         self.last_sig = Some(sig);
         self.last_snapshot = Some(snapshot);
@@ -268,12 +278,7 @@ impl HintsBar {
 
         if show {
             if changed || !self.bar_visible() {
-                self.render(
-                    snapshot.bar_frame,
-                    snapshot.screen_frame,
-                    snapshot.cells,
-                    snapshot.workspaces,
-                );
+                self.render(snapshot);
             }
         } else {
             self.hide();
@@ -290,26 +295,41 @@ impl HintsBar {
         NSScreen::mainScreen(self.mtm).map(|s| s.backingScaleFactor()).unwrap_or(2.0)
     }
 
-    fn render(
-        &mut self,
-        frame: CGRect,
-        screen: CGRect,
-        cells: Vec<ColumnCell>,
-        workspaces: Vec<WorkspaceCell>,
-    ) {
+    fn render(&mut self, snap: Snapshot) {
         tracing::trace!(target: "hbbench", "hb_render");
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
+        let scale = self.backing_scale();
+        let total = snap.cells.len();
+        let has_overflow = snap.top_count < total;
 
-        let bar = match &self.bar {
+        // Partition columns per overflow mode.
+        let (main_cells, main_split, overflow_cells): (
+            Vec<ColumnCell>,
+            Option<usize>,
+            Vec<ColumnCell>,
+        ) = match snap.overflow {
+            HintsBarOverflow::Row if has_overflow => {
+                (snap.cells.clone(), Some(snap.top_count), Vec::new())
+            }
+            HintsBarOverflow::Bar if has_overflow => (
+                snap.cells[..snap.top_count].to_vec(),
+                None,
+                snap.cells[snap.top_count..].to_vec(),
+            ),
+            _ => (snap.cells.clone(), None, Vec::new()),
+        };
+
+        // Main bar: create or reframe, then update.
+        let main = match &self.bar {
             Some(bar) => {
-                if bar.frame() != frame {
-                    if let Err(err) = bar.set_frame(frame) {
+                if bar.frame() != snap.bar_frame {
+                    if let Err(err) = bar.set_frame(snap.bar_frame) {
                         warn!(?err, "hints_bar: set_frame failed");
                     }
                 }
                 bar
             }
-            None => match HintsBarWindow::new(frame, style, self.backing_scale()) {
+            None => match HintsBarWindow::new(snap.bar_frame, style, scale) {
                 Ok(bar) => {
                     self.bar = Some(bar);
                     self.bar.as_ref().unwrap()
@@ -320,10 +340,58 @@ impl HintsBar {
                 }
             },
         };
-
-        if let Err(err) = bar.update(style, HintsBarData { cells, screen, workspaces }) {
+        if let Err(err) = main.update(
+            style,
+            HintsBarData {
+                cells: main_cells,
+                screen: snap.screen_frame,
+                workspaces: snap.workspaces.clone(),
+                overflow_split: main_split,
+            },
+        ) {
             warn!(?err, "hints_bar: update failed");
         }
+
+        // Overflow bar (only `bar` mode with real overflow).
+        if let Some(of_frame) = snap.overflow_frame.filter(|_| !overflow_cells.is_empty()) {
+            let ob = match &self.overflow_bar {
+                Some(ob) => {
+                    if ob.frame() != of_frame {
+                        if let Err(err) = ob.set_frame(of_frame) {
+                            warn!(?err, "hints_bar: overflow set_frame failed");
+                        }
+                    }
+                    ob
+                }
+                None => match HintsBarWindow::new(of_frame, style, scale) {
+                    Ok(ob) => {
+                        self.overflow_bar = Some(ob);
+                        self.overflow_bar.as_ref().unwrap()
+                    }
+                    Err(err) => {
+                        warn!(?err, "hints_bar: failed to create overflow bar");
+                        self.sync_hit_rects();
+                        return;
+                    }
+                },
+            };
+            if let Err(err) = ob.update(
+                style,
+                HintsBarData {
+                    cells: overflow_cells,
+                    screen: snap.screen_frame,
+                    workspaces: Vec::new(),
+                    overflow_split: None,
+                },
+            ) {
+                warn!(?err, "hints_bar: overflow update failed");
+            }
+        } else if let Some(ob) = &self.overflow_bar {
+            if ob.is_visible() {
+                let _ = ob.hide();
+            }
+        }
+
         self.sync_hit_rects();
     }
 
@@ -335,12 +403,18 @@ impl HintsBar {
                 }
             }
         }
+        if let Some(ob) = &self.overflow_bar {
+            if ob.is_visible() {
+                let _ = ob.hide();
+            }
+        }
         self.sync_hit_rects();
     }
 
     fn teardown(&mut self) {
         self.hide();
         self.bar = None;
+        self.overflow_bar = None;
         self.auto_pending = false;
         self.pending_arm = None;
         self.shared_hit_rects.store(Arc::new(Vec::new()));
@@ -353,40 +427,50 @@ impl HintsBar {
                 rects.push(bar.frame());
             }
         }
+        if let Some(ob) = &self.overflow_bar {
+            if ob.is_visible() {
+                rects.push(ob.frame());
+            }
+        }
         self.shared_hit_rects.store(Arc::new(rects));
     }
 
     fn on_mouse_down(&mut self, point: CGPoint) {
-        let Some(bar) = &self.bar else {
-            return;
-        };
-        if !bar.is_visible() {
-            return;
+        // Main bar: workspace pill first, then a column chip.
+        if let Some(bar) = &self.bar {
+            if bar.is_visible() && point_hits_indicator_frame(point, bar.frame()) {
+                let frame = bar.frame();
+                let local = CGPoint::new(point.x - frame.origin.x, point.y - frame.origin.y);
+                if let Some(ws_index) = bar.workspace_at_point(local) {
+                    tracing::debug!(ws_index, "hints_bar: switch workspace via click");
+                    let _ = self.reactor_tx.send(reactor::Event::Command(Command::Layout(
+                        LayoutCommand::SwitchToWorkspace(ws_index),
+                    )));
+                    return;
+                }
+                if let Some(index) = bar.column_at_point(local) {
+                    if let Some(window_id) = bar.window_id_at(index) {
+                        let _ = self.reactor_tx.send(reactor::Event::Command(Command::Reactor(
+                            ReactorCommand::FocusWindow { window_id, window_server_id: None },
+                        )));
+                    }
+                }
+                return;
+            }
         }
-        let frame = bar.frame();
-        if !point_hits_indicator_frame(point, frame) {
-            return;
+        // Overflow bar: column chips only (its cells are already the tail slice).
+        if let Some(ob) = &self.overflow_bar {
+            if ob.is_visible() && point_hits_indicator_frame(point, ob.frame()) {
+                let frame = ob.frame();
+                let local = CGPoint::new(point.x - frame.origin.x, point.y - frame.origin.y);
+                if let Some(index) = ob.column_at_point(local) {
+                    if let Some(window_id) = ob.window_id_at(index) {
+                        let _ = self.reactor_tx.send(reactor::Event::Command(Command::Reactor(
+                            ReactorCommand::FocusWindow { window_id, window_server_id: None },
+                        )));
+                    }
+                }
+            }
         }
-        let local = CGPoint::new(point.x - frame.origin.x, point.y - frame.origin.y);
-        if let Some(ws_index) = bar.workspace_at_point(local) {
-            tracing::debug!(ws_index, "hints_bar: switch workspace via click");
-            let _ = self.reactor_tx.send(reactor::Event::Command(Command::Layout(
-                LayoutCommand::SwitchToWorkspace(ws_index),
-            )));
-            return;
-        }
-        let Some(index) = bar.column_at_point(local) else {
-            return;
-        };
-        let Some(window_id) = bar.window_id_at(index) else {
-            return;
-        };
-        tracing::debug!(index, ?window_id, "hints_bar: focus column via click");
-        let _ = self.reactor_tx.send(reactor::Event::Command(Command::Reactor(
-            ReactorCommand::FocusWindow {
-                window_id,
-                window_server_id: None,
-            },
-        )));
     }
 }

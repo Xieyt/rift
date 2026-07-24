@@ -198,6 +198,24 @@ indicator method, one trait default, one engine arm + command.
   Honors `show_titles`.
   Hot-reloadable. Toggle command `toggle_hints_bar` (`WmCmd` →
   `ReactorCommand::ToggleHintsBar`).
+- **Workspace overview rail** (`show_workspace = true`): leading pills for each
+  *occupied* virtual workspace — number + an icon per distinct app open in it,
+  active one filled. Click a pill to switch (`SwitchToWorkspace`). Data:
+  `LayoutEngine::workspace_app_summaries` → `WorkspaceStore::workspace_app_pids`.
+- **Keyboard column jump:** `LayoutCommand::FocusColumn(n)` focuses the Nth
+  column left→right (matching the bar's hint letters), revealing it like
+  `move_focus`. Bind per key (`{ focus_column = 0 }`) or `rift-cli execute
+  layout focus-column N`; `keys` supplies the on-bar labels.
+- **Overflow** (`max_width_ratio` + `overflow`): cap the chip row at a fraction
+  of display width; the excess wraps per `overflow` — `scale` (compress, the
+  default = old behavior), `row` (second row on a taller top bar), or `bar` (a
+  second CGS strip on the opposite edge). The rail + fitting columns stay on top;
+  a click on either strip maps to the right window (the overflow strip renders
+  the tail *slice*, so no index math). Split point is `HintsBar::overflow_split`
+  (pure). Under `placement = reserve` the tiling area shrinks for the extra
+  strip **dynamically** (only while overflowing) via a one-pass reserve-feedback
+  loop in `managers.rs` (`hints_bar_reserve` + a guarded convergence re-layout in
+  `update_layout`).
 - **Crisp rendering (CRITICAL):** the CGS window + root layer must set
   `contentsScale` **and** `set_resolution` to the display `backingScaleFactor`
   (like `ui/mission_control.rs`), else the layer tree rasterizes at 1x and

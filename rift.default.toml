@@ -258,6 +258,13 @@ align = "center"
 # over sketchybar via a negative pad.top): "flow" (crossing chip stretches across
 # the notch, label continuing past it), "stop" (chips stop before it), "ignore"
 notch = "flow"
+# overflow: when the chips would exceed `max_width_ratio` of the display width,
+# what happens to the excess: "scale" (compress uniformly to fit, the default),
+# "row" (wrap onto a second row of a taller top bar), or "bar" (wrap into a
+# second bar on the opposite edge — bottom when the main bar is on top). The
+# workspace rail and the columns that fit stay on the top row.
+max_width_ratio = 1.0
+overflow = "scale"
 # per-side padding (px) insetting the whole bar from the display edges
 pad = { top = 0.0, bottom = 0.0, left = 0.0, right = 0.0 }
 

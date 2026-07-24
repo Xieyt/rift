@@ -20,8 +20,8 @@ use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::config::{
-    HintsBarAlign, HintsBarDensity, HintsBarDetailStyle, HintsBarNotch, HintsBarPad, HintsBarPosition,
-    HintsBarSettings,
+    HintsBarAlign, HintsBarDensity, HintsBarDetailStyle, HintsBarNotch, HintsBarOverflow,
+    HintsBarPad, HintsBarPosition, HintsBarSettings,
 };
 use crate::sys::app::NSRunningApplicationExt;
 use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
@@ -96,6 +96,9 @@ pub struct HintsBarData {
     pub screen: CGRect,
     /// Occupied workspaces for the overview rail (empty = no rail).
     pub workspaces: Vec<WorkspaceCell>,
+    /// When `Some(k)`, this window renders two rows: the rail + `cells[..k]` on
+    /// the top row, `cells[k..]` on the bottom. `None` = single row.
+    pub overflow_split: Option<usize>,
 }
 
 /// One workspace in the overview rail: its label, index (for switching), and
@@ -128,6 +131,8 @@ pub struct HintsBarStyle {
     pub detail_position: HintsBarPosition,
     pub detail_align: HintsBarAlign,
     pub detail_pad: HintsBarPad,
+    pub max_width_ratio: f64,
+    pub overflow: HintsBarOverflow,
 }
 
 impl Default for HintsBarStyle {
@@ -150,6 +155,8 @@ impl Default for HintsBarStyle {
             detail_position: HintsBarPosition::Bottom,
             detail_align: HintsBarAlign::End,
             detail_pad: HintsBarPad::default(),
+            max_width_ratio: 1.0,
+            overflow: HintsBarOverflow::Scale,
         }
     }
 }
@@ -178,6 +185,8 @@ impl From<&HintsBarSettings> for HintsBarStyle {
             detail_position: c.detail.position,
             detail_align: c.detail.align,
             detail_pad: c.detail.pad,
+            max_width_ratio: c.max_width_ratio,
+            overflow: c.overflow,
         }
     }
 }
@@ -494,215 +503,306 @@ impl HintsBar {
         None
     }
 
+    /// How many leading column chips fit within `budget_px` (rail + chips at
+    /// natural width, incl. margins/gaps). Returns `cells.len()` when they all
+    /// fit (no overflow); at least 1 otherwise. Pure, so the reactor can call it
+    /// to plan overflow without a window.
+    pub fn overflow_split(
+        cells: &[ColumnCell],
+        workspaces: &[WorkspaceCell],
+        style: &HintsBarStyle,
+        fs: f64,
+        budget_px: f64,
+    ) -> usize {
+        if cells.is_empty() {
+            return 0;
+        }
+        let dots = matches!(style.density, HintsBarDensity::Dots);
+        let ws_icon_w = fs + 2.0;
+        let rail_w: f64 = if !workspaces.is_empty() && !dots {
+            workspaces
+                .iter()
+                .map(|w| {
+                    let label_w = Self::approx_text_width(&w.label, fs);
+                    let icons_w = w.pids.len() as f64 * (ws_icon_w + 2.0);
+                    (PAD_X + label_w + BADGE_GAP + icons_w + PAD_X).max(style.height * 0.9) + CHIP_GAP
+                })
+                .sum()
+        } else {
+            0.0
+        };
+        let chip_widths = Self::natural_widths(cells, style, fs);
+        let mut used = 2.0 * MARGIN + rail_w;
+        let mut count = 0usize;
+        for (i, w) in chip_widths.iter().enumerate() {
+            let add = if i == 0 { *w } else { CHIP_GAP + *w };
+            if used + add > budget_px && count >= 1 {
+                break;
+            }
+            used += add;
+            count += 1;
+        }
+        count.clamp(1, cells.len())
+    }
+
     fn rebuild_layers(&self) {
         let mut state = self.state.borrow_mut();
         let style = state.style;
         let bounds = self.bounds();
         let cells = state.data.cells.clone();
         let workspaces = state.data.workspaces.clone();
+        let split = state.data.overflow_split;
+        let screen = state.data.screen;
+        let frame = *self.frame.borrow();
 
         with_disabled_actions(|| {
             unsafe { self.root_layer.setSublayers(None) };
 
             if cells.is_empty() {
                 state.chip_rects.clear();
+                state.ws_rects.clear();
                 return;
             }
 
             let fs = style.font_size.unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
-            let vertical = style.position.is_vertical();
-            let dots = matches!(style.density, HintsBarDensity::Dots);
-
-            let chip_widths = Self::natural_widths(&cells, &style, fs);
-            // Workspace overview rail: one clickable pill per occupied workspace,
-            // laid out as leading slots before the column chips. Dots density
-            // (position pips only) skips it.
-            let show_ws = !workspaces.is_empty() && !dots;
-            let ws_icon_w = fs + 2.0;
-            let ws_widths: Vec<f64> = if show_ws {
-                workspaces
-                    .iter()
-                    .map(|w| {
-                        let label_w = Self::approx_text_width(&w.label, fs);
-                        let icons_w = w.pids.len() as f64 * (ws_icon_w + 2.0);
-                        (PAD_X + label_w + BADGE_GAP + icons_w + PAD_X).max(style.height * 0.9)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            let n_ws = ws_widths.len();
-            let mut widths = ws_widths;
-            widths.extend(chip_widths);
-
-            let frame = *self.frame.borrow();
-            // Notch gap (bar-local) for a top bar that sits on the notch row.
-            let notch = if vertical {
-                None
-            } else {
-                self.display_notch_gap(state.data.screen).and_then(|(nl, nr, nh)| {
-                    (frame.origin.y < nh).then_some((nl - frame.origin.x, nr - frame.origin.x))
-                })
-            };
-
-            // `notch = "stop"`: shrink the layout region to the aligned side so
-            // chips never cross the notch.
-            let mut layout_bounds = bounds;
-            if matches!(style.notch, HintsBarNotch::Stop) {
-                if let Some((nl, nr)) = notch {
-                    match style.align {
-                        HintsBarAlign::Start => {
-                            layout_bounds.size.width =
-                                (nl - bounds.origin.x).clamp(1.0, bounds.size.width);
-                        }
-                        HintsBarAlign::End => {
-                            let x = nr.max(bounds.origin.x);
-                            layout_bounds.origin.x = x;
-                            layout_bounds.size.width =
-                                (bounds.origin.x + bounds.size.width - x).max(1.0);
-                        }
-                        HintsBarAlign::Center => {}
-                    }
+            match split {
+                // Two rows in one (taller) window: rail + cells[..k] on top,
+                // cells[k..] on the bottom half. Chip rects concatenate in cell
+                // order so click hit-testing maps straight to the window id.
+                Some(k) if k < cells.len() => {
+                    let k = k.max(1);
+                    let row_h = bounds.size.height / 2.0;
+                    let top_b = CGRect::new(bounds.origin, CGSize::new(bounds.size.width, row_h));
+                    let bot_b = CGRect::new(
+                        CGPoint::new(bounds.origin.x, bounds.origin.y + row_h),
+                        CGSize::new(bounds.size.width, row_h),
+                    );
+                    let (ws_r, mut chip_r) =
+                        self.render_strip(top_b, &cells[..k], &workspaces, &style, fs, screen, frame);
+                    let (_ws2, chip_r2) =
+                        self.render_strip(bot_b, &cells[k..], &[], &style, fs, screen, frame);
+                    chip_r.extend(chip_r2);
+                    state.chip_rects = chip_r;
+                    state.ws_rects = ws_r;
+                }
+                _ => {
+                    let (ws_r, chip_r) =
+                        self.render_strip(bounds, &cells, &workspaces, &style, fs, screen, frame);
+                    state.chip_rects = chip_r;
+                    state.ws_rects = ws_r;
                 }
             }
-
-            let mut rects = if vertical {
-                let align_right = matches!(style.position, HintsBarPosition::Right);
-                Self::layout_chips_vertical(bounds, &widths, style.height, align_right)
-            } else {
-                Self::layout_chips(layout_bounds, &widths)
-            };
-            // The pure layout functions center the row/column; shift it to hug
-            // the near (`start`) or far (`end`) end per `align`.
-            if let (Some(first), Some(last)) = (rects.first().copied(), rects.last().copied()) {
-                if vertical {
-                    let near = bounds.origin.y + MARGIN;
-                    let far = bounds.origin.y + bounds.size.height - MARGIN;
-                    let dy = match style.align {
-                        HintsBarAlign::Start => near - first.origin.y,
-                        HintsBarAlign::End => far - (last.origin.y + last.size.height),
-                        HintsBarAlign::Center => 0.0,
-                    };
-                    if dy.abs() > 0.01 {
-                        for c in &mut rects {
-                            c.origin.y += dy;
-                        }
-                    }
-                } else {
-                    let near = layout_bounds.origin.x + MARGIN;
-                    let far = layout_bounds.origin.x + layout_bounds.size.width - MARGIN;
-                    let dx = match style.align {
-                        HintsBarAlign::Start => near - first.origin.x,
-                        HintsBarAlign::End => far - (last.origin.x + last.size.width),
-                        HintsBarAlign::Center => 0.0,
-                    };
-                    if dx.abs() > 0.01 {
-                        for c in &mut rects {
-                            c.origin.x += dx;
-                        }
-                    }
-                }
-            }
-
-            // `notch = "flow"`: the first chip that meets the notch stretches
-            // across it — the physical notch hides the middle slice, so the chip's
-            // tail resumes on the right; following chips shift along by the gap.
-            if matches!(style.notch, HintsBarNotch::Flow) {
-                if let Some((nl, nr)) = notch {
-                    if let Some(i) = rects
-                        .iter()
-                        .position(|r| r.origin.x + r.size.width > nl && r.origin.x < nr)
-                    {
-                        let gap = nr - nl;
-                        if gap > 0.0 {
-                            rects[i].size.width += gap;
-                            for c in &mut rects[(i + 1)..] {
-                                c.origin.x += gap;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Separate the workspace rail pills from the column chips.
-            let (ws_rects_now, chip_rects): (Vec<CGRect>, Vec<CGRect>) =
-                if show_ws && rects.len() >= n_ws {
-                    (rects[..n_ws].to_vec(), rects[n_ws..].to_vec())
-                } else {
-                    (Vec::new(), rects.clone())
-                };
-
-            // Capsule background per contiguous run of badge+chips. A large gap
-            // (chips flowing around a notch) splits it into separate capsules so
-            // no empty background spans the gap.
-            let cap_pad = 6.0;
-            if !rects.is_empty() {
-                let mut start = 0usize;
-                for k in 1..=rects.len() {
-                    let split = k == rects.len() || {
-                        let prev = rects[k - 1];
-                        let gap = if vertical {
-                            rects[k].origin.y - (prev.origin.y + prev.size.height)
-                        } else {
-                            rects[k].origin.x - (prev.origin.x + prev.size.width)
-                        };
-                        gap > 40.0
-                    };
-                    if split {
-                        let first = rects[start];
-                        let last = rects[k - 1];
-                        let cap_rect = if vertical {
-                            let x0 = (first.origin.x - cap_pad).max(0.0);
-                            let y0 = (first.origin.y - cap_pad).max(0.0);
-                            let y1 = (last.origin.y + last.size.height + cap_pad)
-                                .min(bounds.size.height);
-                            CGRect::new(
-                                CGPoint::new(x0, y0),
-                                CGSize::new(first.size.width + 2.0 * cap_pad, (y1 - y0).max(1.0)),
-                            )
-                        } else {
-                            let x0 = (first.origin.x - cap_pad).max(0.0);
-                            let x1 = (last.origin.x + last.size.width + cap_pad)
-                                .min(bounds.size.width);
-                            CGRect::new(
-                                CGPoint::new(x0, 0.0),
-                                CGSize::new((x1 - x0).max(1.0), bounds.size.height),
-                            )
-                        };
-                        let radius = (cap_rect.size.width.min(cap_rect.size.height) * 0.5).min(14.0);
-                        let cap = self.add_rounded(cap_rect, style.background, radius);
-                        cap.setShadowColor(Some(&objc2_app_kit::NSColor::blackColor().CGColor()));
-                        cap.setShadowOpacity(0.22);
-                        cap.setShadowRadius(4.0);
-                        cap.setShadowOffset(CGSize::new(0.0, 1.5));
-                        start = k;
-                    }
-                }
-            }
-
-            // Viewport grouping behind the on-screen columns.
-            let visible: Vec<bool> = cells.iter().map(|c| c.visible).collect();
-            if let Some(vp) = Self::viewport_backing(&chip_rects, &visible, vertical) {
-                let r = (vp.size.width.min(vp.size.height) * 0.5).min(10.0);
-                self.add_rounded(vp, style.viewport_color, r);
-            }
-
-            for (w, wr) in workspaces.iter().zip(ws_rects_now.iter()) {
-                self.render_workspace_pill(*wr, w, &style, fs);
-            }
-
-            let chip_notch = if matches!(style.notch, HintsBarNotch::Flow) { notch } else { None };
-            for (cell, rect) in cells.iter().zip(chip_rects.iter()) {
-                if dots {
-                    self.render_dot(*rect, cell, &style);
-                } else {
-                    self.render_chip(*rect, cell, &style, fs, chip_notch);
-                }
-            }
-
-            state.chip_rects = chip_rects;
-            state.ws_rects = ws_rects_now;
         });
+    }
+
+    /// Lay out + render one strip (row) of `cells` (with an optional leading
+    /// `workspaces` rail) inside `bounds`; returns `(ws_pill_rects, chip_rects)`
+    /// for click hit-testing. Used once for a single-row bar, or twice (top and
+    /// bottom halves) for `overflow = "row"`.
+    fn render_strip(
+        &self,
+        bounds: CGRect,
+        cells: &[ColumnCell],
+        workspaces: &[WorkspaceCell],
+        style: &HintsBarStyle,
+        fs: f64,
+        screen: CGRect,
+        frame: CGRect,
+    ) -> (Vec<CGRect>, Vec<CGRect>) {
+        let vertical = style.position.is_vertical();
+        let dots = matches!(style.density, HintsBarDensity::Dots);
+        if cells.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        let chip_widths = Self::natural_widths(cells, style, fs);
+        let show_ws = !workspaces.is_empty() && !dots;
+        let ws_icon_w = fs + 2.0;
+        let ws_widths: Vec<f64> = if show_ws {
+            workspaces
+                .iter()
+                .map(|w| {
+                    let label_w = Self::approx_text_width(&w.label, fs);
+                    let icons_w = w.pids.len() as f64 * (ws_icon_w + 2.0);
+                    (PAD_X + label_w + BADGE_GAP + icons_w + PAD_X).max(style.height * 0.9)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let n_ws = ws_widths.len();
+        let mut widths = ws_widths;
+        widths.extend(chip_widths);
+
+        // Notch gap (bar-local) for a top strip sitting on the notch row; use
+        // this row's absolute top so a wrapped bottom row below the notch is
+        // left alone.
+        let row_top_abs = frame.origin.y + bounds.origin.y;
+        let notch = if vertical {
+            None
+        } else {
+            self.display_notch_gap(screen).and_then(|(nl, nr, nh)| {
+                (row_top_abs < nh).then_some((nl - frame.origin.x, nr - frame.origin.x))
+            })
+        };
+
+        // `notch = "stop"`: shrink the layout region to the aligned side so
+        // chips never cross the notch.
+        let mut layout_bounds = bounds;
+        if matches!(style.notch, HintsBarNotch::Stop) {
+            if let Some((nl, nr)) = notch {
+                match style.align {
+                    HintsBarAlign::Start => {
+                        layout_bounds.size.width =
+                            (nl - bounds.origin.x).clamp(1.0, bounds.size.width);
+                    }
+                    HintsBarAlign::End => {
+                        let x = nr.max(bounds.origin.x);
+                        layout_bounds.origin.x = x;
+                        layout_bounds.size.width =
+                            (bounds.origin.x + bounds.size.width - x).max(1.0);
+                    }
+                    HintsBarAlign::Center => {}
+                }
+            }
+        }
+
+        let mut rects = if vertical {
+            let align_right = matches!(style.position, HintsBarPosition::Right);
+            Self::layout_chips_vertical(bounds, &widths, style.height, align_right)
+        } else {
+            Self::layout_chips(layout_bounds, &widths)
+        };
+        // The pure layout functions center the row/column; shift it to hug the
+        // near (`start`) or far (`end`) end per `align`.
+        if let (Some(first), Some(last)) = (rects.first().copied(), rects.last().copied()) {
+            if vertical {
+                let near = bounds.origin.y + MARGIN;
+                let far = bounds.origin.y + bounds.size.height - MARGIN;
+                let dy = match style.align {
+                    HintsBarAlign::Start => near - first.origin.y,
+                    HintsBarAlign::End => far - (last.origin.y + last.size.height),
+                    HintsBarAlign::Center => 0.0,
+                };
+                if dy.abs() > 0.01 {
+                    for c in &mut rects {
+                        c.origin.y += dy;
+                    }
+                }
+            } else {
+                let near = layout_bounds.origin.x + MARGIN;
+                let far = layout_bounds.origin.x + layout_bounds.size.width - MARGIN;
+                let dx = match style.align {
+                    HintsBarAlign::Start => near - first.origin.x,
+                    HintsBarAlign::End => far - (last.origin.x + last.size.width),
+                    HintsBarAlign::Center => 0.0,
+                };
+                if dx.abs() > 0.01 {
+                    for c in &mut rects {
+                        c.origin.x += dx;
+                    }
+                }
+            }
+        }
+
+        // `notch = "flow"`: the first chip that meets the notch stretches across
+        // it; following chips shift along by the gap.
+        if matches!(style.notch, HintsBarNotch::Flow) {
+            if let Some((nl, nr)) = notch {
+                if let Some(i) = rects
+                    .iter()
+                    .position(|r| r.origin.x + r.size.width > nl && r.origin.x < nr)
+                {
+                    let gap = nr - nl;
+                    if gap > 0.0 {
+                        rects[i].size.width += gap;
+                        for c in &mut rects[(i + 1)..] {
+                            c.origin.x += gap;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Separate the workspace rail pills from the column chips.
+        let (ws_rects_now, chip_rects): (Vec<CGRect>, Vec<CGRect>) =
+            if show_ws && rects.len() >= n_ws {
+                (rects[..n_ws].to_vec(), rects[n_ws..].to_vec())
+            } else {
+                (Vec::new(), rects.clone())
+            };
+
+        // Capsule background per contiguous run; a large gap (notch flow) splits
+        // it into separate capsules so no empty background spans the gap.
+        let cap_pad = 6.0;
+        if !rects.is_empty() {
+            let mut start = 0usize;
+            for k in 1..=rects.len() {
+                let split = k == rects.len() || {
+                    let prev = rects[k - 1];
+                    let gap = if vertical {
+                        rects[k].origin.y - (prev.origin.y + prev.size.height)
+                    } else {
+                        rects[k].origin.x - (prev.origin.x + prev.size.width)
+                    };
+                    gap > 40.0
+                };
+                if split {
+                    let first = rects[start];
+                    let last = rects[k - 1];
+                    let cap_rect = if vertical {
+                        let x0 = (first.origin.x - cap_pad).max(0.0);
+                        let y0 = (first.origin.y - cap_pad).max(0.0);
+                        let y1 = (last.origin.y + last.size.height + cap_pad)
+                            .min(bounds.origin.y + bounds.size.height);
+                        CGRect::new(
+                            CGPoint::new(x0, y0),
+                            CGSize::new(first.size.width + 2.0 * cap_pad, (y1 - y0).max(1.0)),
+                        )
+                    } else {
+                        let x0 = (first.origin.x - cap_pad).max(0.0);
+                        let x1 = (last.origin.x + last.size.width + cap_pad)
+                            .min(bounds.origin.x + bounds.size.width);
+                        CGRect::new(
+                            CGPoint::new(x0, bounds.origin.y + V_INSET - cap_pad),
+                            CGSize::new(
+                                (x1 - x0).max(1.0),
+                                (bounds.size.height - 2.0 * V_INSET + 2.0 * cap_pad).max(1.0),
+                            ),
+                        )
+                    };
+                    let radius = (cap_rect.size.width.min(cap_rect.size.height) * 0.5).min(14.0);
+                    let cap = self.add_rounded(cap_rect, style.background, radius);
+                    cap.setShadowColor(Some(&objc2_app_kit::NSColor::blackColor().CGColor()));
+                    cap.setShadowOpacity(0.22);
+                    cap.setShadowRadius(4.0);
+                    cap.setShadowOffset(CGSize::new(0.0, 1.5));
+                    start = k;
+                }
+            }
+        }
+
+        // Viewport grouping behind the on-screen columns.
+        let visible: Vec<bool> = cells.iter().map(|c| c.visible).collect();
+        if let Some(vp) = Self::viewport_backing(&chip_rects, &visible, vertical) {
+            let r = (vp.size.width.min(vp.size.height) * 0.5).min(10.0);
+            self.add_rounded(vp, style.viewport_color, r);
+        }
+
+        for (w, wr) in workspaces.iter().zip(ws_rects_now.iter()) {
+            self.render_workspace_pill(*wr, w, style, fs);
+        }
+
+        let chip_notch = if matches!(style.notch, HintsBarNotch::Flow) { notch } else { None };
+        for (cell, rect) in cells.iter().zip(chip_rects.iter()) {
+            if dots {
+                self.render_dot(*rect, cell, style);
+            } else {
+                self.render_chip(*rect, cell, style, fs, chip_notch);
+            }
+        }
+
+        (ws_rects_now, chip_rects)
     }
 
     /// One workspace-rail pill: accent fill when active (dim backing otherwise),
@@ -1513,5 +1613,35 @@ mod tests {
         assert!(vp.origin.x < rects[2].origin.x);
         assert!(vp.origin.x + vp.size.width > rects[4].origin.x + rects[4].size.width);
         assert!(HintsBar::viewport_backing(&rects, &[false; 6], false).is_none());
+    }
+
+    #[test]
+    fn overflow_split_wraps_only_when_over_budget() {
+        let style = HintsBarStyle::default();
+        let fs = 13.0;
+        let cell = |label: &str| ColumnCell {
+            hint: "a".to_string(),
+            members: vec![WindowMember {
+                window_id: WindowId::new(1, 1),
+                label: label.to_string(),
+                title: String::new(),
+            }],
+            active: 0,
+            tabbed: false,
+            focused: false,
+            visible: true,
+        };
+        let cells: Vec<ColumnCell> = (0..8).map(|_| cell("Safari")).collect();
+        // Huge budget: everything fits, no overflow.
+        assert_eq!(
+            HintsBar::overflow_split(&cells, &[], &style, fs, 100_000.0),
+            cells.len()
+        );
+        // Tight budget: at least one chip stays on top, but strictly fewer than all.
+        let k = HintsBar::overflow_split(&cells, &[], &style, fs, 250.0);
+        assert!(k >= 1 && k < cells.len(), "expected partial wrap, got {k}");
+        // Monotonic: a wider budget fits at least as many.
+        let wide = HintsBar::overflow_split(&cells, &[], &style, fs, 600.0);
+        assert!(wide >= k, "wider budget fit fewer: {wide} < {k}");
     }
 }

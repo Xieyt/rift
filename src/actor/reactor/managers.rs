@@ -143,6 +143,14 @@ pub struct CommunicationManager {
     pub stack_line_tx: Option<stack_line::Sender>,
     pub hints_bar_tx: Option<hints_bar::Sender>,
     pub hints_bar_last_sig: HashMap<SpaceId, u64>,
+    /// Extra tiling reserve `(top, bottom)` px per space while the hint bar
+    /// overflows (dynamic; only under `reserve` placement).
+    pub hints_bar_reserve: HashMap<SpaceId, (f64, f64)>,
+    /// Set when `hints_bar_reserve` changed this pass; drives one convergence
+    /// layout so tiled windows settle under the new strip geometry.
+    pub hints_bar_reserve_dirty: bool,
+    /// Guards the convergence re-layout against re-entry.
+    pub hints_bar_reserve_converging: bool,
     pub raise_manager_tx: raise_manager::Sender,
     pub event_broadcaster: BroadcastSender,
     pub wm_sender: Option<wm_controller::Sender>,
@@ -312,6 +320,7 @@ fn hints_bar_sig(
     cells: &[crate::ui::hints_bar::ColumnCell],
     workspaces: &[crate::ui::hints_bar::WorkspaceCell],
     frame: CGRect,
+    top_count: usize,
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -336,6 +345,7 @@ fn hints_bar_sig(
         w.active.hash(&mut h);
         w.pids.hash(&mut h);
     }
+    top_count.hash(&mut h);
     h.finish()
 }
 
@@ -345,8 +355,18 @@ impl LayoutManager {
         is_resize: bool,
         is_workspace_switch: bool,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
+        reactor.communication_manager.hints_bar_reserve_dirty = false;
         let layout_result = Self::calculate_layout(reactor);
-        Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)
+        let result = Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)?;
+        if reactor.communication_manager.hints_bar_reserve_dirty
+            && !reactor.communication_manager.hints_bar_reserve_converging
+        {
+            reactor.communication_manager.hints_bar_reserve_converging = true;
+            let converged = Self::update_layout(reactor, is_resize, is_workspace_switch);
+            reactor.communication_manager.hints_bar_reserve_converging = false;
+            return converged;
+        }
+        Ok(result)
     }
 
     fn calculate_layout(reactor: &mut Reactor) -> LayoutResult {
@@ -399,6 +419,25 @@ impl LayoutManager {
                 ) {
                     f.origin.y += reserve;
                 }
+            }
+            // Dynamic overflow reserve: an extra strip per edge while the active
+            // space's hint bar overflows (row = taller top; bar = opposite edge).
+            let (extra_top, extra_bottom) = if reactor.workspace_command_space() == Some(space) {
+                reactor
+                    .communication_manager
+                    .hints_bar_reserve
+                    .get(&space)
+                    .copied()
+                    .unwrap_or((0.0, 0.0))
+            } else {
+                (0.0, 0.0)
+            };
+            if extra_top > 0.0 {
+                f.origin.y += extra_top;
+                f.size.height = (f.size.height - extra_top).max(1.0);
+            }
+            if extra_bottom > 0.0 {
+                f.size.height = (f.size.height - extra_bottom).max(1.0);
             }
             let tiling_frame = f;
             let mut layout =
@@ -544,7 +583,7 @@ impl LayoutManager {
                         let sy = screen_frame.origin.y;
                         let sw = screen_frame.size.width;
                         let sh = screen_frame.size.height;
-                        let bar_frame = match hb.position {
+                        let mut bar_frame = match hb.position {
                             HbPos::Bottom => CGRect::new(
                                 CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
                                 CGSize::new((sw - p.left - p.right).max(1.0), h),
@@ -587,9 +626,102 @@ impl LayoutManager {
                                 Vec::new()
                             };
 
+                        // Overflow plan: cap the top strip at `max_width_ratio`
+                        // of the display; wrap the excess per `overflow` mode.
+                        use crate::common::config::HintsBarOverflow as HbOverflow;
+                        let style = crate::ui::hints_bar::HintsBarStyle::from(hb);
+                        let overflow_mode = hb.overflow;
+                        let mut top_count = cells.len();
+                        let mut overflow_frame: Option<CGRect> = None;
+                        if !cells.is_empty()
+                            && hb.max_width_ratio < 1.0
+                            && !matches!(overflow_mode, HbOverflow::Scale)
+                            && !hb.position.is_vertical()
+                        {
+                            let fs = style
+                                .font_size
+                                .unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
+                            let budget = (sw * hb.max_width_ratio).max(1.0);
+                            let k = crate::ui::hints_bar::HintsBar::overflow_split(
+                                &cells,
+                                &workspaces,
+                                &style,
+                                fs,
+                                budget,
+                            );
+                            if k < cells.len() {
+                                top_count = k;
+                                match overflow_mode {
+                                    HbOverflow::Row => match hb.position {
+                                        HbPos::Bottom => {
+                                            bar_frame.origin.y -= h;
+                                            bar_frame.size.height += h;
+                                        }
+                                        _ => {
+                                            bar_frame.size.height += h;
+                                        }
+                                    },
+                                    HbOverflow::Bar => {
+                                        overflow_frame = Some(match hb.position {
+                                            HbPos::Top => CGRect::new(
+                                                CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
+                                                CGSize::new((sw - p.left - p.right).max(1.0), h),
+                                            ),
+                                            _ => CGRect::new(
+                                                CGPoint::new(sx + p.left, sy + p.top),
+                                                CGSize::new((sw - p.left - p.right).max(1.0), h),
+                                            ),
+                                        });
+                                    }
+                                    HbOverflow::Scale => {}
+                                }
+                            }
+                        }
+
+                        // Dynamic-reserve feedback: record the strip(s) this
+                        // overflow needs so the next (forced) layout pass shrinks
+                        // the tiling area to match. Only under `reserve` placement.
+                        let reserving = hb.placement
+                            == crate::common::config::HintsBarPlacement::Reserve
+                            && !hb.position.is_vertical();
+                        let (want_top, want_bottom) = if reserving && top_count < cells.len() {
+                            match overflow_mode {
+                                HbOverflow::Row => {
+                                    if matches!(hb.position, HbPos::Top) {
+                                        (h, 0.0)
+                                    } else {
+                                        (0.0, h)
+                                    }
+                                }
+                                HbOverflow::Bar => {
+                                    if matches!(hb.position, HbPos::Top) {
+                                        (0.0, h)
+                                    } else {
+                                        (h, 0.0)
+                                    }
+                                }
+                                HbOverflow::Scale => (0.0, 0.0),
+                            }
+                        } else {
+                            (0.0, 0.0)
+                        };
+                        let prev = reactor
+                            .communication_manager
+                            .hints_bar_reserve
+                            .get(&space)
+                            .copied()
+                            .unwrap_or((0.0, 0.0));
+                        if (prev.0 - want_top).abs() > 0.5 || (prev.1 - want_bottom).abs() > 0.5 {
+                            reactor
+                                .communication_manager
+                                .hints_bar_reserve
+                                .insert(space, (want_top, want_bottom));
+                            reactor.communication_manager.hints_bar_reserve_dirty = true;
+                        }
+
                         // Skip redundant sends: nothing downstream changes when the
                         // signature matches the last one we pushed for this space.
-                        let sig = hints_bar_sig(&cells, &workspaces, bar_frame);
+                        let sig = hints_bar_sig(&cells, &workspaces, bar_frame, top_count);
                         let unchanged =
                             reactor.communication_manager.hints_bar_last_sig.get(&space)
                                 == Some(&sig);
@@ -602,6 +734,9 @@ impl LayoutManager {
                                 screen_frame,
                                 cells,
                                 workspaces,
+                                overflow: overflow_mode,
+                                top_count,
+                                overflow_frame,
                             }));
                         }
                     }
