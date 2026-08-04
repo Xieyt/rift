@@ -1,13 +1,13 @@
 use objc2_core_foundation::CGRect;
+pub use rift_protocol::{DisplaySelector, ReactorCommand};
 use serde::{Deserialize, Serialize};
 
 use crate::actor::app::{AppInfo, AppThreadHandle, WindowId, pid_t};
 use crate::common::log::MetricsCommand;
-use crate::layout_engine::{Direction, LayoutCommand, RestoreScope, RestoreSource};
+use crate::layout_engine::LayoutCommand;
 use crate::model::WindowStore;
 use crate::sys::app::WindowInfo;
 use crate::sys::screen::SpaceId;
-use crate::sys::window_server::WindowServerId;
 
 /// All mutable domain state is owned by the reactor thread.
 ///
@@ -31,49 +31,6 @@ pub enum Command {
     Reactor(ReactorCommand),
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(untagged)]
-pub enum DisplaySelector {
-    Direction(Direction),
-    Index(usize),
-    Uuid(String),
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ReactorCommand {
-    Debug,
-    Serialize,
-    SaveLayout {
-        path: std::path::PathBuf,
-    },
-    SaveAndExit,
-    RestoreLayout {
-        path: std::path::PathBuf,
-        scope: RestoreScope,
-        #[serde(default)]
-        source: RestoreSource,
-    },
-    SwitchSpace(Direction),
-    ToggleSpaceActivated,
-    FocusWindow {
-        window_id: WindowId,
-        window_server_id: Option<WindowServerId>,
-    },
-    ShowMissionControlAll,
-    ShowMissionControlCurrent,
-    DismissMissionControl,
-    MoveMouseToDisplay(DisplaySelector),
-    FocusDisplay(DisplaySelector),
-    CloseWindow {
-        window_server_id: Option<WindowServerId>,
-    },
-    ToggleHintsBar,
-    MoveWindowToDisplay {
-        selector: DisplaySelector,
-        window_id: Option<u32>,
-    },
-}
 
 #[derive(Debug, Clone)]
 pub struct DragSession {
@@ -200,6 +157,8 @@ pub enum ReactorError {
 
 #[cfg(test)]
 mod tests {
+    use rift_protocol::{RestoreScope, RestoreSource};
+
     use super::*;
 
     #[test]

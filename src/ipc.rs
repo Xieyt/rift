@@ -1,7 +1,9 @@
-use std::ffi::{CStr, c_char};
+use std::ffi::c_char;
 use std::time::Duration;
 
 use r#continue::continuation;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use tracing::{error, info, trace};
 
 pub mod cli_exec;
@@ -9,15 +11,14 @@ pub mod protocol;
 pub mod subscriptions;
 
 pub use protocol::{RiftCommand, RiftRequest, RiftResponse};
+pub use rift_client::{ClientError as RiftMachClientError, RiftMachClient, RiftMachSubscription};
 
 use crate::actor::config as config_actor;
 use crate::actor::reactor::{self, Event};
 use crate::ipc::subscriptions::SharedServerState;
 use crate::sys::dispatch::block_on;
 use crate::sys::mach::{
-    is_mach_server_registered, mach_allocate_reply_port, mach_deallocate_reply_port,
-    mach_msg_header_t, mach_receive_message_on_port, mach_send_request,
-    mach_send_request_with_reply_port, mach_server_run, send_mach_reply,
+    is_mach_server_registered, mach_msg_header_t, mach_server_run, send_mach_reply,
 };
 
 type ClientPort = u32;
@@ -46,125 +47,6 @@ pub fn run_mach_server(
     });
 
     Ok(shared_state)
-}
-
-pub struct RiftMachClient {
-    connected: bool,
-}
-
-pub struct RiftMachSubscription {
-    reply_port: u32,
-}
-
-impl RiftMachSubscription {
-    pub fn recv_event(&self) -> Result<serde_json::Value, String> {
-        let mut event_buf = Vec::with_capacity(256);
-        let ok = unsafe { mach_receive_message_on_port(self.reply_port, &mut event_buf) };
-        if !ok || event_buf.is_empty() {
-            return Err("Failed to receive Mach event".to_string());
-        }
-
-        let json_bytes = CStr::from_bytes_until_nul(&event_buf)
-            .map_err(|_| "event payload missing NUL terminator")?
-            .to_bytes();
-
-        serde_json::from_slice(json_bytes).map_err(|e| format!("Failed to parse event JSON: {e}"))
-    }
-}
-
-impl Drop for RiftMachSubscription {
-    fn drop(&mut self) {
-        unsafe {
-            mach_deallocate_reply_port(self.reply_port);
-        }
-    }
-}
-
-impl RiftMachClient {
-    pub fn connect() -> Result<Self, String> { Ok(RiftMachClient { connected: true }) }
-
-    fn parse_response_buffer(response_buf: &[u8]) -> Result<RiftResponse, String> {
-        let json_bytes = CStr::from_bytes_until_nul(response_buf)
-            .map_err(|_| "response missing NUL terminator")?
-            .to_bytes();
-
-        serde_json::from_slice(json_bytes)
-            .map_err(|e| format!("Failed to parse response JSON: {}", e))
-    }
-
-    pub fn send_request(&self, request: &RiftRequest) -> Result<RiftResponse, String> {
-        if !self.connected {
-            return Err("Not connected".to_string());
-        }
-
-        let request_json = serde_json::to_vec(request)
-            .map_err(|e| format!("Failed to serialize request: {}", e))?;
-
-        let mut response_buf = Vec::with_capacity(256);
-        let ok = unsafe {
-            mach_send_request(
-                request_json.as_ptr() as *const i8,
-                request_json.len() as u32,
-                &mut response_buf,
-            )
-        };
-
-        if !ok || response_buf.is_empty() {
-            return Err("Failed to send Mach request or no response received".to_string());
-        }
-
-        Self::parse_response_buffer(&response_buf)
-    }
-
-    pub fn subscribe(&self, event: String) -> Result<RiftMachSubscription, String> {
-        if !self.connected {
-            return Err("Not connected".to_string());
-        }
-
-        let reply_port = unsafe {
-            mach_allocate_reply_port().ok_or_else(|| "Failed to allocate reply port".to_string())?
-        };
-
-        let request = RiftRequest::Subscribe { event: event.clone() };
-        let request_json = serde_json::to_vec(&request)
-            .map_err(|e| format!("Failed to serialize request: {}", e))?;
-
-        let mut response_buf = Vec::with_capacity(256);
-        let ok = unsafe {
-            mach_send_request_with_reply_port(
-                request_json.as_ptr() as *const i8,
-                request_json.len() as u32,
-                reply_port,
-                &mut response_buf,
-            )
-        };
-        if !ok || response_buf.is_empty() {
-            unsafe {
-                mach_deallocate_reply_port(reply_port);
-            }
-            return Err("Failed to send subscribe request or no response received".to_string());
-        }
-
-        let response = match Self::parse_response_buffer(&response_buf) {
-            Ok(resp) => resp,
-            Err(err) => {
-                unsafe {
-                    mach_deallocate_reply_port(reply_port);
-                }
-                return Err(err);
-            }
-        };
-
-        match response {
-            RiftResponse::Success { .. } => Ok(RiftMachSubscription { reply_port }),
-            RiftResponse::Error { error } => {
-                unsafe {
-                    mach_deallocate_reply_port(reply_port);
-                }
-                Err(format!("Subscribe request failed: {error}"))
-            }
-        }
-    }
 }
 
 struct MachHandler {
@@ -222,24 +104,24 @@ impl MachHandler {
         match request {
             RiftRequest::Subscribe { event } => {
                 let state = self.server_state.read();
-                state.subscribe_client(client_port, event.clone());
+                state.subscribe_client(client_port, event.to_string());
                 RiftResponse::Success {
-                    data: serde_json::json!({ "subscribed": event }),
+                    data: serde_json::json!({ "subscribed": event.to_string() }),
                 }
             }
             RiftRequest::Unsubscribe { event } => {
                 let state = self.server_state.read();
-                state.unsubscribe_client(client_port, event.clone());
+                state.unsubscribe_client(client_port, event.to_string());
                 RiftResponse::Success {
-                    data: serde_json::json!({ "unsubscribed": event }),
+                    data: serde_json::json!({ "unsubscribed": event.to_string() }),
                 }
             }
             RiftRequest::SubscribeCli { event, command, args } => {
                 let state = self.server_state.read();
-                state.subscribe_cli(event.clone(), command.clone(), args.clone());
+                state.subscribe_cli(event.to_string(), command.clone(), args.clone());
                 RiftResponse::Success {
                     data: serde_json::json!({
-                        "cli_subscribed": event,
+                        "cli_subscribed": event.to_string(),
                         "command": command,
                         "args": args
                     }),
@@ -247,9 +129,9 @@ impl MachHandler {
             }
             RiftRequest::UnsubscribeCli { event } => {
                 let state = self.server_state.read();
-                state.unsubscribe_cli(event.clone());
+                state.unsubscribe_cli(event.to_string());
                 RiftResponse::Success {
-                    data: serde_json::json!({ "cli_unsubscribed": event }),
+                    data: serde_json::json!({ "cli_unsubscribed": event.to_string() }),
                 }
             }
             RiftRequest::ListCliSubscriptions => {
@@ -262,14 +144,26 @@ impl MachHandler {
                 let workspaces =
                     self.reactor.query_workspaces(space_id.map(crate::sys::screen::SpaceId::new));
                 RiftResponse::Success {
-                    data: serde_json::to_value(workspaces).unwrap(),
+                    data: serde_json::to_value(
+                        workspaces
+                            .into_iter()
+                            .map(rift_protocol::WorkspaceData::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
                 }
             }
 
             RiftRequest::GetDisplays => {
                 let displays = self.reactor.query_displays();
                 RiftResponse::Success {
-                    data: serde_json::to_value(displays).unwrap(),
+                    data: serde_json::to_value(
+                        displays
+                            .into_iter()
+                            .map(rift_protocol::DisplayData::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
                 }
             }
 
@@ -278,24 +172,29 @@ impl MachHandler {
 
                 let windows = self.reactor.query_windows(space_id);
                 RiftResponse::Success {
-                    data: serde_json::to_value(windows).unwrap(),
+                    data: serde_json::to_value(
+                        windows
+                            .into_iter()
+                            .map(rift_protocol::WindowData::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
                 }
             }
 
             RiftRequest::GetWindowInfo { window_id } => {
-                let window_id = match crate::actor::app::WindowId::from_debug_string(&window_id) {
-                    Some(wid) => wid,
-                    None => {
-                        error!("Invalid window_id format: {}", window_id);
-                        return RiftResponse::Error {
-                            error: serde_json::json!({ "message": "Invalid window_id format", "window_id": window_id }),
-                        };
-                    }
-                };
+                if window_id.idx == 0 {
+                    error!("Invalid window_id: {:?}", window_id);
+                    return RiftResponse::Error {
+                        error: serde_json::json!({ "message": "Invalid window_id" }),
+                    };
+                }
+                let window_id = crate::actor::app::WindowId::new(window_id.pid, window_id.idx);
 
                 match self.reactor.query_window_info(window_id) {
                     Some(window) => RiftResponse::Success {
-                        data: serde_json::to_value(window).unwrap(),
+                        data: serde_json::to_value(rift_protocol::WindowData::from(window))
+                            .unwrap(),
                     },
                     None => RiftResponse::Error {
                         error: serde_json::json!({ "message": "Window not found" }),
@@ -306,7 +205,10 @@ impl MachHandler {
             RiftRequest::GetLayoutState { space_id } => {
                 match self.reactor.query_layout_state(space_id) {
                     Some(layout_state) => RiftResponse::Success {
-                        data: serde_json::to_value(layout_state).unwrap(),
+                        data: serde_json::to_value(rift_protocol::LayoutStateData::from(
+                            layout_state,
+                        ))
+                        .unwrap(),
                     },
                     None => RiftResponse::Error {
                         error: serde_json::json!({ "message": "Space not found or inactive" }),
@@ -319,14 +221,26 @@ impl MachHandler {
                     workspace_id,
                 );
                 RiftResponse::Success {
-                    data: serde_json::to_value(workspace_layouts).unwrap(),
+                    data: serde_json::to_value(
+                        workspace_layouts
+                            .into_iter()
+                            .map(rift_protocol::WorkspaceLayoutData::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
                 }
             }
 
             RiftRequest::GetApplications => {
                 let applications = self.reactor.query_applications();
                 RiftResponse::Success {
-                    data: serde_json::to_value(applications).unwrap(),
+                    data: serde_json::to_value(
+                        applications
+                            .into_iter()
+                            .map(rift_protocol::ApplicationData::from)
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap(),
                 }
             }
 
@@ -355,68 +269,71 @@ impl MachHandler {
                 }
             }
 
-            RiftRequest::ExecuteCommand { command, args } => {
-                match serde_json::from_str::<RiftCommand>(&command) {
-                    Ok(RiftCommand::Config(_)) => {
-                        if args.len() >= 2 && args[0] == "__apply_config__" {
-                            match serde_json::from_str::<crate::common::config::ConfigCommand>(
-                                &args[1],
-                            ) {
-                                Ok(cfg_cmd) => match self.perform_config_query(|tx| {
-                                    config_actor::Event::ApplyConfig { cmd: cfg_cmd, response: tx }
-                                }) {
-                                    Ok(apply_result) => match apply_result {
-                                        Ok(()) => RiftResponse::Success {
-                                            data: serde_json::json!("Config applied successfully"),
-                                        },
-                                        Err(msg) => RiftResponse::Error {
-                                            error: serde_json::json!({ "message": msg }),
-                                        },
-                                    },
-                                    Err(e) => {
-                                        error!("{}", e);
-                                        RiftResponse::Error {
-                                            error: serde_json::json!({ "message": format!("Failed to apply config: {}", e) }),
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Failed to parse config command from args: {}", e);
-                                    RiftResponse::Error {
-                                        error: serde_json::json!({ "message": format!("Invalid config command in args: {}", e) }),
-                                    }
-                                }
-                            }
-                        } else {
-                            RiftResponse::Success {
-                                data: serde_json::json!("No-op config command"),
-                            }
-                        }
-                    }
-                    Ok(RiftCommand::Reactor(reactor_command)) => {
-                        let event = Event::Command(reactor_command);
-
-                        if let Err(e) = self.reactor.try_send(event) {
-                            error!("Failed to send command to reactor: {}", e);
-                            return RiftResponse::Error {
-                                error: serde_json::json!({ "message": "Failed to execute command", "details": format!("{}", e) }),
-                            };
-                        }
-
-                        RiftResponse::Success {
-                            data: serde_json::json!("Command executed successfully"),
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to parse command: {}", e);
-                        RiftResponse::Error {
-                            error: serde_json::json!({ "message": format!("Invalid command format: {}", e) }),
-                        }
-                    }
+            RiftRequest::ExecuteCommand { command } => match command {
+                rift_protocol::RiftCommand::Config(command) => match decode_protocol(command) {
+                    Ok(command) => match self.perform_config_query(|tx| {
+                        config_actor::Event::ApplyConfig { cmd: command, response: tx }
+                    }) {
+                        Ok(Ok(())) => RiftResponse::Success {
+                            data: serde_json::json!("Config applied successfully"),
+                        },
+                        Ok(Err(msg)) => RiftResponse::Error {
+                            error: serde_json::json!({ "message": msg }),
+                        },
+                        Err(e) => RiftResponse::Error {
+                            error: serde_json::json!({ "message": format!("Failed to apply config: {}", e) }),
+                        },
+                    },
+                    Err(e) => RiftResponse::Error {
+                        error: serde_json::json!({ "message": format!("Invalid config command: {}", e) }),
+                    },
+                },
+                rift_protocol::RiftCommand::Layout(command) => {
+                    self.send_typed_reactor_command(command)
                 }
-            }
+                rift_protocol::RiftCommand::Metrics(command) => {
+                    self.send_typed_reactor_command(command)
+                }
+                rift_protocol::RiftCommand::Reactor(command) => {
+                    self.send_typed_reactor_command(command)
+                }
+            },
+            _ => RiftResponse::Error {
+                error: serde_json::json!({ "message": "Unsupported request" }),
+            },
         }
     }
+
+    fn send_typed_reactor_command<T>(&self, command: T) -> RiftResponse
+    where T: Serialize {
+        let command = match decode_protocol(command) {
+            Ok(command) => command,
+            Err(e) => {
+                return RiftResponse::Error {
+                    error: serde_json::json!({ "message": format!("Invalid command format: {}", e) }),
+                };
+            }
+        };
+        let event = Event::Command(command);
+
+        if let Err(e) = self.reactor.try_send(event) {
+            error!("Failed to send command to reactor: {}", e);
+            return RiftResponse::Error {
+                error: serde_json::json!({ "message": "Failed to execute command", "details": format!("{}", e) }),
+            };
+        }
+
+        RiftResponse::Success {
+            data: serde_json::json!("Command executed successfully"),
+        }
+    }
+}
+
+fn decode_protocol<T, U>(value: T) -> Result<U, serde_json::Error>
+where
+    T: Serialize,
+    U: DeserializeOwned, {
+    serde_json::from_value(serde_json::to_value(value)?)
 }
 
 unsafe extern "C" fn handle_mach_request_c(

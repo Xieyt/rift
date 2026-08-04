@@ -451,7 +451,10 @@ impl HintsBar {
                 if let Some(index) = bar.column_at_point(local) {
                     if let Some(window_id) = bar.window_id_at(index) {
                         let _ = self.reactor_tx.send(reactor::Event::Command(Command::Reactor(
-                            ReactorCommand::FocusWindow { window_id, window_server_id: None },
+                            ReactorCommand::FocusWindow {
+                                window_id: window_id.into(),
+                                window_server_id: None,
+                            },
                         )));
                     }
                 }
@@ -466,7 +469,10 @@ impl HintsBar {
                 if let Some(index) = ob.column_at_point(local) {
                     if let Some(window_id) = ob.window_id_at(index) {
                         let _ = self.reactor_tx.send(reactor::Event::Command(Command::Reactor(
-                            ReactorCommand::FocusWindow { window_id, window_server_id: None },
+                            ReactorCommand::FocusWindow {
+                                window_id: window_id.into(),
+                                window_server_id: None,
+                            },
                         )));
                     }
                 }

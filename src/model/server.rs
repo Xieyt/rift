@@ -1,36 +1,31 @@
+use rift_protocol as protocol;
 use serde::de::Deserializer;
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 
-use crate::actor::app::{WindowId, pid_t};
+use crate::actor::app::WindowId;
 use crate::sys::app::WindowInfo;
 use crate::sys::geometry::CGRectDef;
 use crate::sys::screen::{ScreenId, ScreenInfo, SpaceId};
 use crate::sys::window_server::WindowServerId;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceData {
+/// Runtime-only workspace projection. Its windows retain the macOS
+/// accessibility metadata needed by the UI; IPC uses the protocol-owned
+/// `rift_protocol::WorkspaceData` representation.
+#[derive(Debug, Clone)]
+pub struct RuntimeWorkspaceData {
     pub id: String,
     pub index: usize,
     pub name: String,
     pub layout_mode: String,
     pub is_active: bool,
     pub window_count: usize,
-    pub windows: Vec<WindowData>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkspaceLayoutData {
-    pub id: String,
-    pub index: usize,
-    pub name: String,
-    pub layout_mode: String,
-    pub is_active: bool,
+    pub windows: Vec<RuntimeWindowData>,
 }
 
 #[derive(Debug, Clone)]
-pub struct WindowData {
+pub struct RuntimeWindowData {
     pub id: WindowId,
     pub is_floating: bool,
     pub is_focused: bool,
@@ -38,26 +33,8 @@ pub struct WindowData {
     pub info: WindowInfo,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApplicationData {
-    pub pid: pid_t,
-    pub bundle_id: Option<String>,
-    pub name: String,
-    pub is_frontmost: bool,
-    pub window_count: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LayoutStateData {
-    pub space_id: u64,
-    pub mode: String,
-    pub floating_windows: Vec<WindowId>,
-    pub tiled_windows: Vec<WindowId>,
-    pub focused_window: Option<WindowId>,
-}
-
 #[derive(Debug, Clone)]
-pub struct DisplayData {
+pub struct RuntimeDisplayData {
     pub info: ScreenInfo,
     /// True if this display's space is active per the activation policy.
     pub is_active_space: bool,
@@ -69,7 +46,79 @@ pub struct DisplayData {
     pub inactive_space_ids: Vec<u64>,
 }
 
-impl Serialize for WindowData {
+impl From<WindowId> for protocol::WindowId {
+    fn from(value: WindowId) -> Self {
+        Self {
+            pid: value.pid,
+            idx: value.idx.get(),
+        }
+    }
+}
+
+impl From<RuntimeWindowData> for protocol::WindowData {
+    fn from(value: RuntimeWindowData) -> Self {
+        Self {
+            id: value.id.into(),
+            title: value.info.title,
+            frame: protocol::Rect {
+                origin: protocol::Point {
+                    x: value.info.frame.origin.x,
+                    y: value.info.frame.origin.y,
+                },
+                size: protocol::Size {
+                    width: value.info.frame.size.width,
+                    height: value.info.frame.size.height,
+                },
+            },
+            is_floating: value.is_floating,
+            is_focused: value.is_focused,
+            bundle_id: value.info.bundle_id,
+            app_name: value.app_name,
+            window_server_id: value.info.sys_id.map(|id| id.as_u32()),
+        }
+    }
+}
+
+impl From<RuntimeWorkspaceData> for protocol::WorkspaceData {
+    fn from(value: RuntimeWorkspaceData) -> Self {
+        Self {
+            id: value.id,
+            index: value.index,
+            name: value.name,
+            layout_mode: value.layout_mode,
+            is_active: value.is_active,
+            window_count: value.window_count,
+            windows: value.windows.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<RuntimeDisplayData> for protocol::DisplayData {
+    fn from(value: RuntimeDisplayData) -> Self {
+        Self {
+            uuid: value.info.display_uuid,
+            name: value.info.name,
+            screen_id: value.info.id.as_u32(),
+            frame: protocol::Rect {
+                origin: protocol::Point {
+                    x: value.info.frame.origin.x,
+                    y: value.info.frame.origin.y,
+                },
+                size: protocol::Size {
+                    width: value.info.frame.size.width,
+                    height: value.info.frame.size.height,
+                },
+            },
+            space: value.info.space.map(|space| space.get()),
+            is_active_space: value.is_active_space,
+            is_active_context: value.is_active_context,
+            active_space_ids: value.active_space_ids,
+            inactive_space_ids: value.inactive_space_ids,
+        }
+    }
+}
+
+impl Serialize for RuntimeWindowData {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: Serializer {
         #[serde_as]
@@ -101,7 +150,7 @@ impl Serialize for WindowData {
     }
 }
 
-impl<'de> Deserialize<'de> for WindowData {
+impl<'de> Deserialize<'de> for RuntimeWindowData {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: Deserializer<'de> {
         #[serde_as]
@@ -135,7 +184,7 @@ impl<'de> Deserialize<'de> for WindowData {
             ax_subrole: None,
         };
 
-        Ok(WindowData {
+        Ok(RuntimeWindowData {
             id: helper.id,
             is_floating: helper.is_floating,
             is_focused: helper.is_focused,
@@ -145,7 +194,7 @@ impl<'de> Deserialize<'de> for WindowData {
     }
 }
 
-impl Serialize for DisplayData {
+impl Serialize for RuntimeDisplayData {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: Serializer {
         #[serde_as]
@@ -179,7 +228,7 @@ impl Serialize for DisplayData {
     }
 }
 
-impl<'de> Deserialize<'de> for DisplayData {
+impl<'de> Deserialize<'de> for RuntimeDisplayData {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: Deserializer<'de> {
         #[serde_as]
@@ -206,7 +255,7 @@ impl<'de> Deserialize<'de> for DisplayData {
             space: helper.space.map(SpaceId::new),
         };
 
-        Ok(DisplayData {
+        Ok(RuntimeDisplayData {
             info,
             is_active_space: helper.is_active_space,
             is_active_context: helper.is_active_context,
@@ -240,7 +289,7 @@ mod tests {
             ax_role: None,
             ax_subrole: None,
         };
-        let data = WindowData {
+        let data = RuntimeWindowData {
             id: WindowId::new(123, 7),
             is_floating: true,
             is_focused: false,
@@ -271,7 +320,7 @@ mod tests {
             name: Some("Primary".to_string()),
             space: Some(SpaceId::new(42)),
         };
-        let data = DisplayData {
+        let data = RuntimeDisplayData {
             info,
             is_active_space: true,
             is_active_context: false,

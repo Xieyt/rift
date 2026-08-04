@@ -13,7 +13,7 @@ use crate::common::config::{LayoutMode, LayoutSettings, WorkspaceSelector};
 use crate::layout_engine::LayoutSystem;
 use crate::layout_engine::floating::FloatingFullscreenKind;
 use crate::layout_engine::systems::WindowLayoutConstraints;
-use crate::model::broadcast::{BroadcastEvent, BroadcastSender};
+use crate::model::broadcast::{BroadcastEvent, BroadcastSender, protocol_workspace_id};
 use crate::model::virtual_workspace::{
     AppRuleAssignment, AppRuleResult, VirtualWorkspace, VirtualWorkspaceId, WorkspaceStore,
 };
@@ -24,6 +24,7 @@ mod persistence;
 
 use persistence::PersistenceState;
 pub use persistence::{RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning};
+pub use rift_protocol::{LayoutCommand, MoveFocusArgs};
 
 #[derive(Debug, Clone)]
 pub struct GroupContainerInfo {
@@ -40,110 +41,8 @@ struct WindowRemovalImpact {
     active_space: Option<SpaceId>,
 }
 
-/// Arguments for [`LayoutCommand::MoveFocus`].
-///
-/// Deserializes from either the bare direction (`move_focus = "left"` — the
-/// upstream default-config form, with `activate` defaulting to `false`) or the
-/// full table (`move_focus = { direction = "left", activate = true }`). The
-/// `activate` override forces app foregrounding even when
-/// `[settings.layout] activate_on_focus` is disabled.
-#[derive(Serialize, Debug, Clone, PartialEq)]
-pub struct MoveFocusArgs {
-    pub direction: Direction,
-    pub activate: bool,
-}
-
-impl<'de> Deserialize<'de> for MoveFocusArgs {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Repr {
-            Bare(Direction),
-            Full {
-                direction: Direction,
-                #[serde(default)]
-                activate: bool,
-            },
-        }
-        Ok(match Repr::deserialize(deserializer)? {
-            Repr::Bare(direction) => MoveFocusArgs { direction, activate: false },
-            Repr::Full { direction, activate } => MoveFocusArgs { direction, activate },
-        })
-    }
-}
-
 #[non_exhaustive]
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub enum LayoutCommand {
-    NextWindow,
-    PrevWindow,
-    MoveFocus(MoveFocusArgs),
-    /// Focus the Nth top-level column (0-indexed, left->right), matching the
-    /// hint-bar letters. Scrolling/niri only; other layouts ignore it.
-    FocusColumn(usize),
-    Ascend,
-    Descend,
-    MoveNode(Direction),
 
-    JoinWindow(Direction),
-    ConsumeOrExpelWindow(Direction),
-    ToggleStack,
-    ToggleColumnTabbed,
-    CycleColumnWidth,
-    ToggleOrientation,
-    UnjoinWindows,
-    ToggleFocusFloating,
-    ToggleWindowFloating,
-    ToggleFullscreen,
-    ToggleFullscreenWithinGaps,
-
-    ResizeWindowGrow(ResizeOrientation),
-    ResizeWindowShrink(ResizeOrientation),
-    ResizeWindowBy {
-        amount: f64,
-    },
-
-    /// Scroll the strip by a normalized delta (scaled by column step width)
-    ScrollStrip {
-        delta: f64,
-    },
-    /// Snap the strip to the nearest column boundary
-    SnapStrip,
-    /// Toggle centering for the selected column without changing alignment settings.
-    /// The center override is cleared when focus moves to a different window.
-    CenterSelection,
-
-    NextWorkspace(Option<bool>),
-    PrevWorkspace(Option<bool>),
-    SwitchToWorkspace(usize),
-    MoveWindowToWorkspace {
-        workspace: WorkspaceSelector,
-        #[serde(default = "crate::common::config::no")]
-        follow: bool,
-        window_id: Option<u32>,
-    },
-    SetWorkspaceLayout {
-        workspace: Option<usize>,
-        mode: LayoutMode,
-    },
-    CreateWorkspace,
-    SwitchToLastWorkspace,
-
-    SwapWindows(crate::actor::app::WindowId, crate::actor::app::WindowId),
-
-    AdjustMasterRatio(f64),
-    AdjustMasterCount {
-        delta: i32,
-    },
-    PromoteToMaster,
-    SwapMasterStack,
-}
-
-#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum LayoutEvent {
     WindowsOnScreenUpdated(
@@ -1815,6 +1714,8 @@ impl LayoutEngine {
             LayoutCommand::ToggleFocusFloating => unreachable!(),
 
             LayoutCommand::SwapWindows(a, b) => {
+                let a = crate::actor::app::WindowId::new(a.pid, a.idx);
+                let b = crate::actor::app::WindowId::new(b.pid, b.idx);
                 let _ = self.workspace_tree_mut(workspace_id).swap_windows(layout, a, b);
 
                 EventResponse::default()
@@ -3063,9 +2964,9 @@ impl LayoutEngine {
             {
                 let display_uuid = self.display_uuid_for_space(space_id);
                 let _ = broadcast_tx.send(BroadcastEvent::WorkspaceChanged {
-                    workspace_id: active_workspace_id,
+                    workspace_id: protocol_workspace_id(active_workspace_id),
                     workspace_name: active_workspace_name.clone(),
-                    space_id,
+                    space_id: space_id.get(),
                     display_uuid,
                 });
             }
@@ -3086,10 +2987,10 @@ impl LayoutEngine {
 
                 let display_uuid = self.display_uuid_for_space(space_id);
                 let event = BroadcastEvent::WindowsChanged {
-                    workspace_id,
+                    workspace_id: protocol_workspace_id(workspace_id),
                     workspace_name,
                     windows,
-                    space_id,
+                    space_id: space_id.get(),
                     display_uuid,
                 };
 
