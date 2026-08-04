@@ -16,5 +16,7 @@
 	<string>APPL</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2025 acsandmann. All rights reserved.</string>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>Rift captures window thumbnails to render Mission Control previews.</string>
 </dict>
 </plist>

@@ -67,6 +67,17 @@
             per-build cdhash). With `manageSigningIdentity = true` (default) this
             self-signed identity is created automatically on first activation.
             Set to "-" to sign ad-hoc (Accessibility re-granted each rebuild).
+
+            The same keying covers Screen Recording, which Mission Control's
+            ScreenCaptureKit previews require — but it is a SEPARATE TCC consent
+            record from Accessibility, so a stable identity does not carry an
+            existing Accessibility grant over to it. Every user gets ONE new prompt
+            at the next login after this is first installed; grant Rift under
+            System Settings > Privacy & Security > Screen & System Audio Recording,
+            otherwise Mission Control renders black previews. Because the prompt
+            comes from a launchd agent at login it is easy to miss. With
+            `signingIdentity = "-"` this grant, like Accessibility, is re-prompted
+            on every rebuild.
           '';
         };
 
@@ -77,8 +88,9 @@
             If true (default), activation auto-creates the `signingIdentity`
             self-signed code-signing cert in the System keychain (idempotent:
             created once, reused forever) and trusts it for code signing. This lets
-            a plain `darwin-rebuild switch` keep the Accessibility grant across
-            rebuilds with no manual keychain setup or repo clone. Set false to
+            a plain `darwin-rebuild switch` keep the Accessibility *and* Screen
+            Recording grants across rebuilds with no manual keychain setup or repo
+            clone (both TCC records key on identity + bundle id). Set false to
             manage the identity yourself or to keep ad-hoc signing.
           '';
         };
@@ -105,9 +117,13 @@
           # Copy app bundle (rsync preserves codesign)
           ${pkgs.rsync}/bin/rsync -a "$app_source/" "$app_target/"
           
-          # Ensure a stable code-signing identity exists so TCC (Accessibility)
-          # survives rebuilds, then sign with it. Uses system LibreSSL (/usr/bin)
-          # because Homebrew/nix OpenSSL 3.x writes a p12 macOS can't import.
+          # Ensure a stable code-signing identity exists so TCC (Accessibility and,
+          # for Mission Control's ScreenCaptureKit previews, Screen Recording)
+          # survives rebuilds, then sign with it. Both consent records key on
+          # (signing identity, bundle id), so a stable identity keeps them; ad-hoc
+          # signing ("-") means macOS re-prompts for both on every rebuild.
+          # Uses system LibreSSL (/usr/bin) because Homebrew/nix OpenSSL 3.x
+          # writes a p12 macOS can't import.
           sign="${cfg.signingIdentity}"
           keychain=/Library/Keychains/System.keychain
           ${lib.optionalString cfg.manageSigningIdentity ''
@@ -139,6 +155,12 @@
           echo "✓ Rift.app signed: identifier=$got identity=$sign" >&2
         '';
 
+        # First login after installing/updating to a ScreenCaptureKit build: this
+        # agent triggers a one-time "Screen & System Audio Recording" TCC prompt
+        # (separate from Accessibility, so an existing Accessibility grant does not
+        # cover it). It is easy to miss at login — if Mission Control previews are
+        # black, grant Rift under System Settings > Privacy & Security > Screen &
+        # System Audio Recording and restart the agent.
         launchd.user.agents.rift = {
           serviceConfig = {
             Label = "git.acsandmann.rift";
