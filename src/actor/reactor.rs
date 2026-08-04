@@ -90,13 +90,12 @@ use crate::actor::{self, hints_bar, menu_bar, stack_line};
 use crate::common::collections::{BTreeMap, HashMap, HashSet};
 use crate::common::config::Config;
 use crate::layout_engine::{self as layout, Direction, LayoutEngine, LayoutEvent};
-use crate::model::RiftState;
 use crate::model::broadcast::{
     BroadcastEvent, BroadcastSender, protocol_window_id, protocol_workspace_id,
 };
 use crate::model::space_activation::{SpaceActivationConfig, SpaceActivationPolicy};
 use crate::model::tx_store::WindowTxStore;
-use crate::model::virtual_workspace::AppRuleResult;
+use crate::model::{AppRuleResult, RiftState};
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
 use crate::sys::geometry::{CGRectDef, CGRectExt};
@@ -1124,6 +1123,9 @@ impl Reactor {
             }
             Event::WindowServerFocusChanged(window, reported_space) => {
                 if self.layout_manager.layout_engine.focused_window() == Some(window) {
+                    if let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
+                        _ = event_tap_tx.send(crate::actor::event_tap::Request::EnforceHidden);
+                    }
                     return Ok(EventOutcome::default());
                 }
                 if !self.state.windows.contains_window(window) {
@@ -1487,11 +1489,6 @@ impl Reactor {
                 let needs_layout_sync = window.is_some_and(|window| {
                     self.layout_manager.layout_engine.focused_window() != Some(window)
                 });
-                let arrange_after_layout_sync = needs_layout_sync
-                    && active_space.is_some_and(|space| {
-                        self.layout_manager.layout_engine.active_layout_mode_at(space)
-                            == crate::common::config::LayoutMode::Scrolling
-                    });
                 return window_workflow::handle_mouse_moved_over_window(
                     &self.app_manager,
                     window_workflow::MouseMovedPayload {
@@ -1500,7 +1497,6 @@ impl Reactor {
                             .is_some_and(|window| self.should_raise_on_mouse_over(window)),
                         is_main: window.is_some_and(|window| self.main_window() == Some(window)),
                         needs_layout_sync,
-                        arrange_after_layout_sync,
                         active_space,
                     },
                 );
@@ -2044,7 +2040,7 @@ impl Reactor {
             }
         }
 
-        if let Some((config, keys_changed)) = outcome.service_config_update {
+        if let Some(config) = outcome.service_config_update {
             if let Some(tx) = &self.communication_manager.stack_line_tx
                 && let Err(error) = tx.try_send(stack_line::Event::ConfigUpdated(config.clone()))
             {
@@ -2060,7 +2056,7 @@ impl Reactor {
             {
                 warn!(%error, "failed to update menu bar config");
             }
-            if keys_changed && let Some(wm) = &self.communication_manager.wm_sender {
+            if let Some(wm) = &self.communication_manager.wm_sender {
                 wm.send(crate::actor::wm_controller::WmEvent::ConfigUpdated(config));
             }
         }
@@ -3289,21 +3285,131 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        let focus_changed = matches!(
+            &event,
+            LayoutEvent::WindowFocused(_, window)
+                if self.layout_manager.layout_engine.focused_window() != Some(*window)
+        );
+        let event_space = match &event {
+            LayoutEvent::WindowFocused(space, _) => Some(*space),
+            _ => None,
+        };
         let focus_desktop = matches!(
             event,
             LayoutEvent::WindowRemoved(wid)
                 if self.layout_manager.layout_engine.focused_window() == Some(wid)
         );
         let event_clone = event.clone();
-        let response =
+        let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
+        let mut response = layout_outcome.response;
+        let (placements, resizes, workspace_focus) = layout_outcome.app_rules.into_parts();
+        self.apply_app_rule_placements(placements);
+        self.apply_app_rule_resizes(resizes);
+        let workspace_switch_space = workspace_focus.map(|request| request.space);
+        if let Some(request) = workspace_focus {
+            self.store_current_floating_positions(request.space);
+            self.workspace_switch_manager
+                .start_workspace_switch(WorkspaceSwitchOrigin::Auto);
+            response = self.layout_manager.layout_engine.switch_to_workspace_with_focus(
+                &self.state.windows,
+                request.space,
+                request.workspace_index,
+                request.window,
+            );
+        }
+        if focus_changed && let Some(event_tap_tx) = &self.communication_manager.event_tap_tx {
+            _ = event_tap_tx.send(crate::actor::event_tap::Request::HideOnFocus);
+        }
+        let geometry_changed = response.changed;
         self.prepare_refocus_after_layout_event(&event_clone);
-        self.handle_layout_response(response, None);
+        self.handle_layout_response(response, workspace_switch_space);
+        if geometry_changed {
+            self.update_layout_or_warn(
+                false,
+                workspace_switch_space.is_some(),
+                workspace_switch_space.or(event_space),
+            );
+        }
         if focus_desktop && let Some(space) = self.workspace_command_space() {
             self.focus_desktop_if_active_workspace_empty(space);
         }
         for space in self.space_state.iter_known_spaces() {
             self.layout_manager.layout_engine.debug_tree_desc(space, "after event", false);
+        }
+    }
+
+    fn apply_app_rule_placements(
+        &mut self,
+        placements: Vec<crate::model::app_rules::AppRulePlacement>,
+    ) {
+        for placement in placements {
+            let Some(window) = self.state.windows.window(placement.window) else {
+                continue;
+            };
+            let frame = if placement.position.is_some() {
+                let Some(screen) = self.space_state.screen_by_space(placement.space) else {
+                    warn!(
+                        window = ?placement.window,
+                        space = ?placement.space,
+                        "could not apply app-rule position without screen geometry"
+                    );
+                    continue;
+                };
+                placement.resolve_frame(window.frame_monotonic, screen.frame)
+            } else {
+                placement.resolve_frame(window.frame_monotonic, CGRect::default())
+            };
+
+            let window_server_id = window.info.sys_id;
+            let transaction = if let Some(window_server_id) = window_server_id {
+                let transaction = self.transaction_manager.generate_next_txid(window_server_id);
+                self.transaction_manager.store_txid(window_server_id, transaction, frame);
+                transaction
+            } else {
+                TransactionId::default()
+            };
+            if let Some(app) = self.app_manager.apps.get(&placement.window.pid)
+                && let Err(error) = app.handle.send(Request::SetWindowFrame(
+                    placement.window,
+                    frame,
+                    transaction,
+                    true,
+                ))
+            {
+                warn!(window = ?placement.window, %error, "failed to apply app-rule placement");
+            }
+        }
+    }
+
+    fn apply_app_rule_resizes(&mut self, resizes: Vec<crate::model::app_rules::AppRuleResize>) {
+        for resize in resizes {
+            let Some(window) = self.state.windows.window(resize.window) else {
+                continue;
+            };
+            let Some(screen) = self.space_state.screen_by_space(resize.space) else {
+                warn!(
+                    window = ?resize.window,
+                    space = ?resize.space,
+                    "could not apply app-rule resize without screen geometry"
+                );
+                continue;
+            };
+            let old_frame = window.frame_monotonic;
+            let mut new_frame = old_frame;
+            if let Some(width) = resize.size.w {
+                new_frame.size.width = width;
+            }
+            if let Some(height) = resize.size.h {
+                new_frame.size.height = height;
+            }
+            self.layout_manager.layout_engine.apply_app_rule_resize(
+                resize,
+                old_frame,
+                new_frame,
+                screen.frame,
+                Some(screen.display_uuid.as_str()),
+            );
         }
     }
 

@@ -6,7 +6,8 @@ pub mod utils;
 mod workspaces;
 
 pub use engine::{
-    EventResponse, LayoutCommand, LayoutEngine, LayoutEvent, MoveFocusArgs, RestoreReport,
+    EventResponse, LayoutCommand, LayoutEngine, LayoutEvent, LayoutEventOutcome, MoveFocusArgs,
+    RestoreReport,
     RestoreRequest, RestoreScope, RestoreSource, RestoreWarning,
 };
 pub(crate) use floating::FloatingManager;

@@ -22,6 +22,8 @@ struct Column {
     windows: Vec<WindowId>,
     width_offset: f64,
     #[serde(default)]
+    width_overridden: bool,
+    #[serde(default)]
     height_weights: Vec<f64>,
     #[serde(default)]
     tabbed: bool,
@@ -234,6 +236,7 @@ impl LayoutState {
         let column = Column {
             windows: vec![wid],
             width_offset: 0.0,
+            width_overridden: false,
             height_weights: vec![1.0],
             tabbed: false,
             active: None,
@@ -248,6 +251,7 @@ impl LayoutState {
         self.columns.push(Column {
             windows: vec![wid],
             width_offset: 0.0,
+            width_overridden: false,
             height_weights: vec![1.0],
             tabbed: false,
             active: None,
@@ -277,6 +281,7 @@ impl LayoutState {
                 self.columns.push(Column {
                     windows: vec![window],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0],
                     tabbed: false,
                     active: None,
@@ -590,14 +595,43 @@ impl ScrollingLayoutSystem {
     }
 
     fn move_selected_window_horizontal(state: &mut LayoutState, dir: Direction) -> bool {
-        let (col_idx, _) = match state.selected_location() {
+        let (col_idx, row_idx) = match state.selected_location() {
             Some(loc) => loc,
             None => return false,
         };
-        // In the scrolling layout a column is a single unit — whether a tab group
-        // or a vertical stack. A horizontal move shifts the WHOLE column past its
-        // neighbor rather than tearing the focused window out; use consume/expel
-        // to move windows in or out of a column.
+        // A tabbed column is one unit by definition, so a horizontal move shifts the
+        // WHOLE tab group past its neighbour rather than tearing the focused tab out
+        // (use consume/expel to move windows in or out of a tab group).
+        //
+        // A plain vertical stack takes upstream's behaviour: extract the selected
+        // window into its own neighbour column, the fast way to undo an accidental
+        // stack. See UPSTREAM-SYNC.md §5.1.
+        if !state.columns[col_idx].tabbed && state.columns[col_idx].windows.len() > 1 {
+            state.columns[col_idx].ensure_height_weights();
+            let wid = state.columns[col_idx].windows.remove(row_idx);
+            let weight = state.columns[col_idx].height_weights.remove(row_idx);
+            if state.columns[col_idx].active == Some(wid) {
+                // Do not leave the source column's tab memory pointing at a window
+                // that no longer lives in it.
+                state.columns[col_idx].active = None;
+            }
+            let insert_at = match dir {
+                Direction::Left => col_idx,
+                Direction::Right => (col_idx + 1).min(state.columns.len()),
+                _ => return false,
+            };
+            state.columns.insert(insert_at, Column {
+                windows: vec![wid],
+                width_offset: 0.0,
+                width_overridden: false,
+                height_weights: vec![weight],
+                tabbed: false,
+                active: None,
+            });
+            state.selected = Some(wid);
+            return true;
+        }
+
         let target_col = match dir {
             Direction::Left => col_idx.checked_sub(1),
             Direction::Right => (col_idx + 1 < state.columns.len()).then_some(col_idx + 1),
@@ -751,7 +785,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         let mut column_widths = Vec::with_capacity(state.columns.len());
         let mut column_ratios = Vec::with_capacity(state.columns.len());
         for col in state.columns.iter() {
-            let ratio = if state.columns.len() == 1 {
+            let ratio = if state.columns.len() == 1 && !col.width_overridden {
                 1.0
             } else {
                 self.clamp_ratio(base_ratio + col.width_offset)
@@ -1431,6 +1465,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
             return;
         };
         state.columns[col_idx].width_offset = clamped - base_ratio;
+        state.columns[col_idx].width_overridden = true;
 
         // Handle vertical resizing within columns
         let col = &mut state.columns[col_idx];
@@ -1673,6 +1708,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         state.columns.insert(insert_at, Column {
             windows: vec![wid],
             width_offset: 0.0,
+            width_overridden: false,
             height_weights: vec![weight],
             tabbed: false,
             active: None,
@@ -1754,6 +1790,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
             state.columns.insert(insert_at, Column {
                 windows: vec![wid],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![moved_weights[idx]],
                 tabbed: false,
                 active: None,
@@ -1795,6 +1832,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         state.columns.insert(insert_at, Column {
             windows: vec![wid],
             width_offset: 0.0,
+            width_overridden: false,
             height_weights: vec![weight],
             tabbed: false,
             active: None,
@@ -1865,6 +1903,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         let next = current + amount;
         let clamped = next.clamp(min_ratio, max_ratio).max(0.05);
         state.columns[col_idx].width_offset = clamped - base_ratio;
+        state.columns[col_idx].width_overridden = true;
         if niri_navigation {
             state.reveal_selected_without_direction();
         } else {
@@ -1963,6 +2002,7 @@ mod tests {
             state.columns = vec![Column {
                 windows: vec![w1, w2],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![1.0, 1.0],
                 tabbed: true,
                 active: None,
@@ -2004,6 +2044,7 @@ mod tests {
             state.columns = vec![Column {
                 windows: vec![w1, w2, w3],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![1.0, 1.0, 1.0],
                 tabbed: true,
                 active: None,
@@ -2030,6 +2071,7 @@ mod tests {
             state.columns = vec![Column {
                 windows: vec![w1, w2],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![1.0, 1.0],
                 tabbed: false,
                 active: None,
@@ -2056,6 +2098,7 @@ mod tests {
             state.columns = vec![Column {
                 windows: vec![w1, w2],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![1.0, 1.0],
                 tabbed: true,
                 active: None,
@@ -2120,6 +2163,7 @@ mod tests {
             state.columns = vec![Column {
                 windows: vec![w1, w2, w3],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![1.0, 1.0, 1.0],
                 tabbed: true,
                 active: None,
@@ -2148,6 +2192,7 @@ mod tests {
             state.columns = vec![Column {
                 windows: vec![w1, w2],
                 width_offset: 0.0,
+                width_overridden: false,
                 height_weights: vec![1.0, 1.0],
                 tabbed: false,
                 active: None,
@@ -2175,6 +2220,7 @@ mod tests {
                 Column {
                     windows: vec![a1, a2],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0, 1.0],
                     tabbed: true,
                     active: None,
@@ -2182,6 +2228,7 @@ mod tests {
                 Column {
                     windows: vec![b],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0],
                     tabbed: false,
                     active: None,
@@ -2252,6 +2299,7 @@ mod tests {
         state.columns = vec![Column {
             windows: vec![w1, w2],
             width_offset: 0.0,
+            width_overridden: false,
             height_weights: vec![1.0, 1.0],
             tabbed: false,
             active: None,
@@ -2337,6 +2385,7 @@ mod tests {
         state.columns = vec![Column {
             windows: vec![locked, capped],
             width_offset: 0.0,
+            width_overridden: false,
             height_weights: vec![1.0, 1.0],
             tabbed: false,
             active: None,
@@ -2703,30 +2752,33 @@ mod tests {
         );
     }
 
+    /// Extraction direction matters: moving right drops the extracted window to the
+    /// right of the remaining stack, moving left drops it to the left. Both replace
+    /// the fork's old "a stack always moves as a whole" rule (UPSTREAM-SYNC.md §5.1);
+    /// only *tabbed* columns keep that rule now.
     #[test]
-    fn move_selection_does_not_extract_from_lone_stacked_column() {
+    fn move_selection_right_extracts_from_a_lone_stacked_column() {
         let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
         system.join_selection_with_direction(layout, Direction::Left);
 
-        // A lone stacked column has no neighbor to swap with, so the whole-column
-        // move is a no-op and the stack is NOT torn apart (extraction is now only
-        // via consume/expel).
-        assert!(!system.move_selection(layout, Direction::Right));
+        assert!(system.move_selection(layout, Direction::Right));
         let state = system.layouts.get(layout).expect("layout state missing");
-        assert_eq!(state.columns.len(), 1);
-        assert_eq!(state.columns[0].windows, vec![w1, w2]);
+        assert_eq!(state.columns.len(), 2, "the stack was split");
+        assert_eq!(state.columns[0].windows, vec![w1], "w1 stays behind");
+        assert_eq!(state.columns[1].windows, vec![w2], "w2 extracted to the right");
         assert_eq!(state.selected, Some(w2));
     }
 
     #[test]
-    fn move_selection_left_does_not_extract_from_lone_stacked_column() {
+    fn move_selection_left_extracts_from_a_lone_stacked_column() {
         let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
         system.join_selection_with_direction(layout, Direction::Left);
 
-        assert!(!system.move_selection(layout, Direction::Left));
+        assert!(system.move_selection(layout, Direction::Left));
         let state = system.layouts.get(layout).expect("layout state missing");
-        assert_eq!(state.columns.len(), 1);
-        assert_eq!(state.columns[0].windows, vec![w1, w2]);
+        assert_eq!(state.columns.len(), 2, "the stack was split");
+        assert_eq!(state.columns[0].windows, vec![w2], "w2 extracted to the left");
+        assert_eq!(state.columns[1].windows, vec![w1], "w1 stays behind");
         assert_eq!(state.selected, Some(w2));
     }
 
@@ -3190,6 +3242,7 @@ mod tests {
                 Column {
                     windows: vec![a1, a2],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0, 1.0],
                     tabbed: true,
                     active: None,
@@ -3197,6 +3250,7 @@ mod tests {
                 Column {
                     windows: vec![b],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0],
                     tabbed: false,
                     active: None,
@@ -3217,8 +3271,12 @@ mod tests {
         assert_eq!(state.selected, Some(a1), "selection preserved");
     }
 
+    /// The counterpart to `horizontal_move_shifts_tabbed_column_as_a_whole`: a plain
+    /// (non-tabbed) vertical stack is *not* one unit, so a horizontal move extracts
+    /// the selected window into its own neighbour column. Upstream's semantics,
+    /// adopted deliberately — see UPSTREAM-SYNC.md §5.1.
     #[test]
-    fn horizontal_move_shifts_non_tabbed_stack_as_a_whole() {
+    fn horizontal_move_extracts_selected_window_from_a_non_tabbed_stack() {
         let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
         let layout = system.create_layout();
         let a1 = wid(1, 1);
@@ -3230,13 +3288,15 @@ mod tests {
                 Column {
                     windows: vec![a1, a2],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0, 1.0],
                     tabbed: false,
-                    active: None,
+                    active: Some(a1),
                 },
                 Column {
                     windows: vec![b],
                     width_offset: 0.0,
+                    width_overridden: false,
                     height_weights: vec![1.0],
                     tabbed: false,
                     active: None,
@@ -3245,15 +3305,19 @@ mod tests {
             state.selected = Some(a1);
         }
 
-        // A non-tabbed vertical stack also moves as a whole; use consume/expel to
-        // move a window out of a column.
         assert!(system.move_selection(layout, Direction::Right));
 
         let state = system.layouts.get(layout).expect("layout state");
-        assert_eq!(state.columns.len(), 2, "no window extracted");
-        assert_eq!(state.columns[0].windows, vec![b]);
-        assert_eq!(state.columns[1].windows, vec![a1, a2], "stack stayed intact");
-        assert_eq!(state.selected, Some(a1), "selection preserved");
+        assert_eq!(state.columns.len(), 3, "a1 was extracted into its own column");
+        assert_eq!(state.columns[0].windows, vec![a2], "a2 stays behind");
+        assert_eq!(state.columns[1].windows, vec![a1], "a1 lands to the right of it");
+        assert!(!state.columns[1].tabbed, "an extracted column is never tabbed");
+        assert_eq!(state.columns[2].windows, vec![b], "the neighbour column is untouched");
+        assert_eq!(state.selected, Some(a1), "selection follows the extracted window");
+        assert_eq!(
+            state.columns[0].active, None,
+            "source column's tab memory must not point at an extracted window"
+        );
     }
 
 
