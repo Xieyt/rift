@@ -1033,8 +1033,7 @@ impl State {
                 SLSReenableUpdate(*G_CONNECTION);
             }
             Request::Raise(wids, token, sequence_id, quiet, activate) => {
-                self.raises_tx
-                    .send(RaiseRequest(wids, token, sequence_id, quiet, activate));
+                self.raises_tx.send(RaiseRequest(wids, token, sequence_id, quiet, activate));
             }
         }
         Ok(false)

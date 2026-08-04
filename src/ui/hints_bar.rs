@@ -10,8 +10,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use objc2::{MainThreadMarker, msg_send};
 use objc2::rc::Retained;
+use objc2::{MainThreadMarker, msg_send};
 use objc2_app_kit::{NSRunningApplication, NSScreen, NSStatusWindowLevel};
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_foundation::NSString;
@@ -325,10 +325,7 @@ impl HintsBar {
     /// a workspace pill in the rail.
     pub fn workspace_at_point(&self, point: CGPoint) -> Option<usize> {
         let state = self.state.borrow();
-        let i = state
-            .ws_rects
-            .iter()
-            .position(|r| point_hits_indicator_frame(point, *r))?;
+        let i = state.ws_rects.iter().position(|r| point_hits_indicator_frame(point, *r))?;
         state.data.workspaces.get(i).map(|w| w.index)
     }
 
@@ -355,8 +352,8 @@ impl HintsBar {
                 } else {
                     keycap_w + BADGE_GAP
                 };
-                let text_w =
-                    Self::approx_text_width(c.primary(style.show_titles), font_size).min(MAX_TEXT_W);
+                let text_w = Self::approx_text_width(c.primary(style.show_titles), font_size)
+                    .min(MAX_TEXT_W);
                 let badge = if c.members.len() > 1 {
                     font_size + 4.0 + BADGE_GAP
                 } else {
@@ -412,7 +409,11 @@ impl HintsBar {
         let chip_w = widths.iter().cloned().fold(MIN_CHIP_W, f64::max).min(max_w);
         let avail = (bounds.size.height - 2.0 * MARGIN).max(1.0);
         let natural = n as f64 * row_h + CHIP_GAP * (n - 1) as f64;
-        let scale = if natural > avail { avail / natural } else { 1.0 };
+        let scale = if natural > avail {
+            avail / natural
+        } else {
+            1.0
+        };
         let rh = row_h * scale;
         let gap = CHIP_GAP * scale;
         let total = n as f64 * rh + gap * (n - 1) as f64;
@@ -525,7 +526,8 @@ impl HintsBar {
                 .map(|w| {
                     let label_w = Self::approx_text_width(&w.label, fs);
                     let icons_w = w.pids.len() as f64 * (ws_icon_w + 2.0);
-                    (PAD_X + label_w + BADGE_GAP + icons_w + PAD_X).max(style.height * 0.9) + CHIP_GAP
+                    (PAD_X + label_w + BADGE_GAP + icons_w + PAD_X).max(style.height * 0.9)
+                        + CHIP_GAP
                 })
                 .sum()
         } else {
@@ -577,8 +579,15 @@ impl HintsBar {
                         CGPoint::new(bounds.origin.x, bounds.origin.y + row_h),
                         CGSize::new(bounds.size.width, row_h),
                     );
-                    let (ws_r, mut chip_r) =
-                        self.render_strip(top_b, &cells[..k], &workspaces, &style, fs, screen, frame);
+                    let (ws_r, mut chip_r) = self.render_strip(
+                        top_b,
+                        &cells[..k],
+                        &workspaces,
+                        &style,
+                        fs,
+                        screen,
+                        frame,
+                    );
                     let (_ws2, chip_r2) =
                         self.render_strip(bot_b, &cells[k..], &[], &style, fs, screen, frame);
                     chip_r.extend(chip_r2);
@@ -709,9 +718,8 @@ impl HintsBar {
         // it; following chips shift along by the gap.
         if matches!(style.notch, HintsBarNotch::Flow) {
             if let Some((nl, nr)) = notch {
-                if let Some(i) = rects
-                    .iter()
-                    .position(|r| r.origin.x + r.size.width > nl && r.origin.x < nr)
+                if let Some(i) =
+                    rects.iter().position(|r| r.origin.x + r.size.width > nl && r.origin.x < nr)
                 {
                     let gap = nr - nl;
                     if gap > 0.0 {
@@ -793,7 +801,11 @@ impl HintsBar {
             self.render_workspace_pill(*wr, w, style, fs);
         }
 
-        let chip_notch = if matches!(style.notch, HintsBarNotch::Flow) { notch } else { None };
+        let chip_notch = if matches!(style.notch, HintsBarNotch::Flow) {
+            notch
+        } else {
+            None
+        };
         for (cell, rect) in cells.iter().zip(chip_rects.iter()) {
             if dots {
                 self.render_dot(*rect, cell, style);
@@ -826,7 +838,12 @@ impl HintsBar {
             (style.hint_color, Color::new(0.1, 0.1, 0.12, 1.0))
         } else {
             (
-                Color::new(style.label_color.r, style.label_color.g, style.label_color.b, 0.14),
+                Color::new(
+                    style.label_color.r,
+                    style.label_color.g,
+                    style.label_color.b,
+                    0.14,
+                ),
                 style.label_color,
             )
         };
@@ -1018,7 +1035,10 @@ impl HintsBar {
                 if !right.is_empty() {
                     self.root_layer.addSublayer(&self.text_layer(
                         &right,
-                        CGRect::new(CGPoint::new(nr, y), CGSize::new((label_right - nr).max(1.0), h)),
+                        CGRect::new(
+                            CGPoint::new(nr, y),
+                            CGSize::new((label_right - nr).max(1.0), h),
+                        ),
                         fs,
                         color,
                         false,
@@ -1170,8 +1190,11 @@ impl HintsBar {
                 .members
                 .iter()
                 .map(|m| {
-                    let t =
-                        if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+                    let t = if style.show_titles && !m.title.is_empty() {
+                        &m.title
+                    } else {
+                        &m.label
+                    };
                     Self::approx_text_width(t, fs)
                 })
                 .fold(0.0_f64, f64::max)
@@ -1198,8 +1221,11 @@ impl HintsBar {
         };
         let (px, py) = if matches!(style.detail_style, HintsBarDetailStyle::Bar) {
             // Dock the detail bar to its own edge, positioned along it by `align`.
-            let disp =
-                if screen.size.width > 1.0 && screen.size.height > 1.0 { screen } else { bar };
+            let disp = if screen.size.width > 1.0 && screen.size.height > 1.0 {
+                screen
+            } else {
+                bar
+            };
             let l = disp.origin.x;
             let t = disp.origin.y;
             let r = l + disp.size.width;
@@ -1358,8 +1384,11 @@ fn make_icon_layer(pid: pid_t, frame: CGRect, opacity: f32) -> Option<Retained<C
 /// mirroring the hint bar's own chip sizing (icon + label, no hint letter).
 fn member_chip_w(m: &WindowMember, style: &HintsBarStyle, fs: f64) -> f64 {
     let icon_w = fs + 4.0;
-    let text: &str =
-        if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+    let text: &str = if style.show_titles && !m.title.is_empty() {
+        &m.title
+    } else {
+        &m.label
+    };
     let tw = HintsBar::approx_text_width(text, fs).min(MAX_TEXT_W);
     (PAD_X + icon_w + BADGE_GAP + tw + PAD_X).max(MIN_CHIP_W)
 }
@@ -1443,9 +1472,17 @@ impl DetailWindow {
             }
             let tx = pad + 4.0 + icon_sz + 6.0;
             let tw = (bounds.size.width - tx - pad).max(0.0);
-            let tc = if active { Color::new(1.0, 1.0, 1.0, 1.0) } else { style.label_color };
+            let tc = if active {
+                Color::new(1.0, 1.0, 1.0, 1.0)
+            } else {
+                style.label_color
+            };
             self.root.addSublayer(&make_text_layer(
-                if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label },
+                if style.show_titles && !m.title.is_empty() {
+                    &m.title
+                } else {
+                    &m.label
+                },
                 CGRect::new(CGPoint::new(tx, ry), CGSize::new(tw, row_h)),
                 fs,
                 tc,
@@ -1487,9 +1524,16 @@ impl DetailWindow {
             }
             let tx = cap_pad + PAD_X + icon_sz + BADGE_GAP;
             let tw = (cap_pad + chip_w - PAD_X - tx).max(0.0);
-            let tc = if active { Color::new(1.0, 1.0, 1.0, 1.0) } else { style.label_color };
-            let text: &str =
-                if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+            let tc = if active {
+                Color::new(1.0, 1.0, 1.0, 1.0)
+            } else {
+                style.label_color
+            };
+            let text: &str = if style.show_titles && !m.title.is_empty() {
+                &m.title
+            } else {
+                &m.label
+            };
             self.root.addSublayer(&make_text_layer(
                 text,
                 CGRect::new(CGPoint::new(tx, y), CGSize::new(tw, row_h)),
@@ -1528,9 +1572,16 @@ impl DetailWindow {
             }
             let tx = x + PAD_X + icon_sz + BADGE_GAP;
             let tw = (x + chip_w - PAD_X - tx).max(0.0);
-            let tc = if active { Color::new(1.0, 1.0, 1.0, 1.0) } else { style.label_color };
-            let text: &str =
-                if style.show_titles && !m.title.is_empty() { &m.title } else { &m.label };
+            let tc = if active {
+                Color::new(1.0, 1.0, 1.0, 1.0)
+            } else {
+                style.label_color
+            };
+            let text: &str = if style.show_titles && !m.title.is_empty() {
+                &m.title
+            } else {
+                &m.label
+            };
             self.root.addSublayer(&make_text_layer(
                 text,
                 CGRect::new(CGPoint::new(tx, cy), CGSize::new(tw, chip_h)),

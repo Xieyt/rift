@@ -896,7 +896,10 @@ mod tests {
 
             raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
 
-            assert!(original.is_cancelled(), "the timed-out raise's token must be cancelled");
+            assert!(
+                original.is_cancelled(),
+                "the timed-out raise's token must be cancelled"
+            );
 
             let after = collect_requests(&mut app_rx);
             let focus_token = raise_token_for(&after, WindowId::new(1, 2))
@@ -928,7 +931,10 @@ mod tests {
             let sequence =
                 raise_manager.active_sequence.as_ref().expect("focus phase still active");
             assert!(sequence.pending_raises.contains(&WindowId::new(1, 2)));
-            assert!(!sequence.timed_out, "timeout window must be re-armed for the focus phase");
+            assert!(
+                !sequence.timed_out,
+                "timeout window must be re-armed for the focus phase"
+            );
 
             raise_manager.handle_message(Event::RaiseTimeout { sequence_id: 1 });
             assert!(
@@ -952,7 +958,10 @@ mod tests {
                 app_handles,
                 Quiet::No,
             ));
-            assert_eq!(raise_manager.active_sequence.as_ref().unwrap().pending_raises.len(), 1);
+            assert_eq!(
+                raise_manager.active_sequence.as_ref().unwrap().pending_raises.len(),
+                1
+            );
 
             raise_manager.handle_message(Event::RaiseCompleted {
                 window_id: WindowId::new(1, 1),

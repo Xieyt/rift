@@ -5500,8 +5500,9 @@ mod tests {
         assert_eq!(before, after);
     }
 
-    use crate::common::config::GapSettings;
     use proptest::prelude::*;
+
+    use crate::common::config::GapSettings;
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(200))]

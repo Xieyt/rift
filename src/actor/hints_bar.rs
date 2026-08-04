@@ -17,8 +17,8 @@ use tracing::{instrument, warn};
 
 use crate::actor::reactor::{Command, ReactorCommand};
 use crate::actor::{self, reactor};
-use crate::layout_engine::LayoutCommand;
 use crate::common::config::{Config, HintsBarOverflow, HintsBarVisibility};
+use crate::layout_engine::LayoutCommand;
 use crate::sys::screen::SpaceId;
 use crate::sys::timer::Timer;
 use crate::ui::hints_bar::{
@@ -209,10 +209,7 @@ impl HintsBar {
                 )
             })
             .collect();
-        let ws = workspaces
-            .iter()
-            .map(|w| (w.label.clone(), w.active, w.pids.clone()))
-            .collect();
+        let ws = workspaces.iter().map(|w| (w.label.clone(), w.active, w.pids.clone())).collect();
         (entries, ws, top_count)
     }
 
@@ -340,15 +337,12 @@ impl HintsBar {
                 }
             },
         };
-        if let Err(err) = main.update(
-            style,
-            HintsBarData {
-                cells: main_cells,
-                screen: snap.screen_frame,
-                workspaces: snap.workspaces.clone(),
-                overflow_split: main_split,
-            },
-        ) {
+        if let Err(err) = main.update(style, HintsBarData {
+            cells: main_cells,
+            screen: snap.screen_frame,
+            workspaces: snap.workspaces.clone(),
+            overflow_split: main_split,
+        }) {
             warn!(?err, "hints_bar: update failed");
         }
 
@@ -375,15 +369,12 @@ impl HintsBar {
                     }
                 },
             };
-            if let Err(err) = ob.update(
-                style,
-                HintsBarData {
-                    cells: overflow_cells,
-                    screen: snap.screen_frame,
-                    workspaces: Vec::new(),
-                    overflow_split: None,
-                },
-            ) {
+            if let Err(err) = ob.update(style, HintsBarData {
+                cells: overflow_cells,
+                screen: snap.screen_frame,
+                workspaces: Vec::new(),
+                overflow_split: None,
+            }) {
                 warn!(?err, "hints_bar: overflow update failed");
             }
         } else if let Some(ob) = &self.overflow_bar {

@@ -943,9 +943,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
         LayoutCommands::CenterSelection => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::CenterSelection,
         ))),
-        LayoutCommands::FocusColumn { index } => Ok(CliCommand::Reactor(
-            reactor::Command::Layout(LC::FocusColumn(index)),
-        )),
+        LayoutCommands::FocusColumn { index } => Ok(CliCommand::Reactor(reactor::Command::Layout(
+            LC::FocusColumn(index),
+        ))),
     }
 }
 

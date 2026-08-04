@@ -44,7 +44,6 @@ struct WindowRemovalImpact {
 }
 
 #[non_exhaustive]
-
 #[derive(Debug, Clone)]
 pub enum LayoutEvent {
     WindowsOnScreenUpdated(
@@ -2029,7 +2028,8 @@ impl LayoutEngine {
             }
             LayoutCommand::CycleColumnWidth => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
-                let raised = self.workspace_tree_mut(workspace_id).cycle_column_width_preset(layout);
+                let raised =
+                    self.workspace_tree_mut(workspace_id).cycle_column_width_preset(layout);
                 Self::response_for_raised_windows(raised)
             }
             LayoutCommand::UnjoinWindows => {
@@ -3635,7 +3635,10 @@ mod tests {
                 Some(current_space),
                 &visible_spaces,
                 &visible_space_centers,
-                LayoutCommand::MoveFocus(MoveFocusArgs { direction: Direction::Right, activate: false }),
+                LayoutCommand::MoveFocus(MoveFocusArgs {
+                    direction: Direction::Right,
+                    activate: false,
+                }),
             )
         }));
 

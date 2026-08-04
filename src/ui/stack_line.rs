@@ -3,8 +3,8 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2_app_kit::NSNormalWindowLevel;
-use objc2_foundation::NSString;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_foundation::NSString;
 use objc2_quartz_core::{CALayer, CATextLayer};
 use tracing::warn;
 
@@ -77,7 +77,12 @@ impl Default for IndicatorConfig {
             spacing: 4.0,
             show_titles: false,
             active_title_color: Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-            inactive_title_color: Color { r: 0.72, g: 0.72, b: 0.75, a: 1.0 },
+            inactive_title_color: Color {
+                r: 0.72,
+                g: 0.72,
+                b: 0.75,
+                a: 1.0,
+            },
             font_size: None,
         }
     }
@@ -85,7 +90,8 @@ impl Default for IndicatorConfig {
 
 impl From<&crate::common::config::StackLineSettings> for IndicatorConfig {
     fn from(config: &crate::common::config::StackLineSettings) -> Self {
-        let hex = |s: &Option<String>, d: Color| s.as_deref().and_then(Color::from_hex).unwrap_or(d);
+        let hex =
+            |s: &Option<String>, d: Color| s.as_deref().and_then(Color::from_hex).unwrap_or(d);
         Self {
             bar_thickness: config.thickness,
             selected_color: hex(&config.active_color, Color::new(0.26, 0.53, 0.98, 0.55)),
@@ -809,7 +815,10 @@ mod tests {
         let mut prev_end = bar.origin.x;
         for i in 0..data.total_count {
             let seg = GroupIndicatorWindow::calculate_segment_frame(&data, bar, i);
-            assert!((seg.origin.x - prev_end).abs() < 1.5, "segment {i} abuts previous");
+            assert!(
+                (seg.origin.x - prev_end).abs() < 1.5,
+                "segment {i} abuts previous"
+            );
             assert!(seg.size.width > 0.0, "segment {i} has positive width");
             prev_end = seg.origin.x + seg.size.width;
         }

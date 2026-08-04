@@ -31,7 +31,6 @@ pub enum Command {
     Reactor(ReactorCommand),
 }
 
-
 #[derive(Debug, Clone)]
 pub struct DragSession {
     pub(crate) window: WindowId,

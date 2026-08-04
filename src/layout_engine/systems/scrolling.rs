@@ -1,11 +1,10 @@
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
-
-use slotmap::KeyData;
 use std::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, Ordering};
 
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use serde::{Deserialize, Serialize};
+use slotmap::KeyData;
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::{HashMap, HashSet};
@@ -731,6 +730,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         }
         state.columns[col_idx].windows.clone()
     }
+
     fn contains_layout(&self, layout: LayoutId) -> bool { self.layouts.contains_key(layout) }
 
     fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
@@ -1005,10 +1005,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 };
                 let win_frame = CGRect::new(
                     CGPoint::new(x.round(), win_y.round()),
-                    CGSize::new(
-                        column_width.round(),
-                        (tiling.size.height - bar).max(1.0).round(),
-                    ),
+                    CGSize::new(column_width.round(), (tiling.size.height - bar).max(1.0).round()),
                 );
                 let mut selected = 0usize;
                 for (row_idx, wid) in col.windows.iter().enumerate() {
@@ -2185,8 +2182,7 @@ mod tests {
 
     #[test]
     fn toggle_selection_tabbed_flips_the_column_flag() {
-        let (mut system, layout, w1, w2) =
-            setup_two_windows(ScrollingLayoutSettings::default());
+        let (mut system, layout, w1, w2) = setup_two_windows(ScrollingLayoutSettings::default());
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
@@ -3224,7 +3220,9 @@ mod tests {
             let got = col_width(&system);
             assert!(
                 (got - expected * tiling.size.width).abs() <= 1.5,
-                "expected width {} got {}", expected * tiling.size.width, got
+                "expected width {} got {}",
+                expected * tiling.size.width,
+                got
             );
         }
     }
@@ -3266,7 +3264,11 @@ mod tests {
         let state = system.layouts.get(layout).expect("layout state");
         assert_eq!(state.columns.len(), 2, "no column extracted");
         assert_eq!(state.columns[0].windows, vec![b]);
-        assert_eq!(state.columns[1].windows, vec![a1, a2], "tabbed group stayed intact");
+        assert_eq!(
+            state.columns[1].windows,
+            vec![a1, a2],
+            "tabbed group stayed intact"
+        );
         assert!(state.columns[1].tabbed, "tabbed flag preserved");
         assert_eq!(state.selected, Some(a1), "selection preserved");
     }
@@ -3312,14 +3314,21 @@ mod tests {
         assert_eq!(state.columns[0].windows, vec![a2], "a2 stays behind");
         assert_eq!(state.columns[1].windows, vec![a1], "a1 lands to the right of it");
         assert!(!state.columns[1].tabbed, "an extracted column is never tabbed");
-        assert_eq!(state.columns[2].windows, vec![b], "the neighbour column is untouched");
-        assert_eq!(state.selected, Some(a1), "selection follows the extracted window");
+        assert_eq!(
+            state.columns[2].windows,
+            vec![b],
+            "the neighbour column is untouched"
+        );
+        assert_eq!(
+            state.selected,
+            Some(a1),
+            "selection follows the extracted window"
+        );
         assert_eq!(
             state.columns[0].active, None,
             "source column's tab memory must not point at an extracted window"
         );
     }
-
 
     #[test]
     fn app_reconciliation_honors_updated_next_to_selection_policy() {

@@ -613,26 +613,26 @@ impl LayoutManager {
                                 )
                             }
                         };
-                        let workspaces: Vec<crate::ui::hints_bar::WorkspaceCell> =
-                            if show_workspace {
-                                reactor
-                                    .layout_manager
-                                    .layout_engine
-                                    .workspace_app_summaries(&reactor.state.windows, space)
-                                    .into_iter()
-                                    .filter(|(_, _, _, pids)| !pids.is_empty())
-                                    .map(|(idx, _name, active, pids)| {
-                                        crate::ui::hints_bar::WorkspaceCell {
-                                            label: (idx + 1).to_string(),
-                                            index: idx,
-                                            active,
-                                            pids,
-                                        }
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
+                        let workspaces: Vec<crate::ui::hints_bar::WorkspaceCell> = if show_workspace
+                        {
+                            reactor
+                                .layout_manager
+                                .layout_engine
+                                .workspace_app_summaries(&reactor.state.windows, space)
+                                .into_iter()
+                                .filter(|(_, _, _, pids)| !pids.is_empty())
+                                .map(|(idx, _name, active, pids)| {
+                                    crate::ui::hints_bar::WorkspaceCell {
+                                        label: (idx + 1).to_string(),
+                                        index: idx,
+                                        active,
+                                        pids,
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            Vec::new()
+                        };
 
                         // Overflow plan: cap the top strip at `max_width_ratio`
                         // of the display; wrap the excess per `overflow` mode.
