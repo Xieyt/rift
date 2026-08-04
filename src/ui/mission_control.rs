@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use block2::RcBlock;
 use dispatchr::queue;
@@ -16,7 +16,7 @@ use objc2_app_kit::{NSApplication, NSColor, NSPopUpMenuWindowLevel, NSScreen};
 use objc2_core_foundation::{CFRetained, CFString, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGColor, CGDisplayBounds, CGEvent, CGEventField, CGEventFlags, CGEventTapOptions,
-    CGEventTapProxy, CGEventType,
+    CGEventTapProxy, CGEventType, CGPreflightScreenCaptureAccess,
 };
 use objc2_core_media::CMSampleBuffer;
 use objc2_core_video::CVPixelBufferGetIOSurface;
@@ -28,7 +28,7 @@ use objc2_screen_capture_kit::{
     SCStreamConfiguration,
 };
 use once_cell::sync::Lazy;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::actor::app::WindowId;
 use crate::common::collections::{HashMap, HashSet};
@@ -45,6 +45,20 @@ use crate::sys::window_server::WindowServerId;
 use crate::ui::common::{
     compute_window_layout_metrics, render_layer_to_cgs_window, with_disabled_actions,
 };
+
+/// Screen Recording grant, probed once per process. ScreenCaptureKit is purely
+/// TCC-gated (`kTCCServiceScreenCapture`) with no entitlement to bypass it.
+static SCREEN_CAPTURE_PERMITTED: LazyLock<bool> = LazyLock::new(|| {
+    let granted = CGPreflightScreenCaptureAccess();
+    if !granted {
+        warn!(
+            "Screen Recording permission is not granted; Mission Control will render window \
+             placeholders instead of live previews. Grant Rift under System Settings > Privacy \
+             & Security > Screen & System Audio Recording, then restart it."
+        );
+    }
+    granted
+});
 
 #[derive(Clone, Copy)]
 struct CaptureTarget {
@@ -107,6 +121,15 @@ impl CapturePipeline {
         }
     }
 
+    /// Whether Screen Recording is granted, probed once per process.
+    ///
+    /// ScreenCaptureKit is TCC-gated with no entitlement to bypass it. Without a
+    /// grant `getShareableContent…` answers with a null content and an error, so
+    /// every Mission Control open would pay a pointless async round-trip and the
+    /// user would just see empty previews with nothing in the log explaining why.
+    /// Probe once and degrade loudly instead.
+    fn screen_capture_permitted() -> bool { *SCREEN_CAPTURE_PERMITTED }
+
     fn capture(&self, targets: Vec<CaptureTarget>) {
         let revision = self.revision.fetch_add(1, Ordering::Relaxed) + 1;
         let targets = {
@@ -123,6 +146,11 @@ impl CapturePipeline {
                 .collect::<Vec<_>>()
         };
         if targets.is_empty() {
+            return;
+        }
+
+        if !Self::screen_capture_permitted() {
+            self.finish_failed(&targets);
             return;
         }
 
