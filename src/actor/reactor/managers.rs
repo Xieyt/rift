@@ -354,22 +354,26 @@ impl LayoutManager {
         reactor: &mut Reactor,
         is_resize: bool,
         is_workspace_switch: bool,
+        space_scope: Option<SpaceId>,
     ) -> Result<bool, crate::model::reactor::ReactorError> {
         reactor.communication_manager.hints_bar_reserve_dirty = false;
-        let layout_result = Self::calculate_layout(reactor);
+        let layout_result = Self::calculate_layout(reactor, space_scope);
         let result = Self::apply_layout(reactor, layout_result, is_resize, is_workspace_switch)?;
         if reactor.communication_manager.hints_bar_reserve_dirty
             && !reactor.communication_manager.hints_bar_reserve_converging
         {
             reactor.communication_manager.hints_bar_reserve_converging = true;
-            let converged = Self::update_layout(reactor, is_resize, is_workspace_switch);
+            // Thread the scope through unchanged: a scoped workspace switch must not
+            // widen to a full re-layout just because the hint bar re-reserved.
+            let converged =
+                Self::update_layout(reactor, is_resize, is_workspace_switch, space_scope);
             reactor.communication_manager.hints_bar_reserve_converging = false;
             return converged;
         }
         Ok(result)
     }
 
-    fn calculate_layout(reactor: &mut Reactor) -> LayoutResult {
+    fn calculate_layout(reactor: &mut Reactor, space_scope: Option<SpaceId>) -> LayoutResult {
         if reactor.state.windows.tracked_window_count() == 0 {
             return LayoutResult::new();
         }
@@ -386,6 +390,9 @@ impl LayoutManager {
             let Some(space) = screen.space else {
                 continue;
             };
+            if space_scope.is_some_and(|scope| scope != space) {
+                continue;
+            }
             if !reactor.is_space_active(space) {
                 continue;
             }
@@ -779,9 +786,10 @@ impl LayoutManager {
                 }
             }
 
-            let suppress_animation = is_workspace_switch
-                || reactor.workspace_switch_manager.active_workspace_switch.is_some();
-            if suppress_animation {
+            if is_workspace_switch {
+                any_frame_changed |=
+                    AnimationManager::workspace_switch_layout(reactor, space, &layout, skip_wid);
+            } else if reactor.workspace_switch_manager.active_workspace_switch.is_some() {
                 any_frame_changed |=
                     AnimationManager::instant_layout(reactor, space, &layout, skip_wid);
             } else {
@@ -790,7 +798,6 @@ impl LayoutManager {
             }
         }
 
-        reactor.maybe_send_menu_update();
         Ok(any_frame_changed)
     }
 }

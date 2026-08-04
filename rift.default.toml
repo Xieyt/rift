@@ -84,6 +84,17 @@ mode = "traditional"
 # inside the same strip (e.g. align = "start" on the left, sketchybar on the right).
 external_bar_top = 0.0
 external_bar_bottom = 0.0
+# Where new windows are inserted by default for every layout:
+# - "next_to_selection": immediately after the selected window
+# - "end_of_tree": at the end of the layout
+# This can be overridden per-layout in each layouts respective section.
+window_insertion_point = "next_to_selection"
+
+# these settings only apply when layout mode == "traditional"
+[settings.layout.traditional]
+# Use Sway-style node normalization when adding windows. This gives a new node the
+# average sibling share while preserving the relative proportions of resized nodes.
+equalize_nodes = true
 
 # these settings only apply when layout mode == "master_stack"
 [settings.layout.master_stack]

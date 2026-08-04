@@ -321,11 +321,18 @@ impl Debug for AppThreadHandle {
 pub enum Request {
     Terminate,
     GetVisibleWindows,
+    /// Reconcile the authoritative Carbon front-process change with AX state.
+    ///
+    /// Carbon supplies the activation edge, while the app thread resolves the
+    /// focused/main window and the quiet marker before notifying the reactor.
+    ApplicationGloballyActivated(pid_t),
     WindowMaybeDestroyed(WindowId),
     CloseWindow(Option<WindowServerId>),
 
     SetWindowFrame(WindowId, CGRect, TransactionId, bool),
     SetBatchWindowFrame(Vec<(WindowId, CGRect)>, TransactionId, bool),
+    /// Position-only batch reserved for virtual workspace switches.
+    SetWorkspaceSwitchPositions(Vec<(WindowId, CGPoint)>, TransactionId, bool),
     SetWindowPos(WindowId, CGPoint, TransactionId, bool),
     AnimationFrame {
         wid: WindowId,
@@ -379,6 +386,7 @@ struct State {
     last_window_idx: u32,
     main_window: Option<WindowId>,
     last_activated: Option<(Instant, Quiet, Option<WindowId>, oneshot::Sender<()>)>,
+    pending_activation_quiet: Option<(Instant, Quiet)>,
     is_hidden: bool,
     is_frontmost: bool,
     active_animation_count: usize,
@@ -735,6 +743,11 @@ impl State {
             Request::GetVisibleWindows => {
                 self.refresh_visible_windows()?;
             }
+            Request::ApplicationGloballyActivated(pid) => {
+                if pid == self.pid {
+                    self.on_global_activation()?;
+                }
+            }
             Request::SetWindowPos(wid, pos, txid, eui) => {
                 let (elem, is_animating) = match self.window_mut(wid) {
                     Ok(window) => {
@@ -889,6 +902,63 @@ impl State {
                     let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", true);
                 }
             }
+            Request::SetWorkspaceSwitchPositions(positions, txid, eui) => {
+                let disable_eui_for_batch = eui
+                    && positions.iter().any(|(wid, _)| {
+                        self.windows.get(wid).is_some_and(|window| !window.is_animating)
+                    });
+
+                if disable_eui_for_batch {
+                    let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", false);
+                }
+
+                for (wid, position) in positions {
+                    let (elem, is_animating) = match self.window_mut(wid) {
+                        Ok(window) => {
+                            window.last_seen_txid = txid;
+                            (window.elem.clone(), window.is_animating)
+                        }
+                        Err(err) => match err {
+                            AxError::Ax(code) => {
+                                if self.handle_ax_error(wid, &code) {
+                                    continue;
+                                }
+                                return Err(AxError::Ax(code));
+                            }
+                            AxError::NotFound => continue,
+                        },
+                    };
+
+                    if disable_eui_for_batch {
+                        let _ = elem.set_position(position);
+                    } else if eui && !is_animating {
+                        let _ =
+                            with_enhanced_ui_disabled(&self.app, || elem.set_position(position));
+                    } else {
+                        let _ = elem.set_position(position);
+                    }
+
+                    // Preserve the existing per-window acknowledgement semantics. In
+                    // particular, report the frame AX actually accepted rather than the
+                    // requested position combined with a cached size.
+                    let frame =
+                        match self.handle_ax_result(wid, trace("frame", &elem, || elem.frame()))? {
+                            Some(frame) => frame,
+                            None => continue,
+                        };
+
+                    self.send_event(Event::WindowFrameChanged(
+                        wid,
+                        frame,
+                        Some(txid),
+                        Requested(true),
+                        None,
+                    ));
+                }
+                if disable_eui_for_batch {
+                    let _ = self.app.set_bool_attribute("AXEnhancedUserInterface", true);
+                }
+            }
             Request::BeginWindowAnimation(wid) => {
                 let (elem, started_animation) = {
                     let window = self.window_mut(wid)?;
@@ -982,9 +1052,7 @@ impl State {
             AxNotificationKind::ApplicationHidden => self.on_application_hidden(),
             AxNotificationKind::ApplicationShown => self.on_application_shown(),
             AxNotificationKind::ApplicationActivated
-            | AxNotificationKind::ApplicationDeactivated => {
-                _ = self.on_activation_changed();
-            }
+            | AxNotificationKind::ApplicationDeactivated => _ = self.on_ax_activation_changed(),
             AxNotificationKind::MainWindowChanged => {
                 // `AXWindows` is filtered to the current macOS space, so using it as
                 // a membership list here will incorrectly "destroy" windows that
@@ -1202,6 +1270,14 @@ impl State {
         }
 
         if activate && make_key_result.as_ref().is_some_and(Result::is_ok) && is_standard {
+            // `ActivateIgnoringOtherApps` synthesises a Carbon front-process edge that
+            // reaches `on_global_activation` before `wait_for_activation` below arms
+            // `last_activated`. Without a marker that edge resolves to `Quiet::No`,
+            // i.e. "the user did this", and the reactor absorbs a spurious auto
+            // workspace switch. Arm the pending marker first so the activation is
+            // correctly attributed to Rift and `handle_application_activated` skips
+            // the auto-switch. Uses upstream's own `on_ax_activation_changed` idiom.
+            this.pending_activation_quiet = Some((Instant::now(), Quiet::Yes));
             let _ = this.running_app.activate();
         }
 
@@ -1331,43 +1407,70 @@ impl State {
         Some(wid)
     }
 
-    fn on_activation_changed(&mut self) -> Result<(), AxError> {
-        // TODO: this prolly isnt needed
-        let is_frontmost = trace("is_frontmost", &self.app, || self.app.frontmost())?;
-        let old_frontmost = std::mem::replace(&mut self.is_frontmost, is_frontmost);
-        debug!(
-            "on_activation_changed, pid={:?}, is_frontmost={:?}, old_frontmost={:?}",
-            self.pid, is_frontmost, old_frontmost
-        );
-
-        let event = if !is_frontmost {
-            Event::ApplicationDeactivated(self.pid)
-        } else {
-            let (quiet_activation, quiet_window_change) = match self.last_activated.take() {
-                Some((ts, quiet_activation, quiet_window_change, tx)) => {
-                    _ = tx.send(());
-                    if ts.elapsed() < Duration::from_millis(1000) {
-                        trace!("by us");
-                        (quiet_activation, quiet_window_change)
-                    } else {
-                        trace!("by user");
-                        (Quiet::No, None)
-                    }
-                }
-                None => {
+    fn take_activation_context(&mut self) -> (Quiet, Option<WindowId>) {
+        match self.last_activated.take() {
+            Some((ts, quiet_activation, quiet_window_change, tx)) => {
+                _ = tx.send(());
+                if ts.elapsed() < Duration::from_millis(1000) {
+                    trace!("by us");
+                    (quiet_activation, quiet_window_change)
+                } else {
                     trace!("by user");
                     (Quiet::No, None)
                 }
-            };
+            }
+            None => {
+                trace!("by user");
+                (Quiet::No, None)
+            }
+        }
+    }
 
+    fn on_ax_activation_changed(&mut self) -> Result<(), AxError> {
+        let is_frontmost = trace("is_frontmost", &self.app, || self.app.frontmost())?;
+        let old_frontmost = std::mem::replace(&mut self.is_frontmost, is_frontmost);
+        debug!(
+            "on_ax_activation_changed, pid={:?}, is_frontmost={:?}, old_frontmost={:?}",
+            self.pid, is_frontmost, old_frontmost
+        );
+
+        if !is_frontmost {
+            self.pending_activation_quiet = None;
+            if old_frontmost {
+                self.send_event(Event::ApplicationDeactivated(self.pid));
+            }
+        } else if !old_frontmost {
+            let (quiet, quiet_window_change) = self.take_activation_context();
             self.on_main_window_changed(quiet_window_change, true);
+            self.pending_activation_quiet = Some((Instant::now(), quiet));
+        }
+        Ok(())
+    }
 
-            Event::ApplicationActivated(self.pid, quiet_activation)
+    fn on_global_activation(&mut self) -> Result<(), AxError> {
+        let (quiet, quiet_window_change) = if self.last_activated.is_some() {
+            self.take_activation_context()
+        } else if let Some((ts, quiet)) = self.pending_activation_quiet.take()
+            && ts.elapsed() < Duration::from_millis(1000)
+        {
+            (quiet, None)
+        } else {
+            (Quiet::No, None)
         };
 
-        if old_frontmost != is_frontmost {
-            self.send_event(event);
+        // Carbon is the authoritative inter-application activation edge. AX
+        // frontmost polling/notifications can lag it, so do not reject this
+        // request based on a transient AX value.
+        self.is_frontmost = true;
+        if self.on_main_window_changed(quiet_window_change, true).is_none()
+            && self.main_window.take().is_some()
+        {
+            // Do not let the reactor reuse a previous window as the target for
+            // this authoritative activation when AX cannot resolve the current
+            // main window. This event is queued before ApplicationActivated.
+            self.send_event(Event::ApplicationMainWindowChanged(self.pid, None, Quiet::No));
         }
+        self.send_event(Event::ApplicationActivated(self.pid, quiet));
         Ok(())
     }
 
@@ -1845,6 +1948,14 @@ fn app_thread_main(
     });
 
     let (raises_tx, raises_rx) = actor::channel();
+    let mut info = info;
+    if info.bundle_id.is_none() {
+        info.bundle_id = bundle_id.as_deref().map(ToString::to_string);
+    }
+    if info.localized_name.is_none() {
+        info.localized_name = running_app.localizedName().as_deref().map(ToString::to_string);
+    }
+
     let state = State {
         pid,
         running_app,
@@ -1857,6 +1968,7 @@ fn app_thread_main(
         last_window_idx: 0,
         main_window: None,
         last_activated: None,
+        pending_activation_quiet: None,
         is_hidden: false,
         is_frontmost: false,
         active_animation_count: 0,

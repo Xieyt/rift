@@ -59,6 +59,16 @@ pub fn handle_command_layout(
             | LayoutCommand::CreateWorkspace
             | LayoutCommand::SwitchToLastWorkspace
     );
+    let is_virtual_workspace_command = matches!(
+        cmd,
+        LayoutCommand::NextWorkspace(_)
+            | LayoutCommand::PrevWorkspace(_)
+            | LayoutCommand::SwitchToWorkspace(_)
+            | LayoutCommand::MoveWindowToWorkspace { .. }
+            | LayoutCommand::SetWorkspaceLayout { .. }
+            | LayoutCommand::CreateWorkspace
+            | LayoutCommand::SwitchToLastWorkspace
+    );
     let workspace_space = if requires_workspace_space {
         if let Some(space) = command_space {
             store_current_floating_positions(state, layout, space);
@@ -116,7 +126,14 @@ pub fn handle_command_layout(
         }
     };
 
-    Ok(EventOutcome::layout_changed(false).with_layout_response(response, workspace_space))
+    if is_virtual_workspace_command && !response.changed {
+        return Ok(EventOutcome::no_change());
+    }
+
+    let arrange_space_scope = is_workspace_switch.then_some(workspace_space).flatten();
+    Ok(EventOutcome::layout_changed(false)
+        .with_layout_response(response, workspace_space)
+        .with_arrange_space_scope(arrange_space_scope))
 }
 
 fn current_floating_positions(

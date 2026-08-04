@@ -4,6 +4,7 @@ use tracing::warn;
 
 use crate::actor::app::{WindowId, pid_t};
 use crate::common::collections::HashMap;
+use crate::common::config::WindowInsertionPoint;
 use crate::layout_engine::systems::constraints::{AxisConstraints, solve_axis_lengths};
 use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
 use crate::layout_engine::utils::compute_tiling_area;
@@ -16,6 +17,10 @@ use crate::sys::geometry::Round;
 pub struct TraditionalLayoutSystem {
     pub(crate) tree: Tree<Components>,
     pub(crate) layout_roots: slotmap::SlotMap<LayoutId, OwnedNode>,
+    #[serde(skip, default)]
+    window_insertion_point: WindowInsertionPoint,
+    #[serde(skip, default)]
+    equalize_nodes: bool,
 }
 
 impl Default for TraditionalLayoutSystem {
@@ -23,11 +28,28 @@ impl Default for TraditionalLayoutSystem {
         Self {
             tree: Tree::with_observer(Components::default()),
             layout_roots: Default::default(),
+            window_insertion_point: WindowInsertionPoint::default(),
+            equalize_nodes: true,
         }
     }
 }
 
 impl TraditionalLayoutSystem {
+    pub fn new(window_insertion_point: WindowInsertionPoint, equalize_nodes: bool) -> Self {
+        Self {
+            tree: Tree::with_observer(Components::default()),
+            layout_roots: Default::default(),
+            window_insertion_point,
+            equalize_nodes,
+        }
+    }
+
+    pub fn set_window_insertion_point(&mut self, value: WindowInsertionPoint) {
+        self.window_insertion_point = value;
+    }
+
+    pub fn set_equalize_nodes(&mut self, value: bool) { self.equalize_nodes = value; }
+
     fn find_best_focus_target(&self, node: NodeId) -> Option<(NodeId, WindowId)> {
         if let Some(wid) = self.tree.data.window.at(node) {
             return Some((node, wid));
@@ -116,7 +138,7 @@ impl TraditionalLayoutSystem {
 
     pub(crate) fn root(&self, layout: LayoutId) -> NodeId { self.layout_roots[layout].id() }
 
-    fn selection(&self, layout: LayoutId) -> NodeId {
+    pub(crate) fn selection(&self, layout: LayoutId) -> NodeId {
         self.tree.data.selection.current_selection(self.root(layout))
     }
 
@@ -573,6 +595,12 @@ impl LayoutSystem for TraditionalLayoutSystem {
     }
 
     fn add_window_after_selection(&mut self, layout: LayoutId, wid: WindowId) {
+        if self.window_insertion_point == WindowInsertionPoint::EndOfTree {
+            let root = self.root(layout);
+            let node = self.add_window_under(layout, root, wid);
+            self.select(node);
+            return;
+        }
         let selection = self.selection(layout);
         let node = if selection.parent(self.map()).is_none() {
             // If the root is selected but it already has children, split relative to the
@@ -1210,6 +1238,15 @@ impl TraditionalLayoutSystem {
             return;
         };
         if new_sibling.parent(map) != Some(parent) {
+            return;
+        }
+
+        if self.equalize_nodes {
+            // Sway initializes a new node to the average weight of the existing siblings,
+            // then normalizes the sibling weights. Rift keeps every sibling set normalized
+            // to its child count, so that average is 1.0. Leaving the observer-initialized
+            // weight intact gives identical proportions while preserving manual resizes.
+            self.tree.data.layout.recompute_total(map, parent);
             return;
         }
 
@@ -4834,6 +4871,7 @@ mod tests {
     #[test]
     fn adding_window_after_selection_splits_selected_share() {
         let mut system = TraditionalLayoutSystem::default();
+        system.set_equalize_nodes(false);
         let layout = system.create_layout();
         let root = system.root(layout);
         system.tree.data.layout.set_kind(root, LayoutKind::Horizontal);
@@ -4867,6 +4905,36 @@ mod tests {
         assert!((size2 - 0.5).abs() < 0.0001, "selected child should be halved");
         assert!((size4 - 0.5).abs() < 0.0001, "new sibling should get half");
         assert!((total - 5.0).abs() < 0.0001, "parent total should be preserved");
+    }
+
+    #[test]
+    fn equalize_nodes_gives_new_window_average_sibling_share() {
+        let mut system = TraditionalLayoutSystem::default();
+        system.set_equalize_nodes(true);
+        let layout = system.create_layout();
+        let root = system.root(layout);
+        system.set_layout(root, LayoutKind::Horizontal);
+
+        let first = w(301);
+        let second = w(302);
+        let third = w(303);
+        system.add_window_after_selection(layout, first);
+        system.add_window_after_selection(layout, second);
+
+        let first_node = system.tree.data.window.node_for(layout, first).unwrap();
+        let second_node = system.tree.data.window.node_for(layout, second).unwrap();
+        system.tree.data.layout.info[first_node].size = 1.5;
+        system.tree.data.layout.info[second_node].size = 0.5;
+        system.tree.data.layout.info[root].total = 2.0;
+        system.select(first_node);
+
+        system.add_window_after_selection(layout, third);
+
+        let third_node = system.tree.data.window.node_for(layout, third).unwrap();
+        assert_eq!(system.tree.data.layout.info[first_node].size, 1.5);
+        assert_eq!(system.tree.data.layout.info[second_node].size, 0.5);
+        assert_eq!(system.tree.data.layout.info[third_node].size, 1.0);
+        assert_eq!(system.tree.data.layout.info[root].total, 3.0);
     }
 
     #[test]
@@ -4971,6 +5039,7 @@ mod tests {
     #[test]
     fn adding_with_root_selected_splits_active_child_share() {
         let mut system = TraditionalLayoutSystem::default();
+        system.set_equalize_nodes(false);
         let layout = system.create_layout();
         let root = system.root(layout);
         system.tree.data.layout.set_kind(root, LayoutKind::Horizontal);
@@ -4999,6 +5068,7 @@ mod tests {
     #[test]
     fn adding_second_window_forces_even_split_when_selected_size_is_zero() {
         let mut system = TraditionalLayoutSystem::default();
+        system.set_equalize_nodes(false);
         let layout = system.create_layout();
         let root = system.root(layout);
         system.tree.data.layout.set_kind(root, LayoutKind::Horizontal);

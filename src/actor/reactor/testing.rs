@@ -1,9 +1,9 @@
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use tracing::debug;
 
-use super::{Event, Reactor, Record, Requested, ScreenInfo, TransactionId};
+use super::{Event, EventOutcome, Reactor, Record, Requested, ScreenInfo, TransactionId};
 use crate::actor;
-use crate::actor::app::{AppThreadHandle, Request, WindowId};
+use crate::actor::app::{AppThreadHandle, Quiet, Request, WindowId};
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::common::collections::BTreeMap;
 use crate::common::config::Config;
@@ -120,6 +120,11 @@ impl Reactor {
 
     pub fn handle_test_layout_command(&mut self, command: LayoutCommand) {
         self.handle_event(Event::Command(crate::model::reactor::Command::Layout(command)));
+    }
+
+    pub(crate) fn dispatch_test_layout_command(&mut self, command: LayoutCommand) -> EventOutcome {
+        self.dispatch_workflow(Event::Command(crate::model::reactor::Command::Layout(command)))
+            .expect("test layout command should dispatch")
     }
 
     pub fn mark_test_window_visible_in_space(&mut self, wsid: WindowServerId, space: SpaceId) {
@@ -553,6 +558,9 @@ impl Apps {
                         });
                     }
                 }
+                Request::ApplicationGloballyActivated(pid) => {
+                    events.push(Event::ApplicationActivated(pid, Quiet::No));
+                }
                 Request::SetWindowFrame(wid, frame, txid, _) => {
                     let window = self.windows.entry(wid).or_default();
                     window.last_seen_txid = txid;
@@ -578,6 +586,23 @@ impl Apps {
                             events.push(Event::WindowFrameChanged(
                                 wid,
                                 frame,
+                                Some(txid),
+                                Requested(true),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                Request::SetWorkspaceSwitchPositions(positions, txid, _) => {
+                    for (wid, position) in positions {
+                        let window = self.windows.entry(wid).or_default();
+                        window.last_seen_txid = txid;
+                        let old_frame = window.frame;
+                        window.frame.origin = position;
+                        if !window.animating && !old_frame.same_as(window.frame) {
+                            events.push(Event::WindowFrameChanged(
+                                wid,
+                                window.frame,
                                 Some(txid),
                                 Requested(true),
                                 None,
