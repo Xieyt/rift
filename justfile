@@ -29,17 +29,22 @@ check:
 
 # lint
 clippy:
-    cargo clippy --all-targets
+    nix develop -c cargo clippy --all-targets
 
 # apply / verify formatting.
-# NOTE: this uses the dev-shell rustfmt, which is pinned to NIGHTLY (see
-# nix/package.nix) because rustfmt.toml enables unstable options. Run inside
-# `nix develop`/direnv — a plain-shell stable `cargo fmt` reflows the whole tree.
+# NOTE: these go through `nix develop` ON PURPOSE. rustfmt.toml enables unstable
+# options, so they only apply under the dev-shell rustfmt, which is pinned to
+# NIGHTLY (see nix/package.nix). A plain-shell *stable* `cargo fmt` parses
+# rustfmt.toml, warns, silently ignores every unstable option, and reflows the
+# entire tree to stable defaults — a massive spurious cross-file diff. These
+# recipes used to be bare `cargo fmt`, which meant `just fmt` did exactly that
+# whenever the caller was not already inside the dev shell (it is how ~40
+# unrelated files once got swept into a feature commit; see FORK.md §6).
 # `--all` matches CI (`cargo +nightly fmt --all --check`).
 fmt:
-    cargo fmt --all
+    nix develop -c cargo fmt --all
 fmt-check:
-    cargo fmt --all --check
+    nix develop -c cargo fmt --all --check
 
 # ---------------------------------------------------------------------------
 # tests — run through `nix develop` so they link (see ENVIRONMENT above).
