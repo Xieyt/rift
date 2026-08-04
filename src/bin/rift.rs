@@ -343,7 +343,8 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         hints_bar_hit_rects,
     );
 
-    let mission_control = MissionControlActor::new(config.clone(), mc_rx, reactor.clone(), mtm);
+    let mission_control =
+        MissionControlActor::new(config.clone(), mc_rx, mc_tx.clone(), reactor.clone(), mtm);
     let mission_control_native = NativeMissionControl::new(events_tx.clone(), mc_native_rx);
 
     if config.settings.default_disable {
