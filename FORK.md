@@ -7,6 +7,9 @@ without pain.
 
 Read this before syncing with upstream or adding new local features.
 
+> **Currently behind upstream?** See `UPSTREAM-SYNC.md` for the per-commit
+> verdicts and the staged merge plan for the 2026-08 backlog (38 commits).
+
 ---
 
 ## 1. Repository topology
@@ -269,8 +272,11 @@ commits over a real upstream delta is a per-commit conflict marathon; merging is
 one pass.
 
 `git rerere` is enabled (`git config rerere.enabled true`) so each conflict you
-resolve is recorded and auto-applied next time — the §4 resolutions are already
-recorded.
+resolve is recorded and auto-applied next time. Do **not** count on it across a
+large delta: verified 2026-08-05, none of the 3 resolutions in `.git/rr-cache`
+matched any of the 16 hunks in the 38-commit backlog — upstream had moved the
+surrounding code. rerere pays off for repeated *small* syncs, which is the
+argument for syncing often (`UPSTREAM-SYNC.md` §7).
 
 **Routine (merge):**
 
@@ -575,8 +581,12 @@ per-workspace layouts. So this is the *gaps* worth stealing, ranked.
    (cycle 33/50/66%) and independent per-column widths. Pure layout math in
    `scrolling.rs` + a couple of `LayoutCommand`s.
 3. **Richer window-rule *open* actions** — `open_floating`, `open_maximized`,
-   `default_column_width`. The match engine (`AppWorkspaceRule`) is done; this
-   only adds effects at window-adoption time.
+   `default_column_width`. *(Partly upstream as of `6c64d8b` "more app rule
+   fields": `floating` now has real adoption-time effect via
+   `AppRulePlacement::resolve_frame`, and tiled `size.w` covers
+   `default_column_width` in **pixels, not a ratio**; `open_maximized` is still
+   missing. `95bc739`'s `BaseLayoutSettings::resolved_base_for(mode)` is the
+   override-resolution seam to extend.)*
 4. **Workspace reordering / on-the-fly named workspaces** — niri's
    move-workspace-up/down. We have create/switch/move-to; reordering is missing.
 5. **Interactive mouse resize of tiles** — we have drag-*swap*
@@ -587,8 +597,11 @@ damage-tracked rendering, block-out-from-screencast. macOS owns the compositor.
 
 ### Stability roadmap (higher priority than features)
 1. **CI-runnable tests.** The `move_focus = "left"` config panic (§2.B) shipped
-   because nothing *ran* the tests. Keep `default_config_parses()` green (guards
-   the embedded `rift.default.toml`), fix the test-binary unwinder
+   because nothing *ran* the tests. **Write `default_config_parses()`** — verified
+   2026-08-05, it does not exist; `Config::default()` (which `.unwrap()`s the
+   embedded `rift.default.toml`) is covered only incidentally via
+   `reactor/testing.rs`, and since a panic aborts the whole binary a bad default
+   config kills the run with no attributable failure. Then fix the unwinder
    (`failed to initiate panic` → a panic aborts the whole run instead of
    reporting `FAILED`, so one bad test hides the rest), and seam the window
    server behind the existing `testing.rs` mock so reactor/layout tests run
