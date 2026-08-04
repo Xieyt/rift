@@ -1926,6 +1926,42 @@ mod tests {
     use crate::actor::reactor;
     use crate::layout_engine::{LayoutCommand, ResizeOrientation};
 
+    /// Guards the embedded `rift.default.toml`, which `Config::default()` parses
+    /// with `.unwrap()` — so a bad default config is a startup panic, not a
+    /// diagnostic. `cargo check` cannot see it: every failure mode here is a serde
+    /// runtime error (a new `deny_unknown_fields` struct, a `#[serde(flatten)]`
+    /// that changes the deserialization path, a command variant that lost its
+    /// dual-form parse or its `#[serde(default)]`).
+    ///
+    /// Panics in this test binary abort instead of unwinding, so without a named
+    /// test like this one a broken default config kills the whole run with no
+    /// attributable failure. FORK.md §8 stability item 1.
+    #[test]
+    fn default_config_parses() {
+        let config = Config::parse(include_str!("../../rift.default.toml"))
+            .expect("the embedded rift.default.toml must parse");
+
+        // An empty `keys` map would still "parse", so assert the bindings survived.
+        assert!(!config.keys.is_empty(), "default config binds no keys");
+
+        // The bare `move_focus = "left"` form specifically: this is what panics at
+        // startup if MoveFocusArgs loses its `Repr::Bare` arm (it lives in
+        // rift-protocol now, one crate away from this file).
+        let move_focus_binds = config
+            .keys
+            .iter()
+            .filter(|(_, cmd)| {
+                matches!(
+                    cmd,
+                    crate::actor::wm_controller::WmCommand::ReactorCommand(
+                        reactor::Command::Layout(LayoutCommand::MoveFocus(_))
+                    )
+                )
+            })
+            .count();
+        assert_eq!(move_focus_binds, 4, "expected the four bare move_focus binds");
+    }
+
     #[test]
     fn layout_insertion_point_supports_global_default_and_per_mode_override() {
         let settings: LayoutSettings = toml::from_str(
