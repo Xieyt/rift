@@ -331,7 +331,7 @@ impl StackLine {
             }
         }
 
-        if self.config.settings.ui.stack_line.hover != StackLineHoverMode::Hover {
+        if self.config.settings.ui.stack_line.hover != StackLineHoverMode::Click {
             self.hovered_segment = None;
             return;
         }

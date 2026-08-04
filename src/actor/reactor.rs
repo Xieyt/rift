@@ -1077,6 +1077,9 @@ impl Reactor {
                 let mut outcome = application_workflow::handle_application_activated(
                     application_workflow::ApplicationActivatedPayload { pid, quiet },
                 )?;
+                if quiet == Quiet::No {
+                    outcome.absorb(self.handle_app_activation_workspace_switch(pid));
+                }
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
@@ -1091,7 +1094,10 @@ impl Reactor {
                 if !self.is_login_window_pid(pid) {
                     self.request_visible_windows_for_pid(pid, false);
                     if self.main_window_tracker.take_global_activation_quiet(pid) == Quiet::No {
-                        self.handle_app_activation_workspace_switch(pid);
+                        let mut outcome = self.handle_app_activation_workspace_switch(pid);
+                        outcome.focused_window = raised_window;
+                        outcome.refresh_window_notifications = should_update_notifications;
+                        return Ok(outcome);
                     } else {
                         debug!(
                             pid,
@@ -1354,10 +1360,10 @@ impl Reactor {
                 // early from the reducer. Mouse release still has to terminate
                 // an existing drag session in those cases.
                 if effective_mouse_state == Some(crate::sys::event::MouseState::Up)
-                    && (matches!(
+                    && matches!(
                         self.drag_manager.drag_state,
                         DragState::Active { .. } | DragState::PendingSwap { .. }
-                    ) || self.drag_manager.skip_layout_for_window.is_some())
+                    )
                 {
                     outcome.dispatch_mouse_up = true;
                 }
@@ -1539,14 +1545,12 @@ impl Reactor {
                 source,
             })) => {
                 let Some(active_space) = self.active_display_space() else {
-                    return Ok(EventOutcome::finalized_event(None, false, false, false)
-                        .with_stdout_line(
-                            "Could not restore saved layout: no active macOS space is available"
-                                .into(),
-                        ));
+                    return Ok(EventOutcome::no_change().with_stdout_line(
+                        "Could not restore saved layout: no active macOS space is available".into(),
+                    ));
                 };
                 let request = layout::RestoreRequest { scope, active_space, source };
-                let outcome = EventOutcome::finalized_event(None, false, false, true);
+                let outcome = EventOutcome::window_membership_changed(false, true);
                 let report = self.layout_manager.layout_engine.restore_layout(
                     path,
                     request,
@@ -1696,7 +1700,7 @@ impl Reactor {
             })) => {
                 if self.is_in_drag() {
                     warn!("Ignoring move-window-to-display while a drag is active");
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 }
                 let command_space = self.workspace_command_space();
                 let resolved_window = {
@@ -1723,11 +1727,11 @@ impl Reactor {
                 };
                 let Some(window) = resolved_window else {
                     warn!("Move window to display ignored because no target window was resolved");
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 };
                 let Some(window_state) = self.state.windows.window(window) else {
                     warn!(?window, "Move window to display ignored: unknown window");
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 };
                 let window_server_id = window_state.info.sys_id;
                 let window_frame = window_state.frame_monotonic;
@@ -1741,7 +1745,7 @@ impl Reactor {
                         ?window,
                         "Move window to display ignored: source space unavailable"
                     );
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 };
                 let origin = self
                     .space_state
@@ -1754,7 +1758,7 @@ impl Reactor {
                         ?selector,
                         "Move window to display ignored: target display not found"
                     );
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 };
                 let Some(target_space) =
                     target_screen.space.filter(|space| self.is_space_active(*space))
@@ -1763,10 +1767,10 @@ impl Reactor {
                         ?selector,
                         "Move window to display ignored: target space unavailable"
                     );
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 };
                 if source_space == target_space {
-                    return Ok(EventOutcome::finalized_event(None, false, false, false));
+                    return Ok(EventOutcome::no_change());
                 }
                 let mut target_frame = window_frame;
                 let mut origin = target_screen.frame.mid();
@@ -1793,10 +1797,8 @@ impl Reactor {
             _ => (),
         }
 
-        Ok(EventOutcome::finalized_event(
+        Ok(EventOutcome::focus_changed(
             raised_window,
-            false,
-            false,
             should_update_notifications,
         ))
     }
@@ -1834,10 +1836,6 @@ impl Reactor {
                 discovery.app_info,
             );
         }
-        if let Some(pid) = outcome.activate_application {
-            self.handle_app_activation_workspace_switch(pid);
-        }
-
         for window in outcome.reapply_app_rules {
             self.maybe_reapply_app_rules_for_window(window);
         }
@@ -2316,6 +2314,10 @@ impl Reactor {
         );
         self.check_for_new_windows();
 
+        if let Some(space) = self.workspace_command_space() {
+            self.focus_desktop_if_active_workspace_empty(space);
+        }
+
         if let Some(space) = self
             .workspace_command_space()
             .or_else(|| spaces.iter().copied().flatten().find(|space| self.is_space_active(*space)))
@@ -2410,7 +2412,7 @@ impl Reactor {
         &mut self,
         space_state: ForwardedSpaceState,
     ) -> anyhow::Result<EventOutcome> {
-        let mut outcome = EventOutcome::finalized_event(None, false, false, true);
+        let mut outcome = EventOutcome::window_membership_changed(false, true);
         let analysis = topology_workflow::analyze_space_snapshot(
             &self.space_state,
             &self.active_spaces,
@@ -3246,11 +3248,19 @@ impl Reactor {
     }
 
     fn send_layout_event(&mut self, event: LayoutEvent) {
+        let focus_desktop = matches!(
+            event,
+            LayoutEvent::WindowRemoved(wid)
+                if self.layout_manager.layout_engine.focused_window() == Some(wid)
+        );
         let event_clone = event.clone();
         let response =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
         self.prepare_refocus_after_layout_event(&event_clone);
         self.handle_layout_response(response, None);
+        if focus_desktop && let Some(space) = self.workspace_command_space() {
+            self.focus_desktop_if_active_workspace_empty(space);
+        }
         for space in self.space_state.iter_known_spaces() {
             self.layout_manager.layout_engine.debug_tree_desc(space, "after event", false);
         }
@@ -3497,17 +3507,13 @@ impl Reactor {
         }
     }
 
-    fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) {
-        use objc2_app_kit::NSRunningApplication;
-
-        use crate::sys::app::NSRunningApplicationExt;
-
+    fn handle_app_activation_workspace_switch(&mut self, pid: pid_t) -> EventOutcome {
         if self.workspace_switch_manager.active_workspace_switch.is_some() {
             trace!(
                 "Skipping auto workspace switch for pid {} because a workspace switch is in progress",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         if self.workspace_switch_manager.manual_switch_in_progress() {
@@ -3515,7 +3521,7 @@ impl Reactor {
                 "Skipping auto workspace switch for pid {} because a manual switch is in progress",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         if let Some(active_space) = self.raw_command_space()
@@ -3525,7 +3531,7 @@ impl Reactor {
                 "Skipping auto workspace switch for pid {} because the active space is fullscreen",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         if let Some(wsid) = self.activation_from_unmanageable_window(pid) {
@@ -3534,52 +3540,21 @@ impl Reactor {
                 "Skipping auto workspace switch for pid {} because the activated window is not manageable",
                 pid
             );
-            return;
+            return EventOutcome::no_change();
         }
 
-        let visible_spaces: HashSet<SpaceId> = self.iter_active_spaces().collect();
-        let app_is_on_visible_workspace =
-            self.state.windows.iter_windows().any(|(wid, _window_state)| {
-                if wid.pid != pid {
-                    return false;
-                }
-                let Some(space) = self.best_space_for_window_id(wid) else {
-                    return false;
-                };
-                if !visible_spaces.contains(&space) {
-                    return false;
-                }
-                let Some(active_workspace) =
-                    self.layout_manager.layout_engine.active_workspace(space)
-                else {
-                    return false;
-                };
-                self.layout_manager
-                    .layout_engine
-                    .virtual_workspace_manager()
-                    .workspace_for_window(&self.state.windows, space, wid)
-                    .is_some_and(|window_workspace| window_workspace == active_workspace)
-            });
-
-        if app_is_on_visible_workspace {
-            debug!("App {} is already on a visible workspace, not switching.", pid);
-            return;
-        }
-
-        let Some(app) = NSRunningApplication::with_process_id(pid) else {
-            return;
+        let Some(bundle_id_str) =
+            self.app_manager.apps.get(&pid).and_then(|app| app.info.bundle_id.clone())
+        else {
+            return EventOutcome::no_change();
         };
-        let Some(bundle_id) = app.bundle_id() else {
-            return;
-        };
-        let bundle_id_str = bundle_id.to_string();
 
         if self.config.settings.auto_focus_blacklist.contains(&bundle_id_str) {
             debug!(
                 "App {} is blacklisted for auto-focus workspace switching, ignoring activation",
                 bundle_id_str
             );
-            return;
+            return EventOutcome::no_change();
         }
 
         debug!(
@@ -3598,14 +3573,14 @@ impl Reactor {
             });
 
         let Some(app_window_id) = app_window else {
-            return;
+            return EventOutcome::no_change();
         };
 
         let Some(window_space) = self.best_space_for_window_id(app_window_id) else {
-            return;
+            return EventOutcome::no_change();
         };
 
-        self.maybe_auto_switch_to_window_workspace(pid, app_window_id, window_space);
+        self.maybe_auto_switch_to_window_workspace(pid, app_window_id, window_space)
     }
 
     fn maybe_auto_switch_to_window_workspace(
@@ -3613,18 +3588,18 @@ impl Reactor {
         pid: pid_t,
         app_window_id: WindowId,
         window_space: SpaceId,
-    ) {
+    ) -> EventOutcome {
         let workspace_state = self.layout_manager.layout_engine.virtual_workspace_manager();
         let Some(window_workspace) =
             workspace_state.workspace_for_window(&self.state.windows, window_space, app_window_id)
         else {
-            return;
+            return EventOutcome::no_change();
         };
 
         let Some(current_workspace) =
             self.layout_manager.layout_engine.active_workspace(window_space)
         else {
-            return;
+            return EventOutcome::no_change();
         };
 
         if window_workspace != current_workspace {
@@ -3651,10 +3626,12 @@ impl Reactor {
                     workspace_index,
                     app_window_id,
                 );
-                self.handle_layout_response(response, Some(window_space));
-                self.update_event_tap_layout_mode();
+                return EventOutcome::layout_changed(false)
+                    .with_layout_response(response, Some(window_space));
             }
         }
+
+        EventOutcome::no_change()
     }
 
     fn handle_layout_response(
@@ -3759,12 +3736,14 @@ impl Reactor {
                                 .is_empty()
                         })
                         .unwrap_or(false);
-                    let warp_space = if skip_center_warp {
-                        None
+                    if skip_center_warp {
+                        workspace_switch_space.is_some_and(|space| {
+                            self.focus_desktop_if_active_workspace_empty(space)
+                        })
                     } else {
-                        workspace_switch_space.or_else(|| self.command_context_space())
-                    };
-                    self.try_focus_or_warp_without_raise(warp_space, &mut focus_window)
+                        let space = workspace_switch_space.or_else(|| self.command_context_space());
+                        self.try_focus_or_warp_without_raise(space, &mut focus_window)
+                    }
                 }
             } else if let Some(space) = pending_refocus_space.take() {
                 if let Some(wid) = self.last_focused_window_in_space(space) {
@@ -4061,6 +4040,31 @@ impl Reactor {
 
         let Some(info) = window_info else { return false };
         window_server::make_key_window(info.pid, wsid).is_ok()
+    }
+
+    fn focus_desktop_if_active_workspace_empty(&mut self, space: SpaceId) -> bool {
+        if !self.is_space_active(space)
+            || !self
+                .layout_manager
+                .layout_engine
+                .windows_in_active_workspace(&self.state.windows, space)
+                .is_empty()
+        {
+            return false;
+        }
+        let Some(screen) = self.space_state.screen_by_space(space) else {
+            return false;
+        };
+        if !window_server::focus_desktop_window(screen) {
+            return false;
+        }
+
+        self.layout_manager.layout_engine.commit_workspace_focus(
+            &mut self.state.windows,
+            space,
+            None,
+        );
+        true
     }
 
     fn last_focused_window_in_space(&self, space: SpaceId) -> Option<WindowId> {

@@ -473,7 +473,8 @@ pub struct GestureSettings {
     /// Enable horizontal swipes to switch virtual workspaces
     #[serde(default = "no")]
     pub enabled: bool,
-    /// If true, consume low-level dock swipe events to prevent macOS from also handling them
+    /// If true, consume horizontal swipe events owned by Rift so macOS and the
+    /// foreground app do not also handle them.
     #[serde(default = "yes")]
     pub consume_dock_swipe: bool,
     /// Invert horizontal direction (swap next/prev)
@@ -1528,7 +1529,7 @@ fn default_animation_duration() -> f64 { 0.3 }
 fn default_animation_fps() -> f64 { 100.0 }
 
 #[allow(dead_code)]
-fn no() -> bool { false }
+pub fn no() -> bool { false }
 
 fn default_layout_folder() -> PathBuf { PathBuf::from("~/.config/rift/layouts") }
 

@@ -295,8 +295,8 @@ fade_duration_ms = 180.0
 [settings.gestures]
 # Enable horizontal swipes to switch virtual workspaces
 enabled = false
-# If true, Rift consumes low-level dock swipe events for its trackpad gesture handlers
-# to prevent interference with rift's own swipe detection
+# If true, Rift consumes horizontal swipes handled by its trackpad gesture handlers
+# so macOS and the foreground app do not also handle them
 consume_dock_swipe = true
 # Invert horizontal direction (swap next/prev)
 invert_horizontal_swipe = false
@@ -452,7 +452,8 @@ comb1 = "Alt + Shift"
 # - prev_workspace = true|false (optional skip-empty override)
 # - switch_to_workspace = N
 # - move_window_to_workspace = N|"next"|"prev"
-# - move_window_to_workspace = { workspace = N|"next"|"prev", window_id = 123 } (optional window id)
+# - move_window_to_workspace = { workspace = N|"next"|"prev", follow = true|false, window_id = 123 }
+#   (follow and window_id are optional)
 # - create_workspace
 # - switch_to_last_workspace
 # - set_workspace_layout = { mode = "traditional"|"bsp"|"stack"|"master_stack"|"scrolling" } (active workspace)
