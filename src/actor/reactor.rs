@@ -887,7 +887,16 @@ impl Reactor {
 
     fn log_event(&self, event: &Event) {
         match event {
-            Event::WindowFrameChanged(..) | Event::MouseUp | Event::MouseMoved(_) => {
+            // High-frequency, low-information events stay at trace so `reactor=debug`
+            // remains usable. `WindowTitleChanged` belongs here for the same reason as
+            // the others: any terminal with a progress spinner in its title emits one
+            // per animation frame. Measured on a normal desktop it was 77% of the
+            // entire log by volume and ~1 GiB/day, which is also how the log-rotation
+            // agent's inability to rotate an actively-written file went unnoticed.
+            Event::WindowFrameChanged(..)
+            | Event::MouseUp
+            | Event::MouseMoved(_)
+            | Event::WindowTitleChanged(..) => {
                 trace!(?event, "Event")
             }
             _ => debug!(?event, "Event"),

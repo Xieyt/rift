@@ -13,9 +13,35 @@
 
       toml = pkgs.formats.toml { };
 
+      # Rotate by SIZE, in place, and only rift's own logs.
+      #
+      # The previous implementation was
+      #   find "$logDir" -name "*.log" -mmin +1440 -delete
+      # which could never rotate the log that matters: launchd keeps rift.err.log
+      # open and rift appends to it continuously, so its mtime is always "now" and
+      # `-mmin +1440` never matches. It ran hourly for 290 cycles, exited 0 every
+      # time, and the file reached 1.2 GiB. It also deleted *any* `*.log` in logDir
+      # (commonly /tmp), i.e. other programs' logs.
+      #
+      # Renaming or deleting is not an option either: launchd holds the descriptor,
+      # so the process would keep writing to the unlinked inode and the new file
+      # would stay empty. Truncating in place is what works — the fd stays valid and,
+      # because it was opened O_APPEND, writes resume at offset 0.
       logRotateScript = pkgs.writeShellScript "rift-logrotate" ''
+        set -eu
+        max=$(( ${toString cfg.logMaxSizeMiB} * 1024 * 1024 ))
         mkdir -p "${cfg.logDir}"
-        find "${cfg.logDir}" -name "*.log" -mmin +1440 -delete
+        for f in "${cfg.logDir}"/rift.err.log "${cfg.logDir}"/rift.out.log; do
+          [ -f "$f" ] || continue
+          sz=$(/usr/bin/stat -f%z "$f" 2>/dev/null || echo 0)
+          [ "$sz" -gt "$max" ] || continue
+          # keep exactly one previous generation, then truncate the live file
+          cp -f "$f" "$f.1" 2>/dev/null || true
+          : > "$f"
+          echo "rotated $f at $sz bytes (max $max)"
+        done
+        # drop stale previous generations (these are NOT open, so mtime works here)
+        find "${cfg.logDir}" -maxdepth 1 -name 'rift.*.log.1' -mmin +10080 -delete 2>/dev/null || true
       '';
 
       configFile =
@@ -54,7 +80,28 @@
 
         logDir = lib.mkOption {
           type = lib.types.str;
-          description = "Directory for rift log files. Must be an absolute path.";
+          description = ''
+            Directory for rift log files. Must be an absolute path.
+
+            Note this directory is also where `logMaxSizeMiB` rotation operates. The
+            rotation agent only ever touches `rift.err.log` / `rift.out.log` and their
+            `.1` generations, so pointing this at a shared directory such as `/tmp` is
+            safe — but it does mean the logs are world-readable there.
+          '';
+        };
+
+        logMaxSizeMiB = lib.mkOption {
+          type = lib.types.ints.positive;
+          default = 64;
+          description = ''
+            Size threshold (MiB) at which the hourly agent rotates a rift log. The
+            live file is truncated in place after copying it to `<name>.log.1`,
+            because launchd holds the descriptor open — renaming or deleting it would
+            leave rift writing to an unlinked inode.
+
+            Worth keeping modest: with `rift_wm::actor::reactor=debug` the log grows
+            at tens of MiB/hour on a busy desktop.
+          '';
         };
 
         signingIdentity = lib.mkOption {
