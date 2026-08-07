@@ -9,20 +9,23 @@ reference for the **next** sync, not as history for its own sake:
 
 - **§3** — why each of the 38 commits was taken. Unchanged verdicts; notes now
   say where the predicted rework differed from the real one.
-- **§4** — the five pieces of real work, as landed. **§4.6 is new: the
-  predictions that were wrong.** Read it before trusting anything else here.
+- **§4** — the five pieces of real work, as landed. **§4.6 is the predictions that
+  were wrong; §4.7 is what live testing found afterwards.** Read both before
+  trusting anything else here.
 - **§6** — per-stage outcome log (conflicts, resolutions, gates).
 - **§7** — the sync cadence the measurements actually support.
 
-## 0. Status — merge complete
+## 0. Status — merge complete, and one follow-on since
 
 ```
 branch                    xieyt/5
 behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
-upstream tip merged       6c64d8b
-curated tests             327 -> 352, all passing
+ahead                     44
+upstream tip merged       1de4d09  (the 38-commit backlog ended at 6c64d8b)
+curated tests             327 -> 352 (merge) -> 353 (guard test) -> 359 (allowlist fix)
 cargo check               --workspace --all-targets clean
-nix build .#rift-unwrapped  succeeds (new workspace scoping, both binaries run)
+just fmt-check            clean
+nix build .#rift          succeeds; .app installed and exercised live
 ```
 
 Landed as five chronological checkpoint merges, one per stage. The checkpoint
@@ -37,9 +40,28 @@ SHAs are *upstream* commits; the merge commits on `xieyt/5` are separate:
 | 5 | `upstream/main` (`6c64d8b`) | `4e8b56e` | 5 | 2 | 352 |
 
 Each merge commit message carries its own resolution log — those messages, not
-this file, are the authoritative account of what was changed and why. Three fork
-commits were added alongside the merges: `84ea8e8` (§4.2 packaging), `d1622e6`
-(Mission Control Screen-Recording preflight), `1c73bb3` (`default_config_parses`).
+this file, are the authoritative account of what was changed and why. Fork commits
+added alongside and after the merges: `84ea8e8` (§4.2 packaging), `d1622e6`
+(Mission Control Screen-Recording preflight), `1c73bb3` (`default_config_parses`),
+`54ce476` (`just fmt`/`clippy` routed through `nix develop`), `9f26883` (nightly
+rustfmt pass over 13 fork-owned files).
+
+**Follow-on merge, 2026-08-08 — `1de4d09` → `45e7826`.** Upstream #437, "move_node
+hiding col in scroll layout": after `move_selection`, niri navigation reveals the
+moved column (`reveal_selected_without_direction`) instead of re-aligning
+(`align_scroll_to_selected`). Ten lines, zero conflicts, and directly relevant —
+`focus_navigation_style = "niri"` is the configuration §2.D/§2.E target. It lands in
+`move_selection`, one level above our §5.1 `move_selected_window_horizontal` split,
+so the two are independent. See `FORK.md` §2.D.
+
+**Post-merge live verification (2026-08-08).** `just install` on the real desktop,
+then exercised end to end: typed IPC round-trip; `focus-column N`; `toggle-tabbed`;
+`cycle-column-width` (widths matched the configured presets exactly); **both branches
+of the §5.1 split** (tabbed column moved intact, untabbed stack extracted);
+`--activate` foregrounding plus the §4.1 spurious-switch hazard (12 activations with
+the app parked on two workspaces, zero jumps); hint bar rendering including the
+overflow strip; and #437's reveal. Two things were *found* by this pass rather than
+confirmed — see §4.7.
 
 ---
 
@@ -271,12 +293,24 @@ Never an infinite loop (`652a53f` adds `is_globally_frontmost` dedup and drops t
 "any standard window of this pid" fallback), but a real behavioural regression risk
 and the merge's only genuine design decision.
 
-**Both fixes are runtime-only and remain untested.** `cargo check` and `just test`
-do not catch either; nothing in the curated suite exercises the Carbon activation
-edge. Verify by hand after any future merge that touches `app.rs` activation or
-`WorkspaceSwitchOrigin`: `just install`, then Dock-click an app that lives on
-another workspace — the workspace must follow the app once, not twice, and focus
-must not bounce.
+**Both fixes remain untested by the suite, but were verified by hand (2026-08-08,
+passed).** `cargo check` and `just test` catch neither; nothing in the curated suite
+exercises the Carbon activation edge. The check that matters reproduces the hazard —
+an app frontmost-able on the active workspace that *also* owns a window elsewhere:
+park one window of a multi-window app on another workspace without `--follow`, then
+drive `window focus <dir> --activate` repeatedly and assert the active workspace
+never changes. Executed with Emacs parked on ws0 while still present on ws3: twelve
+`--activate` moves, active workspace stayed `3` throughout. `--activate` also
+demonstrably foregrounds (frontmost changed with the flag, not without), and the log
+showed `MoveFocus(MoveFocusArgs { direction: …, activate: true })` arriving through
+the new typed IPC. Full procedure in `FORK.md` §2.B.
+
+**Expect `Quiet::No` in the log on a keyboard focus move — that is correct.**
+`on_global_activation` prefers `last_activated` (armed by `wait_for_activation` with
+the raise's own `quiet`) over our `pending_activation_quiet` marker, so an explicit
+focus command is attributed to the user by design. Our pre-arm covers the narrower
+path where `last_activated` is *not* armed (`waits_for_activation == false`, e.g. the
+target app is already frontmost). Do not "fix" the `Quiet::No`.
 
 ### 4.2 ScreenCaptureKit packaging (`84ea8e8`) — landed
 
@@ -410,18 +444,20 @@ predicted reason — see §4.6, correction 2.
 `topology_change_clears_stale_pending_hide_target_*` still exists upstream, so the
 `--skip` stays.
 
-**Gap found while checking that:** the allowlist has no `ui::hints_bar` filter, so
-the §2.E hint-bar geometry/click tests **never run under `just test`** despite
-`FORK.md` §2.E claiming they do. Not caused by this sync; add the filter (or
-`--skip`-based inversion) next time the `justfile` is touched.
+**Gap found while checking that, since CLOSED (2026-08-08):** the allowlist had no
+`ui::hints_bar` filter, so the §2.E hint-bar geometry/click tests **never ran under
+`just test`** despite `FORK.md` §2.E claiming they did. Not caused by this sync. The
+filter was added when the `justfile` was next touched, taking the suite from 353 to
+359 tests. See §4.7.
 
 ### 4.6 Predictions that were wrong
 
-The most useful section here for the next maintainer. **Five** calls in this document
-were wrong, and the pattern across them is worth more than the individual facts:
-every one was an assumption never checked against the thing it described — the
-pinned nixpkgs, the enum that actually deserializes, the diff git would produce,
-the rr-cache hit rate, the authorship of a line.
+The most useful section here for the next maintainer. **Seven** calls were wrong —
+five predicted in this document (below) and two found during live testing (§4.7) —
+and the pattern across them is worth more than the individual facts: every one was
+an assumption never checked against the thing it described — the pinned nixpkgs, the
+enum that actually deserializes, the diff git would produce, the rr-cache hit rate,
+the authorship of a line, the config flag, and the verification command itself.
 
 **1. §4.2 called the SDK pin "build-breaking". It was not a blocker at all.**
 The claim was that `clangStdenv` inherits apple-sdk **11.x**, so `0bf5549`'s
@@ -491,6 +527,52 @@ how you either delete a real feature or "restore" code you never wrote.
 the `MoveFocusArgs`/`Repr::Bare` landmine, and the call that `652a53f` was the
 highest-risk commit in the backlog. Predicted conflict surface (8 files, 16 hunks)
 matched the executed total exactly.
+
+### 4.7 What the live pass found (2026-08-08)
+
+The merges were gated on `cargo check` + `just test`, which is why both of these
+survived to `just install`. Neither is a merge defect; both are the *gates* being
+narrower than they looked.
+
+**6. "Mission Control is broken, and it's upstream's bug." Wrong — it is off by
+default.** During live testing the overlay never appeared: the command reached the
+reactor, `wm_controller` forwarded it, no overlay, no capture, no actor log lines. I
+diffed the whole path against upstream (`actor/mission_control.rs` byte-identical;
+our only diffs the additive `WmCmd::ToggleHintsBar` and the inert §2.F preflight),
+concluded upstream regression, and leaned on the commit being titled
+"improvements to mission control **1/n**" as supporting evidence. All of it was
+built on not reading the config: `rift.default.toml` ships
+`[settings.ui.mission_control] enabled = false`, and `MissionControlActor::run()`
+gates on that flag *inside* its receive loop, so every event is silently dropped.
+Enabled, it works — live ScreenCaptureKit previews, legible contents, focus border.
+Two compounding errors worth naming: (a) I treated "zero log lines from the actor"
+as evidence of a broken actor when the actor simply has no logging on that path, and
+(b) I read a commit-message convention as evidence of a code state — "1/n" is the
+only such commit in the repo's entire history, so there was no pattern to infer
+from. Triage order now documented in `FORK.md` §2.F.
+**Lesson: for "feature does nothing", check the feature flag before the code. A
+silent no-op is far more often a gate than a bug — and never let a commit message
+substitute for reading the config.**
+
+**7. `just fmt-check` was itself broken, which hid 47 real hunks.**
+`just fmt` / `fmt-check` / `clippy` were bare `cargo …` with only a *comment*
+instructing the caller to be inside `nix develop` — unlike `just test`, which always
+enforced it. Outside the dev shell they resolved to system **stable** rustfmt
+(1.8.0-stable), which parses `rustfmt.toml`, warns that the unstable options need
+nightly, ignores them, and reports the whole tree as drift: **411 phantom hunks**.
+That number is also what made `FORK.md`'s "baseline drift is pre-existing, do not
+reformat" note look plausible — and that note was false. With the flake-pinned
+nightly (1.8.0-nightly): pristine `upstream/main` is **completely clean**, and our
+tree had **47 real hunks**, all in fork-owned files. Fixed in `54ce476` (recipes now
+`nix develop -c`) and `9f26883` (the 47 hunks). `just fmt-check` is now 0.
+**Lesson: a verification command that cannot fail correctly is worse than none — it
+manufactures noise, and someone then documents the noise as expected. When a check
+reports implausible output, verify the check before believing or excusing it.**
+
+Also closed by this pass: the `ui::hints_bar` allowlist hole flagged in §4.5. The
+filter was added, taking `just test` from 353 to 359 — §2.E's six geometry/click
+tests had never run. Same failure mode as #7: a check that silently covered less
+than it claimed.
 
 ---
 

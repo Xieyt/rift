@@ -52,9 +52,11 @@ fmt-check:
 # reactor test that fails on upstream too.
 # ---------------------------------------------------------------------------
 
-# fast deterministic logic tests (layout, raise, reactor, config, stack-line) — no GUI
+# fast deterministic logic tests (layout, raise, reactor, config, stack-line,
+# hints-bar) — no GUI. `ui::hints_bar` was missing from this allowlist, so §2.E's
+# geometry/click tests silently never ran; FORK.md §2.E claimed they did.
 test:
-    nix develop -c cargo test --lib -- layout_engine actor::raise_manager actor::reactor::tests common::config ui::stack_line --skip topology_change_clears_stale_pending_hide_target
+    nix develop -c cargo test --lib -- layout_engine actor::raise_manager actor::reactor::tests common::config ui::stack_line ui::hints_bar --skip topology_change_clears_stale_pending_hide_target
 
 # whole library suite — only meaningful in a real GUI session
 test-all:

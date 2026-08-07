@@ -166,10 +166,43 @@ scoping must be re-checked whenever upstream adopts a new framework or crate.
      Keyboard and IPC switches keep their `activate`.
 
   **No test covers either fix.** `cargo check` and `just test` both pass with them
-  reverted. Verify by hand after any merge touching `app.rs` activation or
-  `WorkspaceSwitchOrigin`: `just install`, then Dock-click an app that lives on
-  another workspace — the workspace should follow once, not twice, and focus must
-  not bounce.
+  reverted, so this needs a manual check after any merge touching `app.rs`
+  activation or `WorkspaceSwitchOrigin`.
+
+  **Repeatable procedure (executed 2026-08-08, passed).** Reproduce the exact
+  hazard — an app that is frontmost-able on the active workspace *and* owns a window
+  on another one, which is what makes a misattributed edge jump workspaces:
+
+  ```bash
+  CLI=./result/bin/rift-cli
+  ws() { $CLI query workspaces | python3 -c \
+    "import json,sys;print([w['index'] for w in json.load(sys.stdin) if w['is_active']])"; }
+  # park one window of a multi-window app on another workspace, stay put
+  $CLI execute workspace move-window 0      # no --follow
+  ws                                        # must still print the original workspace
+  # now hammer the activation path; the workspace must never change
+  for i in $(seq 6); do
+    $CLI execute window focus left --activate  >/dev/null; sleep 0.8; ws
+    $CLI execute window focus right --activate >/dev/null; sleep 0.8; ws
+  done
+  ```
+
+  Result: Emacs parked on ws0 while still present on ws3, twelve `--activate`
+  moves, active workspace stayed `3` every time — no spurious switch. Also confirm
+  `--activate` actually foregrounds (`osascript -e 'tell application "System Events"
+  to get name of first process whose frontmost is true'` changes with `--activate`
+  and not without it) and that the log shows
+  `MoveFocus(MoveFocusArgs { direction: …, activate: true })`.
+
+  **What the log will show, and why it is not a bug:** the resulting
+  `ApplicationActivated(pid, …)` is usually `Quiet::No`, not `Quiet::Yes`. That is
+  upstream's intended attribution for an *explicit* focus command —
+  `on_global_activation` prefers `last_activated` (armed by `wait_for_activation`
+  with the raise's own `quiet`) over our `pending_activation_quiet` marker. Our
+  pre-arm covers the narrower path where `last_activated` is *not* armed
+  (`waits_for_activation == false`, e.g. the app is already frontmost), which is
+  exactly the case that would otherwise resolve to a bare `Quiet::No` with no raise
+  in flight. Do not "fix" the `Quiet::No` you see on a keyboard focus move.
 
 **Effect:** a focus move / workspace switch brings the target *app* to the
 foreground, not just shifting keyboard focus.
@@ -265,6 +298,17 @@ on a real Mac — SkyLight indicator windows can't render in a headless session.
   `width_overridden: bool` (`6c64d8b`) beside our `tabbed` and `active`. All three
   show up in the 21 exhaustive `Column { .. }` literals in `scrolling.rs`, 12 of
   which are fork-only test code — see §4.
+- **Moving a column now reveals it (upstream `1de4d09`, #437).** After
+  `move_selection`, upstream reveals the moved column via
+  `reveal_selected_without_direction()` instead of `align_scroll_to_selected()`
+  **when `focus_navigation_style = "niri"`** — previously a `move_node` could scroll
+  the column you just moved off-screen. It lands in `move_selection`, one level
+  *above* our `move_selected_window_horizontal` tabbed split, so the two are
+  independent; the merge was conflict-free. Worth knowing when reading the split:
+  the visible screen x of the focused column often stays *constant* across
+  successive `move_node`s (it is re-revealed at the same spot each time), so verify
+  a move by checking column **order**, not coordinates. Verified live 2026-08-08:
+  order went 3 → 2 → 1 across two `move-node left`s while staying on-screen.
 
 **Why:** the *real* niri tabbed-columns feature — §C only decorated the tree/stack
 indicator, which the scrolling layout never emits.
@@ -374,10 +418,13 @@ also supersedes the stack-line tab bar for scrolling (turn `stack_line` off).
 **Conflict risk:** LOW for the new files; the *touched* core files are where it
 bites — see §4 items 7 (the `hints_bar_tx` hot-reload arm) and 3, plus the
 `space_scope` threading above.
-**Verify:** `cargo test --lib ui::hints_bar` for the geometry/click tests —
-**`just test` does not run them**: its allowlist has no `ui::hints_bar` filter (see
-§6 "Tests"). Visuals need `just install` on a real Mac (SkyLight windows can't
-render headless).
+**Verify:** `just test` now covers the six `ui::hints_bar` geometry/click tests —
+its allowlist gained the `ui::hints_bar` filter on 2026-08-08, having silently
+omitted it since the feature landed (see §6 "Tests"). Visuals need `just install`
+on a real Mac (SkyLight windows can't render headless); verified there 2026-08-08 —
+workspace rail, hint letters, focused chip fill, `show_titles`, the detail overlay,
+and the `overflow = "bar"` second strip all render, and `focus-column N` lights the
+Nth `keys` letter (`focus-column 2` → `D` for `keys = "asdfghjkl;"`).
 
 ### F. `fix: degrade Mission Control previews when Screen Recording is denied`
 **Files:** `src/ui/mission_control.rs`.
@@ -389,6 +436,35 @@ render headless).
   with one clear `warn!` naming the missing permission instead of rendering nothing.
   Preflight only — it never raises the prompt, so it is safe to call on any capture
   path.
+- **Mission Control is OPT-IN, and that is the first thing to check.**
+  `rift.default.toml` ships `[settings.ui.mission_control] enabled = false` under a
+  `# experimental mission control` comment, and `MissionControlActor::run()` gates on
+  it *inside* its receive loop:
+
+  ```rust
+  while let Some((span, event)) = self.rx.recv().await {
+      if self.config.settings.ui.mission_control.enabled {
+          self.handle_event(event);   // dropped entirely when disabled
+      }
+  }
+  ```
+
+  So with the default config, `rift-cli execute mission-control show-all` returns
+  `"Command executed successfully"`, the reactor logs the command, `wm_controller`
+  forwards it — **and nothing happens, silently, with no log line from the actor.**
+  That is indistinguishable from a broken feature, and it cost a full debugging
+  detour during the 2026-08 sync: the symptom was read as an upstream regression in
+  `0bf5549` before anyone checked the flag. Verified working once enabled: live
+  ScreenCaptureKit previews, legible window contents, focus border, dimmed backdrop.
+
+  **Triage order for "Mission Control does nothing / is blank":**
+  1. `[settings.ui.mission_control] enabled = true` in your config? (Not in
+     `dev-config.toml` by default.) This is almost always it.
+  2. Screen Recording granted? Check for this section's `warn!`, or
+     `sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
+     "select service,auth_value from access where client='git.acsandmann.rift'"`
+     — `kTCCServiceScreenCapture` with `auth_value = 2` means granted.
+  3. Only then suspect the code.
 
 **Why:** a WM should degrade loudly, not silently (§8 stability item 2). The new
 Screen Recording prompt is easy to miss (§2.A), so "Mission Control is blank" would
@@ -656,25 +732,32 @@ just test-all        # whole lib suite — only in a real GUI session
 ```
 
 `just test` runs through `nix develop` so it links even without direnv. It is a
-curated allowlist, currently **352 tests** (327 before the 2026-08 upstream merge).
-Four things to know:
+curated allowlist, currently **359 tests** (327 before the 2026-08 upstream merge;
+352 after it; 359 once the hint-bar filter below was added). Four things to know:
 
 - **One known upstream failure:** `topology_change_clears_stale_pending_hide_target_before_next_workspace_layout`
-  panics on clean `upstream/main` too (verified). `just test` skips it — it is
-  not ours, don't chase it.
+  panics on clean `upstream/main` too (re-verified 2026-08-08 by running it in a
+  pristine `upstream/main` worktree). `just test` skips it — it is not ours, don't
+  chase it.
 - **Window-server tests need a real GUI session.** Tests touching SkyLight
   (`SLS…`) abort with an objc weak-reference error in a headless/agent shell,
   so `just test` excludes them; use `just test-all` from your logged-in desktop.
+  `just test-all` therefore still fails on the known upstream test above — that is
+  expected, not a regression.
 - Panics in the test binary currently *abort* instead of unwinding
   (`failed to initiate panic`), so one failing test kills the whole run with no
   attributable failure — which is why `just test` uses a curated allowlist rather
   than the full suite. This bit us **three times** during the 2026-08 merge; it is
-  the open half of §8 stability item 1.
-- **The allowlist has a hole:** its five module filters are `layout_engine`,
+  the open half of §8 stability item 1. Workaround when it happens:
+  `cargo test --lib -- <module> --test-threads=1` and read the last test printed —
+  that is the one that aborted.
+- **The allowlist hole is closed.** Its six module filters are now `layout_engine`,
   `actor::raise_manager`, `actor::reactor::tests`, `common::config`,
-  `ui::stack_line`. There is **no `ui::hints_bar` filter**, so §2.E's hint-bar tests
-  never run under `just test` — use `cargo test --lib ui::hints_bar` until the
-  `justfile` is fixed.
+  `ui::stack_line`, **`ui::hints_bar`**. The last one was missing until
+  2026-08-08, so §2.E's six hint-bar geometry/click tests silently never ran under
+  `just test` even though §2.E claimed they did. If you add a new `ui::` or `sys::`
+  test module, add its filter here too — a curated allowlist fails silent by
+  design.
 
 **Install / test on this Mac.** Real builds and the running WM are driven via
 `just` (see the `justfile`):
@@ -693,7 +776,9 @@ With the cert, TCC keys on the stable signing identity and the grant persists.
 **Since the ScreenCaptureKit merge there is a second grant:** Screen Recording, a
 separate TCC record from Accessibility (§2.A). Expect one new prompt at the next
 login after installing, and — on ad-hoc installs — on every rebuild. If Mission
-Control previews come up blank, check that grant first; §2.F logs a `warn!` naming it.
+Control does nothing or comes up blank, check the **`enabled` flag first** (it is
+`false` by default and the actor drops events silently), *then* the grant — see
+§2.F for the full triage order; §2.F also logs a `warn!` naming the permission.
 
 **Installing via the flake** (`darwin-rebuild switch` with `services.rift.enable`)
 needs *no* manual cert setup: the module auto-creates the `rift-codesign` identity
@@ -713,30 +798,40 @@ channel"*, and **silently ignores them** — so a stable `cargo fmt` reflows the
 *entire* tree to stable defaults, i.e. a massive spurious cross-file diff.
 
 To make the right thing the default, the devShell toolchain pins rustfmt to
-nightly (`latest.rustfmt`, see `nix/package.nix`). So **inside `nix develop` /
-direnv**:
+nightly (`latest.rustfmt`, see `nix/package.nix`), **and the recipes now enforce
+the dev shell themselves** — they are `nix develop -c cargo fmt …`, so they are
+correct from any shell:
 
 ```bash
-just fmt          # cargo fmt --all (nightly) — the only correct way
-just fmt-check    # cargo fmt --all --check (matches CI)
+just fmt          # nix develop -c cargo fmt --all (nightly) — the only correct way
+just fmt-check    # same, --check (matches CI)
 ```
 
 CI enforces the same via `dtolnay/rust-toolchain@nightly` + `cargo +nightly fmt
 --all --check` (`.github/workflows/rust.yml`).
 
 **Never** run a plain-shell `cargo fmt` — that resolves to system *stable*
-rustfmt and will churn every file. This bit us once: a stable `cargo fmt` (run to
-tidy imports) got swept into the hint-bar commit and reformatted ~40 unrelated
-files. The fix was to reformat with real nightly rustfmt (via
-`nix shell 'github:nix-community/fenix#latest.rustfmt'`) and restore the files we
-never touched: `git checkout <parent> -- <untouched files>`, then
-`git commit --amend`. Keep feature commits to the files the feature actually
-changes.
+rustfmt and will churn every file. This bit us twice:
 
-Note: the baseline isn't guaranteed clean under the *latest* nightly (CI's
-`@nightly` floats; the flake pins one via `flake.lock`), so `fmt-check` may flag
-files you didn't touch. That drift is pre-existing — do **not** reformat them, or
-you recreate the churn.
+1. A stable `cargo fmt` (run to tidy imports) got swept into the hint-bar commit
+   and reformatted ~40 unrelated files. The fix was to reformat with real nightly
+   rustfmt and restore the files we never touched:
+   `git checkout <parent> -- <untouched files>`, then `git commit --amend`.
+2. **`just fmt` / `just fmt-check` / `just clippy` were themselves the trap** until
+   `54ce476`. They were bare `cargo …` with only a *comment* telling the caller to
+   be inside `nix develop` — unlike `just test`, which always enforced it. Outside
+   the dev shell they silently used stable rustfmt, which is how mechanism #1
+   happened in the first place. Fixed: all three now wrap in `nix develop -c`.
+
+**Correction to a long-standing note here:** this section used to claim the
+baseline "isn't guaranteed clean under the latest nightly" and that any drift
+`fmt-check` reports is "pre-existing — do not reformat". That was **false**, and it
+was load-bearing enough to hide 47 real hunks. Measured 2026-08-08 with the
+flake-pinned rustfmt (1.8.0-nightly): pristine `upstream/main` is **completely
+clean** (0 hunks), and our tree had 47 hunks — all in fork-owned files, all real,
+now fixed. The 411 hunks the old bare recipe reported were the *stable*-rustfmt
+phantom (1.8.0-stable), not baseline drift. So: if `just fmt-check` reports drift,
+it is **yours** — fix it. Do not dismiss it.
 
 ### Benchmarking a perf change (counter-based A/B)
 
@@ -880,7 +975,11 @@ damage-tracked rendering, block-out-from-screencast. macOS owns the compositor.
      `testing.rs` mock so reactor/layout tests run headless; upstream added nothing
      here.
    - **Still open: `nix flake check`.** `just test` is not wired into it.
-   - **Still open: the `ui::hints_bar` allowlist hole** (§6 "Tests").
+   - **`ui::hints_bar` allowlist hole — DONE** (2026-08-08). The filter was added to
+     `just test`, taking it from 353 to 359 tests; §2.E's six geometry/click tests
+     had silently never run. The general lesson stands and is why this item is worth
+     keeping in sight: a curated allowlist fails *silent*, so adding a test module
+     without adding its filter is a no-op that looks like coverage.
 2. **Panic hygiene in runtime paths.** A WM should degrade, not crash. Partially
    advanced: §2.F's `CGPreflightScreenCaptureAccess` gate means a denied Screen
    Recording grant now degrades with one clear warning instead of a silent blank
