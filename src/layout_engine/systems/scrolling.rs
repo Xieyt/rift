@@ -1556,6 +1556,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
     }
 
     fn move_selection(&mut self, layout: LayoutId, direction: Direction) -> bool {
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
         let Some(state) = self.layout_state_mut(layout) else {
             return false;
         };
@@ -1568,7 +1572,11 @@ impl LayoutSystem for ScrollingLayoutSystem {
             }
         };
         if moved {
-            state.align_scroll_to_selected();
+            if niri_navigation {
+                state.reveal_selected_without_direction();
+            } else {
+                state.align_scroll_to_selected();
+            }
         }
         moved
     }
