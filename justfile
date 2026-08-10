@@ -53,10 +53,18 @@ fmt-check:
 # ---------------------------------------------------------------------------
 
 # fast deterministic logic tests (layout, raise, reactor, config, stack-line,
-# hints-bar) — no GUI. `ui::hints_bar` was missing from this allowlist, so §2.E's
-# geometry/click tests silently never ran; FORK.md §2.E claimed they did.
+# hints-bar, menu-bar) — no GUI. Every new `ui::`/`sys::` test module MUST get a
+# filter here: a curated allowlist fails *silent*, so adding a test module without
+# adding its filter is a no-op that looks like coverage. `ui::hints_bar` was missing
+# for months while FORK.md §2.E claimed those tests ran; `ui::menu_bar` was added
+# with upstream's `abdbcc8` and would have repeated it.
+#
+# Two skips, both upstream failures reproduced on a pristine `upstream/main`
+# worktree — not our regressions, see UPSTREAM-SYNC.md §8:
+#   topology_change_clears_stale_pending_hide_target
+#   ax_invalidation_after_quarantine_release_preserves_live_layout_state  (1e3a898)
 test:
-    nix develop -c cargo test --lib -- layout_engine actor::raise_manager actor::reactor::tests common::config ui::stack_line ui::hints_bar --skip topology_change_clears_stale_pending_hide_target
+    nix develop -c cargo test --lib -- layout_engine actor::raise_manager actor::reactor::tests common::config ui::stack_line ui::hints_bar ui::menu_bar --skip topology_change_clears_stale_pending_hide_target --skip ax_invalidation_after_quarantine_release_preserves_live_layout_state
 
 # whole library suite — only meaningful in a real GUI session
 test-all:

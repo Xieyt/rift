@@ -926,6 +926,7 @@ impl Reactor {
         matches!(
             event,
             Event::WindowCreated(..)
+                | Event::WindowDestroyed(..)
                 | Event::WindowServerDestroyed(..)
                 | Event::WindowServerAppeared(..)
                 | Event::WindowFrameChanged(..)
@@ -1187,23 +1188,30 @@ impl Reactor {
                 return Ok(outcome);
             }
             Event::WindowDestroyed(wid) => {
-                // AX destruction is not always native window destruction. AXWindows is
-                // space-filtered, and macOS also replaces AX elements during unlock,
-                // fullscreen/Mission Control, and display churn. A direct WindowServer query
-                // is the existence authority; a live peer takes the detached-recovery path so
-                // the stale AX state cannot remain as a ghost.
+                // AX destruction is not native window destruction. During sleep/unlock and
+                // display churn macOS can replace AXUIElements while the WindowServer window
+                // remains alive. Never let an unstable AX lifetime event mutate persistent
+                // workspace/layout topology.
+                if self.refreshes_blocked() {
+                    debug!(
+                        ?wid,
+                        state = ?self.refresh_quarantine_state(),
+                        "Deferring AX window invalidation until native state stabilizes"
+                    );
+                    self.defer_visible_refresh(true);
+                    return Ok(EventOutcome::default());
+                }
+
                 let window_server_id =
                     self.state.windows.record(wid).and_then(|record| record.window_server_id());
                 let platform_window_alive = window_server_id.is_some_and(|window_server_id| {
                     window_server::get_window(window_server_id)
                         .is_some_and(|info| info.pid == wid.pid)
                 });
-                // While lifecycle/display refreshes are quarantined, a negative
-                // WindowServer lookup is not authoritative. Detach the dead AX state
-                // now so it cannot remain in layout, and let the stabilized native
-                // snapshot either rediscover or permanently retire the record.
-                let native_existence_uncertain = self.refreshes_blocked();
-                let mut outcome = if platform_window_alive || native_existence_uncertain {
+
+                // A live native peer means only the AX handle died. Preserve the logical
+                // window and its exact tree position while the app actor reacquires AX.
+                let mut outcome = if platform_window_alive {
                     window_workflow::handle_window_invalidated(
                         &mut self.state,
                         &self.transaction_manager,
@@ -1321,7 +1329,32 @@ impl Reactor {
                 );
             }
             Event::WindowFrameChanged(wid, new_frame, last_seen, requested, mouse_state) => {
-                let effective_mouse_state = mouse_state.or_else(crate::sys::event::get_mouse_state);
+                let mission_control_active = self.is_mission_control_active();
+                let mut effective_mouse_state = mouse_state;
+                if matches!(
+                    window_workflow::classify_window_frame_change(
+                        &mut self.state,
+                        &self.transaction_manager,
+                        &mut self.drag_manager,
+                        wid,
+                        new_frame,
+                        last_seen,
+                        requested.0,
+                        &mut effective_mouse_state,
+                        mission_control_active,
+                    ),
+                    window_workflow::FrameChangeDisposition::Handled
+                ) {
+                    let mut outcome = EventOutcome::no_change();
+                    outcome.dispatch_mouse_up = effective_mouse_state
+                        == Some(crate::sys::event::MouseState::Up)
+                        && matches!(
+                            self.drag_manager.drag_state,
+                            DragState::Active { .. } | DragState::PendingSwap { .. }
+                        );
+                    outcome.focused_window = raised_window;
+                    return Ok(outcome);
+                }
                 let (server_id, old_frame) = self
                     .state
                     .windows
@@ -1359,19 +1392,14 @@ impl Reactor {
                         Some((screen.space?, screen.frame, screen.display_uuid_owned()))
                     })
                     .collect();
-                let mission_control_active = self.is_mission_control_active();
                 let mut outcome = window_workflow::handle_window_frame_changed(
                     &mut self.state,
                     &mut self.layout_manager,
-                    &self.transaction_manager,
                     &mut self.drag_manager,
                     window_workflow::WindowFrameChangedPayload {
                         window: wid,
                         new_frame,
-                        last_seen,
-                        requested,
                         mouse_state: effective_mouse_state,
-                        mission_control_active,
                         old_space,
                         new_space,
                         old_space_active,
