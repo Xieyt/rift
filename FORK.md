@@ -536,27 +536,45 @@ but `.git/rr-cache` is **local-only and uncommitted**: it protects one clone and
 nothing else. rerere pays off for repeated *small* syncs; §4 below is the durable
 store.
 
-**Routine (merge):**
+**Routine (merge) — use the recipes; they encode this procedure:**
+
+```bash
+just upstream-status   # drift + structural tripwires: does this need syncing NOW?
+just sync              # checkpointed merges, one per upstream commit, gated on build
+just test              # curated suite
+git push origin xieyt/5
+```
+
+`just sync` merges **one upstream commit per checkpoint, oldest first**, running
+`cargo check --workspace --all-targets` after each, and stops at the first
+conflict or broken build so you resolve one coherent step at a time. Re-run it to
+continue; `git merge --abort` to back out a step. It refuses to start on a dirty
+tree.
+
+> Until 2026-08-10 `just sync` did `git rebase upstream/main` — the strategy this
+> section explicitly rejects — plus an unannounced `git push`. If you remember the
+> recipe as a rebase, that memory is the old one. Trust this section; the recipe now
+> agrees with it.
+
+The manual equivalent, when you want to drive a single checkpoint by hand:
 
 ```bash
 git fetch upstream
-
-# keep the clean mirror in sync (fast-forward, never conflicts)
-git push origin upstream/main:main
-
-git checkout xieyt/5                    # our working branch
+git push origin upstream/main:main      # keep the clean mirror in sync (fast-forward)
+git checkout xieyt/5
 git log --oneline HEAD..upstream/main   # more than a handful? pick checkpoints
-
-# once per checkpoint (or just `upstream/main` for a small delta):
 git merge <checkpoint-sha>
 # ...resolve conflicts if any (see §4), then:
 git add -A
 cargo check --workspace --all-targets   # --lib misses the test targets AND crates/
-just test                               # our curated suite must pass
+just test                              # our curated suite must pass
 git commit                              # finalize this stage's merge commit
-
-git push origin xieyt/5                 # no --force needed
 ```
+
+When a test goes red during a sync, establish *whose* bug it is before debugging it:
+`just upstream-test <TEST>` runs it on a detached pristine `upstream/main` worktree.
+Upstream has shipped a red test at its own tip at least once (§8.3 of
+`UPSTREAM-SYNC.md`).
 
 **Rebase alternative** (only for upstreaming / a linear history):
 
@@ -732,32 +750,42 @@ just test-all        # whole lib suite — only in a real GUI session
 ```
 
 `just test` runs through `nix develop` so it links even without direnv. It is a
-curated allowlist, currently **359 tests** (327 before the 2026-08 upstream merge;
-352 after it; 359 once the hint-bar filter below was added). Four things to know:
+curated allowlist, currently **363 tests** (327 before the 2026-08 upstream merge;
+352 after it; 359 once the hint-bar filter was added; 363 after the 2026-08-10
+sync). Four things to know:
 
-- **One known upstream failure:** `topology_change_clears_stale_pending_hide_target_before_next_workspace_layout`
-  panics on clean `upstream/main` too (re-verified 2026-08-08 by running it in a
-  pristine `upstream/main` worktree). `just test` skips it — it is not ours, don't
-  chase it.
+- **Two known upstream failures**, both re-verified by running them on a pristine
+  `upstream/main` worktree — neither is ours, don't chase them. Use
+  `just upstream-test <TEST>` to re-check either one, or any future red test:
+  - `topology_change_clears_stale_pending_hide_target_before_next_workspace_layout`
+  - `ax_invalidation_after_quarantine_release_preserves_live_layout_state` — arrived
+    with upstream's `1e3a898`; the model survives an AX-element swap but the layout
+    node does not. See UPSTREAM-SYNC.md §8.3.
 - **Window-server tests need a real GUI session.** Tests touching SkyLight
   (`SLS…`) abort with an objc weak-reference error in a headless/agent shell,
   so `just test` excludes them; use `just test-all` from your logged-in desktop.
-  `just test-all` therefore still fails on the known upstream test above — that is
+  `just test-all` therefore still fails on the known upstream tests above — that is
   expected, not a regression.
-- Panics in the test binary currently *abort* instead of unwinding
-  (`failed to initiate panic`), so one failing test kills the whole run with no
-  attributable failure — which is why `just test` uses a curated allowlist rather
-  than the full suite. This bit us **three times** during the 2026-08 merge; it is
-  the open half of §8 stability item 1. Workaround when it happens:
-  `cargo test --lib -- <module> --test-threads=1` and read the last test printed —
-  that is the one that aborted.
-- **The allowlist hole is closed.** Its six module filters are now `layout_engine`,
-  `actor::raise_manager`, `actor::reactor::tests`, `common::config`,
-  `ui::stack_line`, **`ui::hints_bar`**. The last one was missing until
-  2026-08-08, so §2.E's six hint-bar geometry/click tests silently never ran under
-  `just test` even though §2.E claimed they did. If you add a new `ui::` or `sys::`
-  test module, add its filter here too — a curated allowlist fails silent by
-  design.
+- Panics in the test binary *abort* instead of unwinding (`failed to initiate
+  panic`), so one failing test kills the whole run — which is why `just test` uses a
+  curated allowlist rather than the full suite. This bit us three times during the
+  2026-08 merge; it is the open half of §8 stability item 1. **The assertion message
+  is not lost, though** — an earlier version of this note said the failure was
+  unattributable, which is only half right. `--nocapture` prints the panic *before*
+  the abort:
+  `cargo test --lib -- <test> --test-threads=1 --nocapture`
+  Without it you learn which test died; with it you learn why.
+- **The allowlist hole is closed mechanically, not by promise.** Its seven module
+  filters are `layout_engine`, `actor::raise_manager`, `actor::reactor::tests`,
+  `common::config`, `ui::stack_line`, `ui::hints_bar`, `ui::menu_bar`. The last three
+  were each missing at some point — §2.E's hint-bar tests silently never ran for
+  months while §2.E claimed they did, and `ui::menu_bar` arrived with upstream's
+  `abdbcc8` carrying four tests that would have gone the same way. Two doc notes
+  asking the next person to remember failed twice, so the invariant is now a test:
+  `common::config::tests::just_test_allowlist_classifies_every_test_module` parses
+  this recipe out of the `justfile` and asserts every `#[cfg(test)] mod` in `src/` is
+  either allowlisted or in its explicit `GUI_OR_DEFERRED` list. Add a test module
+  without classifying it and that test fails by name.
 
 **Install / test on this Mac.** Real builds and the running WM are driven via
 `just` (see the `justfile`):
@@ -832,6 +860,15 @@ clean** (0 hunks), and our tree had 47 hunks — all in fork-owned files, all re
 now fixed. The 411 hunks the old bare recipe reported were the *stable*-rustfmt
 phantom (1.8.0-stable), not baseline drift. So: if `just fmt-check` reports drift,
 it is **yours** — fix it. Do not dismiss it.
+
+**`just clippy` does not pass, and that is upstream's debt — not a gate you broke.**
+Measured 2026-08-10: 8 errors, all in files byte-identical to `upstream/main` and
+untouched by our merges — 4 in `src/sys/dispatch.rs` (`not_unsafe_ptr_arg_deref`), 1
+in `src/actor/mission_control_observer.rs` (`never_loop`), plus their knock-ons.
+Deliberately not fixed: the fixes are signature changes to upstream's `unsafe`
+boundary and would conflict on every future sync for zero benefit to us. So `clippy`
+is a *read-it-yourself* lint here, not a pass/fail gate — but check that any new
+error names a file **we** own before dismissing it. If the count moves off 8, look.
 
 ### Benchmarking a perf change (counter-based A/B)
 

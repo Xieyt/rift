@@ -4,8 +4,9 @@ Companion to `FORK.md`. `FORK.md` says *what we carry and why*; this says *how w
 absorbed the 38 upstream commits we were behind*, commit by commit, with the
 verdict each one got and what it actually cost.
 
-Written as a plan on 2026-08-05 and executed the same day. It is kept as the
-reference for the **next** sync, not as history for its own sake:
+Written as a plan on 2026-08-05 and executed the same day; §8 records the follow-up
+sync on 2026-08-10. Kept as the reference for the **next** sync, not as history for
+its own sake:
 
 - **§3** — why each of the 38 commits was taken. Unchanged verdicts; notes now
   say where the predicted rework differed from the real one.
@@ -13,20 +14,30 @@ reference for the **next** sync, not as history for its own sake:
   were wrong; §4.7 is what live testing found afterwards.** Read both before
   trusting anything else here.
 - **§6** — per-stage outcome log (conflicts, resolutions, gates).
-- **§7** — the sync cadence the measurements actually support.
+- **§7** — the sync cadence the measurements support. **§8.4 is that rule tested
+  once, and the three `justfile` gaps closing it exposed** — including a `just sync`
+  that implemented the strategy §3 explicitly rejected.
+- **§8** — the 2026-08-10 sync (11 commits, 2 hunks). Start here if you are about
+  to sync: it is the shortest complete worked example, and §8.3 covers what to do
+  when upstream ships a failing test.
 
-## 0. Status — merge complete, and one follow-on since
+## 0. Status — two syncs complete; §8 is the second one
 
 ```
 branch                    xieyt/5
 behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     44
-upstream tip merged       1de4d09  (the 38-commit backlog ended at 6c64d8b)
-curated tests             327 -> 352 (merge) -> 353 (guard test) -> 359 (allowlist fix)
+ahead                     49
+upstream tip merged       7829780  (2026-08-10; the 38-commit backlog ended at 6c64d8b,
+                                   then 1de4d09, now this)
+curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
+                              -> 363 (2026-08-10 sync: +4 ui::menu_bar, -1 upstream-red, +1 guard)
 cargo check               --workspace --all-targets clean
 just fmt-check            clean
 nix build .#rift          succeeds; .app installed and exercised live
 ```
+
+**§8 records the 2026-08-10 sync (11 commits).** It is the first sync run under §7's
+cadence rule, so it is also the test of whether that rule works — see §8.4.
 
 Landed as five chronological checkpoint merges, one per stage. The checkpoint
 SHAs are *upstream* commits; the merge commits on `xieyt/5` are separate:
@@ -809,3 +820,148 @@ fresh resolutions protect exactly one machine and vanish with the clone. Until t
 changes, **§4 of this file is the durable resolution store** — when you resolve
 something non-obvious, write it into `FORK.md` §4's playbook rather than trusting
 the cache to replay it.
+
+---
+
+## 8. Second sync — 2026-08-10, `1de4d09` → `7829780` (11 commits)
+
+```
+behind before        11        ahead 47
+conflict hunks       2         (both additive, both in §4's documented pattern)
+hand-resolved files  2         src/actor/app.rs, src/common/config.rs
+merge commit         5030a4c
+curated tests        359 -> 363
+```
+
+### 8.1 Verdicts
+
+| Commit | Subject | Verdict |
+|---|---|---|
+| `9fea58a` | chore: beautify menubar | TAKE — `src/ui/menu_bar.rs` only; we own nothing there |
+| `1e3a898` | fix: make ax destroy not be authoritative (#440) | TAKE — but ships a red test, see §8.3 |
+| `8f882fc` | chore: titlechanged on window elem | TAKE — verified live, see §8.2 |
+| `261a980` | feat: unstripped release profile | TAKE — inert: adds `[profile.profiling]`, does not touch `[profile.release]`, and the nix build selects `release` |
+| `2484722` | fix: this didnt actually do anything | TAKE — deletes an unbalanced `SLSDisableUpdate`/`SLSReenableUpdate` pair that was never a real optimization |
+| `6eff0b8` | perf: optimized enhancedui handling | TAKE — the one conflict; see below |
+| `02f16c3` | perf: fast path for frame ack | TAKE — drops a synchronous WindowServer `get_mouse_state()` from every frame event |
+| `abdbcc8` | perf: only rebuild menu bar once | TAKE — also removes a `read_dir` from the menu update path |
+| `b2c26bb` | fix: make propagation more aggressive | TAKE the constant; see §8.2 |
+| `1b69d8e` | perf: eliminate redundant work from mouse/gesture hot paths | net-zero pair ↓ |
+| `7829780` | Revert of `1b69d8e` | Upstream reverted its own commit two days later |
+
+**The `1b69d8e`/`7829780` pair is why you merge in chronological checkpoints and do
+not cherry-pick.** `1b69d8e` appends a `FocusConfirmation` field to `Request::Raise`
+and `struct RaiseRequest` — head-on with our §2.B `activate` 5-tuple — and `7829780`
+takes it back out. Merging `upstream/main` as a range absorbs both and lands exactly
+where we started; nothing survived in-tree (verified: no `FocusConfirmation`,
+`MOUSE_MOVE_INTERVAL_`, `resolve_mouse_window_with`, or `is_scrolling_mode_at_event`
+anywhere in `src/`). Picking commits individually would have cost a 6-tuple
+migration and then a revert of it, for zero net change.
+
+### 8.2 The two conflicts, and the one live decision
+
+**`src/actor/app.rs` — `6eff0b8`.** Upstream's new `impl Request {
+disables_enhanced_ui() }` inserts into the gap *between* our two fork-modified
+lines (`Request::Raise(.., Quiet, bool)` and `struct RaiseRequest(.., Quiet,
+bool)`). Purely additive: take their block, keep both 5-tuples. This is §4.1's
+pattern with no new twist. `6eff0b8` also moves EnhancedUI suppression from a
+per-call wrapper to a refcounted `EnhancedUi` on `State` — worth knowing because
+correctness now depends on `acquire`/`release` balancing across async boundaries,
+which is why upstream also added `restore_if_needed` to `Drop for State`.
+
+**`src/common/config.rs` — `b2c26bb`.** Upstream lowered
+`default_overscroll_threshold()` from `0.625` to `0.15`; our `default_scroll_speed()`
+sits on the next line. Took theirs, kept ours. This looks like a scrolling-feel
+change and is not, which is the only reason it was safe to take blind:
+`workspace_switch_threshold` has exactly one reader (`scroll_by_delta`), the scroll
+offset is clamped and stored *before* the threshold branch, and the threshold's only
+effect is the `Option<Direction>` that becomes `EventResponse::boundary_hit` —
+consumed at one site gated on `propagate_to_workspace_swipe`, which is `false` in
+both `dev-config.toml` and the shipped `rift.default.toml`. Pixel offsets are
+bit-identical either way.
+
+**`8f882fc` needed a live check, not a code read.** It moves `TitleChanged` from
+`APP_NOTIFICATIONS` to `WINDOW_NOTIFICATIONS`. That is a real hazard, because
+`register_window_notifications` returns `false` on the *first* notification that
+fails and `register_window` then returns `None` — so if any window's AX element
+rejected `kAXTitleChangedNotification`, that window would silently stop being
+tracked and tiled. Verified on the live desktop instead of assumed: 8 windows across
+6 apps still tracked after install, and titles still update live (a controlled
+generator emitting OSC-0 sequences read back through `rift-cli query windows` as
+`TT-7 → TT-29 → TT-50 → TT-72`). No regression.
+
+> Measuring that needs care: `alacritty --title X` **locks** the title and ignores
+> OSC sequences, so the obvious version of this experiment silently measures nothing.
+> The first run "showed" a frozen title and looked like a regression; it was the
+> probe that was broken.
+
+### 8.3 Upstream shipped a red test — how that was established
+
+`1e3a898` adds/modifies
+`ax_invalidation_after_quarantine_release_preserves_live_layout_state`, and it fails
+at upstream's own tip. Its first four assertions pass (invalidation preserves the
+window snapshot, workspace ownership, membership, and the layout node); the last one
+fails — after rediscovery the window is no longer in `calculate_layout`, i.e. the
+model survives an AX-element swap but the layout node does not. A window whose AX
+element is replaced while it sits on a background workspace loses its tiling
+position.
+
+It is **not** our regression, and that was established rather than assumed by
+running it on a detached `upstream/main` worktree. That check is now
+`just upstream-test <TEST>` (§8.4) instead of a hand-built worktree, and the test is
+in the `just test` skip list next to `topology_change_clears_stale_pending_hide_target`
+with the reason recorded in the recipe comment.
+
+**Panics in this test binary abort instead of unwinding, but the assertion message
+is not actually lost** — `FORK.md` §8 said "no attributable failure", which is only
+half true. `--nocapture` prints the panic message *before* the abort:
+
+```bash
+cargo test --lib -- <test> --test-threads=1 --nocapture
+```
+
+Without it you learn which test died; with it you learn why. `just upstream-test`
+passes it for this reason.
+
+### 8.4 §7's cadence rule, tested — and what it was missing
+
+This is the first sync run under §7 ("sync on structural change, not on a
+calendar"), and the numbers support it: **11 commits, 3 days, 2 additive hunks, zero
+design decisions.** Compare the backlog: 38 commits, 16 hunks, five staged
+checkpoints. Same project, same fork surface; the difference is elapsed time.
+
+What §7 got wrong was not the rule but its *form* — it wrote the tripwires as shell
+snippets in prose, which nobody runs. Three gaps closed, all in the `justfile`:
+
+1. **`just sync` implemented the strategy §3 rejected.** It ran `git rebase
+   upstream/main` plus a `git push origin upstream/main:main`. §3 chose merging
+   precisely because rebasing replays our 47 commits against every upstream step.
+   Anyone trusting the recipe over the prose would have done the wrong thing. It now
+   merges in chronological checkpoints, gated on `cargo check` per step, and refuses
+   on a dirty tree.
+2. **`just upstream-status` now runs the §7 tripwires** rather than printing a commit
+   count — crate/workspace changes, added fields on `EventResponse`/`EventOutcome`/
+   `Column`, `calculate_layout`/`update_layout` signature changes, and commit counts
+   against our three churniest shared files.
+3. **`just upstream-test TEST`** answers "our regression or theirs" in one command.
+
+### 8.5 The allowlist hole, closed mechanically
+
+`abdbcc8` ships four tests in a new `ui::menu_bar` module. They would have silently
+never run — the **third** occurrence of this exact failure (`ui::stack_line` and
+`ui::hints_bar` were the first two, and `FORK.md` §2.E claimed coverage that did not
+exist for months). The response to the first two was a doc note asking the next
+person to remember. That failed twice, so it is now a test:
+`common::config::tests::just_test_allowlist_classifies_every_test_module`.
+
+It parses the `test:` recipe out of the `justfile` via `include_str!`, walks `src/`
+for every `#[cfg(test)] mod`, and asserts each one is either allowlisted or named in
+an explicit `GUI_OR_DEFERRED` list. The invariant is *classification*, not
+inclusion — 175 tests are excluded on purpose (they need a real GUI session, and
+`bin::rift-cli` is not even reachable from `cargo test --lib`). A new module in
+neither list fails loudly.
+
+Proven by mutation, not just by passing: deleting `ui::menu_bar` from the recipe
+makes it report `["ui::menu_bar::layout_library_tests"]`. It also immediately found
+two modules nobody had classified (`bin::rift-cli::tests`,
+`ui::mission_control::tests`).

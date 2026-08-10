@@ -317,15 +317,99 @@ probe *ARGS:
 # fork maintenance (see FORK.md)
 # ---------------------------------------------------------------------------
 
-# how far from upstream + what we carry on top
+# UPSTREAM-SYNC.md §7: sync on structural change, not on a calendar. Measured: 13
+# flat commits cost 0 hand-resolved hunks; single structural commits cost 6 each.
+# A commit count tells you nothing, so this reports the tripwires instead.
+# drift vs upstream + structural tripwires (decides whether to sync now)
 upstream-status:
-    git fetch upstream
-    @echo "behind / ahead vs upstream/main:"
-    @git rev-list --left-right --count upstream/main...HEAD
-    @git log --oneline upstream/main..HEAD
+    #!/usr/bin/env bash
+    set -uo pipefail
+    git fetch upstream --quiet
+    echo "=== behind / ahead vs upstream/main (left=new upstream, right=ours) ==="
+    git rev-list --left-right --count upstream/main...HEAD
+    behind=$(git rev-list --count HEAD..upstream/main)
+    if [ "$behind" -eq 0 ]; then echo "up to date."; exit 0; fi
+    echo "=== $behind new upstream commit(s) ==="
+    git log --oneline --no-merges HEAD..upstream/main
+    echo
+    echo "=== structural tripwires — ANY hit means sync now, not later ==="
+    hit=0
+    if ! git diff --quiet HEAD..upstream/main -- Cargo.toml Cargo.lock crates/; then
+      echo "  [!] crate/workspace change:"
+      git diff --stat HEAD..upstream/main -- Cargo.toml Cargo.lock crates/ | sed 's/^/      /'
+      hit=1
+    fi
+    # Field added to a struct our fork extends (EventResponse.activate,
+    # Column.tabbed/.active) — every such field forces a sweep of our literals.
+    fields=$(git log -p HEAD..upstream/main -- src/layout_engine/engine.rs \
+      src/actor/reactor/events/outcome.rs src/layout_engine/systems/scrolling.rs 2>/dev/null \
+      | grep -cE '^\+ +pub (changed|activate|tabbed|active|width_overridden|boundary_hit|raise_windows|focus_window)\b')
+    if [ "${fields:-0}" -gt 0 ]; then
+      echo "  [!] $fields added field(s) on EventResponse/EventOutcome/Column — expect a literal sweep"
+      hit=1
+    fi
+    for f in src/layout_engine/systems/scrolling.rs src/actor/reactor.rs src/actor/app.rs; do
+      n=$(git log --oneline HEAD..upstream/main -- "$f" | wc -l | tr -d ' ')
+      [ "$n" -gt 0 ] && echo "  [.] $n commit(s) touch $f (our churniest shared files)"
+    done
+    if git log -p HEAD..upstream/main -- src/layout_engine/ 2>/dev/null \
+      | grep -qE '^[-+].*fn (calculate_layout|update_layout|create_layout)\('; then
+      echo "  [!] calculate_layout/update_layout/create_layout signature changed"
+      hit=1
+    fi
+    [ "$hit" -eq 0 ] && echo "  none — a batched merge is fine (still checkpoint it)"
+    echo
+    echo "next: just sync   (checkpointed merges, NOT a rebase — see UPSTREAM-SYNC.md §3)"
 
-# rebase our branch onto latest upstream (then resolve, `just check`, force-push)
+# Deliberately a merge, not a rebase: §3 rejected rebasing because it replays our
+# 47 commits against every upstream step and re-resolves the same conflicts; merge
+# resolves each once and `rerere` records it. Rebase is for upstreaming a PR only.
+#
+# Stops at the first checkpoint that fails to build so you resolve one coherent step
+# at a time. Re-run to continue; `git merge --abort` to back out.
+# merge upstream in chronological checkpoints, each gated on a clean build
 sync:
-    git fetch upstream
-    git push origin upstream/main:main
-    git rebase upstream/main
+    #!/usr/bin/env bash
+    set -uo pipefail
+    git fetch upstream --quiet
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+      echo "working tree dirty — commit or stash first"; exit 1
+    fi
+    behind=$(git rev-list --count HEAD..upstream/main)
+    if [ "$behind" -eq 0 ]; then echo "already up to date."; exit 0; fi
+    echo "$behind commit(s) behind; merging in checkpoints"
+    # One checkpoint per upstream commit, oldest first. Upstream ordering matters:
+    # later commits depend on earlier ones (and sometimes revert them).
+    for sha in $(git rev-list --reverse HEAD..upstream/main); do
+      subject=$(git log -1 --format='%h %s' "$sha")
+      echo "=== merging $subject"
+      if ! git merge --no-edit "$sha"; then
+        echo
+        echo "CONFLICT at $subject"
+        git diff --name-only --diff-filter=U | sed 's/^/  /'
+        echo "resolve, then: git commit && just check && just test && just sync"
+        exit 1
+      fi
+      if ! cargo check --workspace --all-targets --message-format=short >/dev/null 2>&1; then
+        echo "BUILD BROKE at $subject — fix on top, then re-run just sync"; exit 1
+      fi
+    done
+    echo "=== all $behind commit(s) merged; running tests ==="
+    just test
+
+# Answers "our regression or theirs" without guessing — the question every red test
+# during a sync raises. Builds a detached worktree at upstream/main, runs TEST there.
+# e.g. `just upstream-test ax_invalidation_after_quarantine_release_preserves_live_layout_state`
+# does TEST also fail on pristine upstream? (our regression, or upstream's)
+upstream-test TEST:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    git fetch upstream --quiet
+    wt=$(mktemp -d -t rift-pristine)
+    trap 'git worktree remove --force "$wt" >/dev/null 2>&1 || true' EXIT
+    git worktree add -f --detach "$wt" upstream/main >/dev/null 2>&1
+    echo "=== {{TEST}} on pristine upstream/main ($(git rev-parse --short upstream/main)) ==="
+    # --nocapture matters: panics abort instead of unwinding in this test binary, and
+    # without it the assertion message is swallowed and you only learn WHICH test died.
+    (cd "$wt" && nix develop {{justfile_directory()}} -c \
+      cargo test --lib -- {{TEST}} --test-threads=1 --nocapture 2>&1 | tail -20)

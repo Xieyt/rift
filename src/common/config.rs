@@ -1962,6 +1962,146 @@ mod tests {
         assert_eq!(move_focus_binds, 4, "expected the four bare move_focus binds");
     }
 
+    /// Guards the `just test` allowlist against silent coverage loss.
+    ///
+    /// `just test` runs a *curated* filter list, so a new `#[cfg(test)] mod` that
+    /// nobody adds a filter for simply never runs — and reads as covered. That has
+    /// now happened three times: `ui::stack_line` and `ui::hints_bar` were absent for
+    /// months while `FORK.md` §2.E claimed their geometry tests ran, and
+    /// `ui::menu_bar` arrived with upstream's `abdbcc8` carrying four tests that
+    /// would have gone the same way.
+    ///
+    /// The invariant is *classification*, not inclusion: many modules are excluded on
+    /// purpose because they need a real GUI session (SkyLight / window-server tests
+    /// abort with an objc weak-reference error in a headless shell — see `just
+    /// test-all`). So every test module must be either allowlisted in the `test:`
+    /// recipe or named in `GUI_OR_DEFERRED` below. A module in neither fails here,
+    /// which is the loud failure the recipe cannot produce by itself.
+    ///
+    /// Lives in this module because the guard is only useful if it runs, and
+    /// `common::config` is itself allowlisted.
+    #[test]
+    fn just_test_allowlist_classifies_every_test_module() {
+        /// Test modules deliberately outside `just test`. Removing an entry here
+        /// without adding a `test:` filter re-opens the silent-coverage hole.
+        const GUI_OR_DEFERRED: &[&str] = &[
+            // Not reachable from `cargo test --lib` at all: `src/bin/rift-cli.rs` is a
+            // separate bin target, so `--lib` never compiles it. `just test-all` does
+            // not cover it either; only a bare `cargo test` would.
+            "bin::rift-cli",
+            // Need a real GUI session / live window server. Headless these abort with
+            // an objc weak-reference error rather than failing, which is why they are
+            // out of the fast recipe — see `just test-all` and FORK.md §8.
+            "actor::app",
+            "actor::drag_swap",
+            "actor::event_tap",
+            "actor::menu_bar",
+            "actor::mission_control",
+            "actor::notification_center",
+            "actor::reactor::animation",
+            "actor::reactor::events",
+            "actor::reactor::main_window",
+            "actor::reactor::managers",
+            "actor::reactor::replay",
+            "actor::reactor::SpaceEventHandler",
+            "actor::reactor::testing",
+            "actor::spaces",
+            "actor::stack_line",
+            "actor::window_notify",
+            "actor::wm_controller",
+            "common::collections",
+            "common::log",
+            "ipc",
+            "model",
+            "sys",
+            "ui::mission_control",
+        ];
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let recipe = include_str!("../../justfile")
+            .lines()
+            .find(|line| line.contains("cargo test --lib --") && line.contains("--skip"))
+            .expect("justfile must still have a `test:` recipe running `cargo test --lib`");
+
+        // Filters sit between `--lib --` and the first `--skip`.
+        let filters: Vec<&str> = recipe
+            .split_once("--lib --")
+            .expect("recipe shape changed")
+            .1
+            .split("--skip")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert!(!filters.is_empty(), "the `test:` recipe names no filters");
+
+        // `a::b` covers `a::b::tests` but must not let `ui::menu` cover `ui::menu_bar`.
+        let covers = |prefix: &str, module: &str| {
+            module == prefix
+                || module.strip_prefix(prefix).is_some_and(|rest| rest.starts_with("::"))
+        };
+
+        let mut unclassified = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("source must be readable");
+
+                // `src/a/b.rs` -> `a::b`; `src/a/mod.rs` -> `a`; `src/lib.rs` -> ``.
+                let rel = path.strip_prefix(&root).expect("under src/").with_extension("");
+                let mut owner: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                if owner.last().is_some_and(|last| last == "mod" || last == "lib") {
+                    owner.pop();
+                }
+
+                // Each `#[cfg(test)]` guarding a `mod NAME` is one test module.
+                for (idx, line) in body.lines().enumerate() {
+                    if line.trim_start() != "#[cfg(test)]" {
+                        continue;
+                    }
+                    let Some(name) = body
+                        .lines()
+                        .skip(idx + 1)
+                        .find(|next| !next.trim_start().starts_with("#["))
+                        .and_then(|decl| decl.trim_start().strip_prefix("mod "))
+                        .and_then(|rest| rest.split([' ', ';', '{']).next())
+                    else {
+                        continue; // `#[cfg(test)] use ...` and friends
+                    };
+                    let module = owner
+                        .iter()
+                        .map(String::as_str)
+                        .chain(std::iter::once(name))
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    let classified =
+                        filters.iter().chain(GUI_OR_DEFERRED).any(|prefix| covers(prefix, &module));
+                    if !classified {
+                        unclassified.push(module);
+                    }
+                }
+            }
+        }
+
+        unclassified.sort();
+        assert!(
+            unclassified.is_empty(),
+            "these test modules are in neither the `just test` allowlist nor \
+             GUI_OR_DEFERRED, so they silently never run: {unclassified:#?}",
+        );
+    }
+
     #[test]
     fn layout_insertion_point_supports_global_default_and_per_mode_override() {
         let settings: LayoutSettings = toml::from_str(
