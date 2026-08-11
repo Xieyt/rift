@@ -540,21 +540,37 @@ store.
 
 ```bash
 just upstream-status   # drift + structural tripwires: does this need syncing NOW?
-just sync              # checkpointed merges, one per upstream commit, gated on build
-just test              # curated suite
+just sync              # one range merge, gated on build + tests
 git push origin xieyt/5
 ```
 
-`just sync` merges **one upstream commit per checkpoint, oldest first**, running
-`cargo check --workspace --all-targets` after each, and stops at the first
-conflict or broken build so you resolve one coherent step at a time. Re-run it to
-continue; `git merge --abort` to back out a step. It refuses to start on a dirty
-tree.
+`just sync` merges the **whole range at once** (`sync-to upstream/main`), then gates
+on `cargo check --workspace --all-targets` and `just test`. It refuses to start on a
+dirty tree.
 
-> Until 2026-08-10 `just sync` did `git rebase upstream/main` — the strategy this
-> section explicitly rejects — plus an unannounced `git push`. If you remember the
-> recipe as a rebase, that memory is the old one. Trust this section; the recipe now
-> agrees with it.
+**Why a range merge and not commit-by-commit** — this is counter-intuitive, and the
+first version of the recipe got it wrong. A range merge is the *smaller* conflict
+set, because git's 3-way merge over the range absorbs upstream's internal churn,
+including commits it later reverts. Measured on `b31dddf..7829780`:
+
+| | conflicted files |
+|---|---|
+| range merge (what the recipe does) | **2**, both additive |
+| commit-by-commit | **7** at `1b69d8e` alone |
+
+`1b69d8e` rewrites `Request::Raise` to carry `FocusConfirmation` exactly where our
+fork carries `activate: bool` (§2.B) — so stepping commit-by-commit makes you
+resolve the fork's most delicate feature across 7 files, and then `7829780` reverts
+the lot. Same destination, all the risk.
+
+Still too big to resolve in one bite? Pick a checkpoint SHA: `just sync-to <sha>`
+(UPSTREAM-SYNC.md §6 split the 38-commit backlog into 5 hand-picked checkpoints).
+Choose boundaries that do **not** split a revert pair, or you buy the problem above.
+
+> Two corrections, both from 2026-08-10. Until that day `just sync` did `git rebase
+> upstream/main` — the strategy this section explicitly rejects — plus an unannounced
+> `git push`. Its replacement then merged commit-by-commit, which is the trap
+> described above. If you remember either, the memory is stale.
 
 The manual equivalent, when you want to drive a single checkpoint by hand:
 

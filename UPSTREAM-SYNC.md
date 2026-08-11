@@ -942,8 +942,9 @@ snippets in prose, which nobody runs. Three gaps closed, all in the `justfile`:
    upstream/main` plus a `git push origin upstream/main:main`. §3 chose merging
    precisely because rebasing replays our 47 commits against every upstream step.
    Anyone trusting the recipe over the prose would have done the wrong thing. It now
-   merges in chronological checkpoints, gated on `cargo check` per step, and refuses
-   on a dirty tree.
+   merges, gates on build + tests, and refuses on a dirty tree. (Its *first*
+   replacement merged commit-by-commit, which is its own trap — corrected the same
+   day, see §9.4.)
 2. **`just upstream-status` now runs the §7 tripwires** rather than printing a commit
    count — crate/workspace changes, added fields on `EventResponse`/`EventOutcome`/
    `Column`, `calculate_layout`/`update_layout` signature changes, and commit counts
@@ -978,7 +979,8 @@ two modules nobody had classified (`bin::rift-cli::tests`,
 ```
 behind before        3         ahead 49
 conflict hunks       0         (all three auto-merged)
-merge commits        d92cb5f, ed5a810, 112b563   (via `just sync`)
+merge commits        d92cb5f, ed5a810, 112b563   (via `just sync`, then still
+                                                  commit-by-commit — see §9.4)
 curated tests        363 -> 370
 ```
 
@@ -1040,3 +1042,59 @@ async focus grab re-selected its column. Re-tested deterministically with every 
 targeting a non-selected column — 5/5 correct, so a no-op could not have passed.
 Same failure mode as the `alacritty --title` trap in §8.2: **when a check fails
 during a sync, confirm the probe before blaming the merge.**
+
+### 9.4 The new `just sync` was wrong twice — found by testing it, not using it
+
+Both §8's recipes shipped after exactly one happy-path run each. Pushed on whether
+they were *actually* correct, two real bugs turned up — in the recipe written to
+stop exactly this class of mistake.
+
+**Bug 1: it merged commit-by-commit.** That reads like the careful option and is the
+opposite. A range merge is the *smaller* conflict set, because git's 3-way merge
+absorbs upstream's internal churn — including commits upstream later reverts.
+Measured on `b31dddf..7829780` in a scratch worktree:
+
+| strategy | conflicted files |
+|---|---|
+| range merge | **2**, both additive, both replayed by `rerere` |
+| commit-by-commit | **7** at `1b69d8e` alone |
+
+`1b69d8e` rewrites `Request::Raise` to carry `FocusConfirmation` precisely where our
+fork carries `activate: bool`, and `7829780` reverts it. Stepping commit-by-commit
+means resolving §2.B across 7 files to arrive exactly where a range merge lands for
+free. §8.1 had *already written that down* as an argument against cherry-picking —
+and the recipe did it anyway. Now: `sync` = `sync-to upstream/main`, with
+`just sync-to <sha>` as the escape hatch for a backlog worth splitting (pick
+boundaries that do not split a revert pair).
+
+**Bug 2: bare `cargo` in the build gate.** It resolved fine in the blessed checkout
+(direnv) and failed with `cargo: command not found` in any git worktree — which is
+where a sync probe actually runs. This is the *identical* mechanism `FORK.md` §6
+records for `just fmt`, reintroduced in a recipe written the same afternoon as that
+correction was reaffirmed. Fixed: `nix develop {{justfile_directory()}} -c`, and the
+duplicated second `cargo check` (run only to count errors) collapsed into one.
+
+Also fixed: the recipe trusted `git merge`'s exit code, which is non-zero even when
+`rerere` replays a resolution and leaves the file clean. It now asks git what is
+unmerged and splits that list by whether conflict markers are actually present, so a
+`rerere` replay reports "review before staging" instead of sending you to fix a file
+with nothing left to fix.
+
+**`rerere` earned its keep here, contradicting §4.6's 0% verdict** — it replayed both
+`app.rs` and `config.rs` resolutions in the probe. §4.6's measurement stands for its
+own case (a large delta where upstream had moved the surrounding code); the corollary
+is narrower than it was written: rerere is useless across *big* gaps, valuable across
+*small repeated* ones. Which is one more argument for §7's cadence.
+
+Verified across all three paths before this was believed — reporting only, no claims
+from a single run:
+
+| case | setup | result |
+|---|---|---|
+| A | conflict `rerere` knows | reports "replayed … REVIEW before staging" |
+| B | novel conflict (`0.999` vs upstream's `0.15`) | reports "needs manual resolution (8 files)" |
+| C | clean range, bare worktree | merge → build → `just test` all run |
+
+Plus the dirty-tree refusal, and `just upstream-test` on a *passing* test (exit 0,
+temp worktree removed by its trap) — the path never exercised when it was written,
+since both real uses hit failing tests.

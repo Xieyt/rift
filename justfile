@@ -369,39 +369,86 @@ upstream-status:
     echo "next: just sync   (checkpointed merges, NOT a rebase — see UPSTREAM-SYNC.md §3)"
 
 # Deliberately a merge, not a rebase: §3 rejected rebasing because it replays our
-# 47 commits against every upstream step and re-resolves the same conflicts; merge
+# commits against every upstream step and re-resolves the same conflicts; merge
 # resolves each once and `rerere` records it. Rebase is for upstreaming a PR only.
 #
-# Stops at the first checkpoint that fails to build so you resolve one coherent step
-# at a time. Re-run to continue; `git merge --abort` to back out.
-# merge upstream in chronological checkpoints, each gated on a clean build
-sync:
+# Merges the WHOLE RANGE in one go rather than commit-by-commit. That is not
+# laziness, it is the cheaper conflict set: git's 3-way merge over a range absorbs
+# upstream's internal churn, including commits it later reverts. Measured on
+# b31dddf..7829780 — range merge: 2 additive hunks. Per-commit: `1b69d8e` alone
+# conflicts across 7 files and rewrites `Request::Raise` to carry
+# `FocusConfirmation` where our fork carries `activate: bool`, and then `7829780`
+# reverts the whole thing. You would resolve the fork's most delicate feature across
+# 7 files to reach exactly where you started.
+#
+# Too big to resolve in one bite? Pick a checkpoint SHA and use `just sync-to <sha>`
+# (UPSTREAM-SYNC.md §6 did the 38-commit backlog as 5 hand-picked checkpoints).
+# merge upstream in one range merge, gated on build + tests
+sync: (sync-to "upstream/main")
+
+# merge upstream up to a specific checkpoint sha (for a backlog worth splitting)
+sync-to target:
     #!/usr/bin/env bash
     set -uo pipefail
     git fetch upstream --quiet
     if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
       echo "working tree dirty — commit or stash first"; exit 1
     fi
-    behind=$(git rev-list --count HEAD..upstream/main)
-    if [ "$behind" -eq 0 ]; then echo "already up to date."; exit 0; fi
-    echo "$behind commit(s) behind; merging in checkpoints"
-    # One checkpoint per upstream commit, oldest first. Upstream ordering matters:
-    # later commits depend on earlier ones (and sometimes revert them).
-    for sha in $(git rev-list --reverse HEAD..upstream/main); do
-      subject=$(git log -1 --format='%h %s' "$sha")
-      echo "=== merging $subject"
-      if ! git merge --no-edit "$sha"; then
-        echo
-        echo "CONFLICT at $subject"
-        git diff --name-only --diff-filter=U | sed 's/^/  /'
-        echo "resolve, then: git commit && just check && just test && just sync"
-        exit 1
+    behind=$(git rev-list --count HEAD..{{target}} 2>/dev/null) || {
+      echo "unknown target: {{target}}"; exit 1; }
+    if [ "$behind" -eq 0 ]; then echo "already up to date with {{target}}."; exit 0; fi
+    echo "=== merging $behind commit(s) up to {{target}} ==="
+    git log --oneline --no-merges HEAD..{{target}} | sed 's/^/  /'
+    git merge --no-edit {{target}}
+    # NOTE: exit code is unreliable here — `git merge` still reports failure when
+    # rerere replays a resolution, even though it left the file clean. Ask git what
+    # is actually unmerged instead of trusting $?, then split that list: a path can
+    # be unmerged in the INDEX while already conflict-free in the WORKING TREE,
+    # which is exactly what a rerere replay looks like. Reporting those as "resolve
+    # this" sends you to inspect a file that has nothing left to fix.
+    unmerged=$(git diff --name-only --diff-filter=U)
+    if [ -n "$unmerged" ]; then
+      auto=""; manual=""
+      while IFS= read -r f; do
+        if grep -q '^<<<<<<<' "$f" 2>/dev/null; then manual="${manual}${f}"$'\n'
+        else auto="${auto}${f}"$'\n'; fi
+      done <<< "$unmerged"
+      echo
+      if [ -n "$auto" ]; then
+        echo "rerere replayed a known resolution for $(printf '%s' "$auto" | grep -c .) file(s) —"
+        echo "already conflict-free, but REVIEW before staging (upstream may have moved"
+        echo "the surrounding code since the resolution was recorded):"
+        printf '%s' "$auto" | sed 's/^/  /'
       fi
-      if ! cargo check --workspace --all-targets --message-format=short >/dev/null 2>&1; then
-        echo "BUILD BROKE at $subject — fix on top, then re-run just sync"; exit 1
+      if [ -n "$manual" ]; then
+        echo "needs manual resolution ($(printf '%s' "$manual" | grep -c .) file(s)):"
+        printf '%s' "$manual" | sed 's/^/  /'
       fi
-    done
-    echo "=== all $behind commit(s) merged; running tests ==="
+      echo
+      echo "This is the MINIMAL conflict set for this range — do not try to shrink it"
+      echo "by merging commit-by-commit, that is usually strictly worse (see comment)."
+      echo "Resolve (playbook: FORK.md §4), then:"
+      echo "  git add -A && git commit && just check && just test"
+      exit 1
+    fi
+    if ! git diff --quiet --cached 2>/dev/null || ! git diff --quiet 2>/dev/null; then
+      git commit --no-edit >/dev/null 2>&1 || true
+    fi
+    echo "=== merged cleanly; gating on build ==="
+    # `nix develop -c`, not bare `cargo`: --all-targets builds the test targets, which
+    # LINK against the SDK, and cargo itself is only on PATH inside the dev shell (or
+    # via direnv in the repo dir). A bare `cargo` here works in the blessed checkout
+    # and fails in every git worktree — the same trap FORK.md §6 records for
+    # `just fmt`. Run once and reuse the output; a second check just pays twice.
+    out=$(nix develop {{justfile_directory()}} -c \
+          cargo check --workspace --all-targets --message-format=short 2>&1)
+    errs=$(printf '%s\n' "$out" | grep -c 'error\[\|^error:')
+    if [ "${errs:-0}" -gt 0 ]; then
+      printf '%s\n' "$out" | grep -E 'error' | head -20
+      echo "BUILD BROKE ($errs error(s)) — fix on top of the merge, then re-run gates"
+      exit 1
+    fi
+    echo "=== build clean; running tests ==="
     just test
 
 # Answers "our regression or theirs" without guessing — the question every red test
