@@ -157,6 +157,45 @@ impl LayoutEngine {
         })
     }
 
+    /// The active workspace's columns, left -> right, each listing its windows in
+    /// stack/tab order. Empty for any layout mode that is not a column strip.
+    ///
+    /// Exists because consumers must not infer column structure from on-screen
+    /// frames. The scrolling layout parks columns that are scrolled off the right
+    /// edge at a shared sliver x, so grouping windows by frame position merges
+    /// distinct columns — which silently shifts every hint-bar letter after the
+    /// merge away from the `focus_column` index it is supposed to label.
+    pub fn active_workspace_columns(&self, space: SpaceId) -> Vec<Vec<WindowId>> {
+        let Some(active) = self.virtual_workspace_manager.active_workspace(space) else {
+            return Vec::new();
+        };
+        let Some(layout) = self.workspace_layouts.active(space, active) else {
+            return Vec::new();
+        };
+        let Some(workspace) = self.virtual_workspace_manager.workspace_info(space, active) else {
+            return Vec::new();
+        };
+        // For a column strip the tree is exactly one container per column, each
+        // holding its windows (see `ScrollingLayoutSystem::container_tree`).
+        workspace
+            .layout_system
+            .container_tree(layout)
+            .children
+            .into_iter()
+            .map(|column| {
+                column
+                    .children
+                    .into_iter()
+                    .filter_map(|node| node.window_id)
+                    // `NonZeroU32::new` rejects 0, which no live window uses.
+                    .filter_map(|w| {
+                        std::num::NonZeroU32::new(w.idx).map(|idx| WindowId { pid: w.pid, idx })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Get the active workspace ID for a space, ensuring initialization.
     fn active_workspace_id(&self, space: SpaceId) -> Option<VirtualWorkspaceId> {
         self.virtual_workspace_manager.active_workspace(space)

@@ -208,47 +208,51 @@ fn bound_scrolling_tiled_frames_to_screen(
     }
 }
 
-/// Group a space's laid-out frames into the scrolling strip's columns, keyed by
-/// rounded x-origin so a `BTreeMap` orders them left -> right.
+/// Is a strip column showing enough of itself on screen to count as visible?
 ///
-/// Two windows are excluded, and the first one is the subtle one:
+/// Frames are still the right source for *this* question — it is a question about
+/// pixels. Columns scrolled past the right edge are parked as ~10px slivers, so the
+/// threshold sits above that while still counting a half-revealed neighbour.
+/// Members with no entry in `frames` (a hidden tab) simply do not contribute.
 ///
-/// 1. **Windows outside the active workspace.** `layout` covers the whole *space*,
-///    and the scrolling layout parks every inactive workspace's windows off-screen
-///    at a shared x. Without this filter they all collapse into one phantom column
-///    that earns its own hint letter and a member-count badge — observed as chip
-///    "D" with badge "8" while the active workspace held just two windows.
-///    `bound_scrolling_tiled_frames_to_screen` filters on the same set.
-/// 2. **Floating windows**, which are not part of the strip at all.
-///
-/// Split out from `build_hints_bar_cells` so the rule is testable without standing
-/// up a whole `Reactor`.
-fn scrolling_strip_columns(
-    layout: &[(WindowId, CGRect)],
-    active_workspace_windows: &HashSet<WindowId>,
-    is_floating: impl Fn(WindowId) -> bool,
-) -> std::collections::BTreeMap<i64, Vec<(WindowId, CGRect)>> {
-    let mut columns: std::collections::BTreeMap<i64, Vec<(WindowId, CGRect)>> =
-        std::collections::BTreeMap::new();
-    for (wid, frame) in layout {
-        if !active_workspace_windows.contains(wid) || is_floating(*wid) {
-            continue;
+/// What frames must NOT decide is which windows form a column: parked columns share
+/// one x, so grouping by position merges them. That is what
+/// `LayoutEngine::active_workspace_columns` is for.
+fn strip_column_visibility(
+    members: &[WindowId],
+    frames: &HashMap<WindowId, CGRect>,
+    screen_left: f64,
+    screen_right: f64,
+) -> bool {
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    for wid in members {
+        if let Some(f) = frames.get(wid) {
+            xmin = xmin.min(f.origin.x);
+            xmax = xmax.max(f.origin.x + f.size.width);
         }
-        columns.entry(frame.origin.x.round() as i64).or_default().push((*wid, *frame));
     }
-    columns
+    if xmin > xmax {
+        return false;
+    }
+    (xmax.min(screen_right) - xmin.max(screen_left)).max(0.0) > 24.0
 }
 
-/// Build the scrolling strip cells: group the active workspace's tiled windows
-/// into columns by x-origin (ordered left -> right), then decorate each with a
-/// hint letter, its app, focus, and whether it lies inside the screen viewport.
+/// Build the scrolling strip cells: one per column of the active workspace, in the
+/// engine's own left -> right order, decorated with a hint letter, its app, focus,
+/// and whether it lies inside the screen viewport.
+///
+/// Cell index `i` is deliberately the same index `focus_column i` acts on, because
+/// the bar is the legend for the `hyper + a s d f g` binds. Deriving columns from
+/// frame x broke that: parked columns merged, so letters after a merge labelled the
+/// wrong column.
 fn build_hints_bar_cells(
     reactor: &Reactor,
     layout: &[(WindowId, CGRect)],
     screen: CGRect,
     hb: &crate::common::config::HintsBarSettings,
     groups: &[crate::layout_engine::engine::GroupContainerInfo],
-    active_workspace_windows: &HashSet<WindowId>,
+    columns: Vec<Vec<WindowId>>,
 ) -> Vec<crate::ui::hints_bar::ColumnCell> {
     let focused = reactor.layout_manager.layout_engine.focused_window();
     let resolve = |wid: WindowId| -> (String, String) {
@@ -267,25 +271,26 @@ fn build_hints_bar_cells(
         (label, title)
     };
 
-    let columns = scrolling_strip_columns(layout, active_workspace_windows, |wid| {
-        reactor.layout_manager.layout_engine.is_window_floating(wid)
-    });
+    // `columns` is one entry per ENGINE column, in the engine's own order, so cell
+    // index i is exactly the index `focus_column i` acts on.
+    let frames: HashMap<WindowId, CGRect> = layout.iter().copied().collect();
 
     let keys: Vec<char> = hb.keys.chars().collect();
     let screen_left = screen.origin.x;
     let screen_right = screen.origin.x + screen.size.width;
 
     let mut cells = Vec::with_capacity(columns.len());
-    for (i, (_x, wins)) in columns.into_iter().enumerate() {
-        let focused_here = focused.is_some_and(|f| wins.iter().any(|(w, _)| *w == f));
+    for (i, column) in columns.into_iter().enumerate() {
+        let wins: Vec<WindowId> = column
+            .into_iter()
+            .filter(|w| !reactor.layout_manager.layout_engine.is_window_floating(*w))
+            .collect();
+        let focused_here = focused.is_some_and(|f| wins.contains(&f));
 
         // A tabbed column shows up in `groups` (from the engine's tab_groups),
         // carrying the full window list + active tab even when the hidden tabs
-        // aren't in the visible frame list. Stacks aren't grouped, so fall back
-        // to the windows sharing this column's x.
-        let group = groups
-            .iter()
-            .find(|g| g.window_ids.iter().any(|w| wins.iter().any(|(x, _)| x == w)));
+        // aren't in the visible frame list.
+        let group = groups.iter().find(|g| g.window_ids.iter().any(|w| wins.contains(w)));
         let (member_ids, active, tabbed) = if let Some(g) = group {
             let count = g.window_ids.len().max(1);
             let active = if focused_here {
@@ -298,7 +303,7 @@ fn build_hints_bar_cells(
             };
             (g.window_ids.clone(), active.min(count - 1), true)
         } else {
-            let ids: Vec<WindowId> = wins.iter().map(|(w, _)| *w).collect();
+            let ids: Vec<WindowId> = wins.clone();
             let active = if focused_here {
                 ids.iter().position(|w| Some(*w) == focused).unwrap_or(0)
             } else {
@@ -319,15 +324,7 @@ fn build_hints_bar_cells(
         }
         let active = active.min(members.len() - 1);
 
-        let xmin = wins.iter().map(|(_, f)| f.origin.x).fold(f64::INFINITY, f64::min);
-        let xmax = wins
-            .iter()
-            .map(|(_, f)| f.origin.x + f.size.width)
-            .fold(f64::NEG_INFINITY, f64::max);
-        let overlap = (xmax.min(screen_right) - xmin.max(screen_left)).max(0.0);
-        // On screen if a usable strip is showing; > a parked sliver (~10px),
-        // and partial columns (a half-revealed neighbour) still count.
-        let visible = overlap > 24.0;
+        let visible = strip_column_visibility(&wins, &frames, screen_left, screen_right);
 
         cells.push(crate::ui::hints_bar::ColumnCell {
             hint: keys.get(i).map(|c| c.to_string()).unwrap_or_default(),
@@ -603,21 +600,20 @@ impl LayoutManager {
                                 == LayoutMode::Scrolling;
                         let cells = if is_scrolling {
                             let hb = &reactor.config.settings.ui.hints_bar;
-                            // Computed here rather than hoisted: only the scrolling
-                            // strip needs it, and only when the bar is enabled.
-                            let active_ws: HashSet<WindowId> = reactor
+                            // The engine's own column list, not a grouping of frames:
+                            // cell index must line up with `focus_column i`, and
+                            // off-strip columns share one parked x.
+                            let columns = reactor
                                 .layout_manager
                                 .layout_engine
-                                .windows_in_active_workspace(&reactor.state.windows, space)
-                                .into_iter()
-                                .collect();
+                                .active_workspace_columns(space);
                             build_hints_bar_cells(
                                 reactor,
                                 &layout,
                                 screen_frame,
                                 hb,
                                 &group_infos,
-                                &active_ws,
+                                columns,
                             )
                         } else {
                             Vec::new()
@@ -866,7 +862,7 @@ pub struct PendingSpaceChangeManager {
 mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-    use super::{HashSet, bound_frame_to_screen, scrolling_strip_columns};
+    use super::{HashMap, bound_frame_to_screen, strip_column_visibility};
     use crate::actor::app::WindowId;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
@@ -909,71 +905,72 @@ mod tests {
         assert_eq!(bounded.size.width, 600.0);
     }
 
-    /// The hint bar showed a third chip ("D", badge "8") while the active workspace
-    /// held two windows: `layout` spans the whole space, and the eight windows parked
-    /// off-screen for three *other* workspaces shared one x-origin, so they grouped
-    /// into one phantom column with its own hint letter.
+    /// The bug this replaced: four columns scrolled past the right edge are parked at
+    /// one sliver x, so grouping windows by frame position merged them into a single
+    /// chip. That both hid columns behind one hint letter and shifted every later
+    /// letter off the `focus_column` index it labels. Visibility is the only thing
+    /// frames may decide, and a parked sliver must not read as visible.
     #[test]
-    fn strip_columns_exclude_windows_from_other_workspaces() {
-        let active_a = WindowId::new(1, 1);
-        let active_b = WindowId::new(1, 2);
-        // Eight parked windows from other workspaces, all at the same x — this is
-        // what the scrolling layout does with inactive workspaces.
-        let parked: Vec<WindowId> = (10..18).map(|i| WindowId::new(2, i)).collect();
-
-        let mut layout = vec![
-            (active_a, rect(10.0, 38.0, 1183.0, 1064.0)),
-            (active_b, rect(1203.0, 38.0, 1183.0, 1064.0)),
-        ];
-        layout.extend(parked.iter().map(|w| (*w, rect(-4255.0, 38.0, 1183.0, 1064.0))));
-
-        let active: HashSet<WindowId> = [active_a, active_b].into_iter().collect();
-        let columns = scrolling_strip_columns(&layout, &active, |_| false);
-
-        assert_eq!(columns.len(), 2, "parked windows must not add a phantom column");
-        assert_eq!(
-            columns.keys().copied().collect::<Vec<_>>(),
-            vec![10, 1203],
-            "columns keyed by x, ordered left -> right"
-        );
+    fn parked_sliver_columns_are_not_visible() {
+        let (screen_left, screen_right) = (0.0, 1710.0);
+        let parked = WindowId::new(1, 1);
+        // Off-strip right: parked so ~10px peeks at the screen edge.
+        let frames: HashMap<WindowId, CGRect> =
+            [(parked, rect(1700.0, 38.0, 1183.0, 1064.0))].into_iter().collect();
         assert!(
-            columns.values().all(|c| c.len() == 1),
-            "no column should collect the parked windows as members (the badge \"8\")"
+            !strip_column_visibility(&[parked], &frames, screen_left, screen_right),
+            "a 10px sliver is parked, not visible"
         );
     }
 
     #[test]
-    fn strip_columns_group_a_stack_and_drop_floating() {
-        let stacked_a = WindowId::new(1, 1);
-        let stacked_b = WindowId::new(1, 2);
-        let floater = WindowId::new(1, 3);
-        let layout = vec![
-            (stacked_a, rect(10.0, 38.0, 1183.0, 527.0)),
-            (stacked_b, rect(10.0, 575.0, 1183.0, 527.0)),
-            (floater, rect(400.0, 300.0, 600.0, 400.0)),
-        ];
-        let active: HashSet<WindowId> = [stacked_a, stacked_b, floater].into_iter().collect();
-
-        let columns = scrolling_strip_columns(&layout, &active, |w| w == floater);
-        assert_eq!(columns.len(), 1, "a vertical stack is one column");
-        assert_eq!(columns[&10].len(), 2, "both stacked windows are members");
+    fn half_revealed_column_counts_as_visible() {
+        let (screen_left, screen_right) = (0.0, 1710.0);
+        let neighbour = WindowId::new(1, 1);
+        // Half off the right edge: 1183 wide starting at 1100 -> 610px on screen.
+        let frames: HashMap<WindowId, CGRect> =
+            [(neighbour, rect(1100.0, 38.0, 1183.0, 1064.0))].into_iter().collect();
         assert!(
-            !columns.values().flatten().any(|(w, _)| *w == floater),
-            "floating windows are not on the strip"
+            strip_column_visibility(&[neighbour], &frames, screen_left, screen_right),
+            "a half-revealed neighbour is visible"
         );
     }
 
-    /// x-origins are rounded before keying, so sub-pixel drift must not split a column.
+    /// A tabbed column's hidden tabs have no frame in the layout; the column is still
+    /// visible on the strength of the tab that does.
     #[test]
-    fn strip_columns_round_subpixel_x_into_one_column() {
-        let a = WindowId::new(1, 1);
-        let b = WindowId::new(1, 2);
-        let layout = vec![
-            (a, rect(10.2, 38.0, 1183.0, 527.0)),
-            (b, rect(9.8, 575.0, 1183.0, 527.0)),
-        ];
-        let active: HashSet<WindowId> = [a, b].into_iter().collect();
-        let columns = scrolling_strip_columns(&layout, &active, |_| false);
-        assert_eq!(columns.len(), 1, "10.2 and 9.8 both round to 10");
+    fn hidden_tabs_without_frames_do_not_hide_their_column() {
+        let (screen_left, screen_right) = (0.0, 1710.0);
+        let shown = WindowId::new(1, 1);
+        let hidden_a = WindowId::new(1, 2);
+        let hidden_b = WindowId::new(1, 3);
+        let frames: HashMap<WindowId, CGRect> =
+            [(shown, rect(10.0, 38.0, 1183.0, 1064.0))].into_iter().collect();
+        assert!(
+            strip_column_visibility(
+                &[shown, hidden_a, hidden_b],
+                &frames,
+                screen_left,
+                screen_right
+            ),
+            "the visible tab decides the column"
+        );
+    }
+
+    #[test]
+    fn column_with_no_frames_at_all_is_not_visible() {
+        let frames: HashMap<WindowId, CGRect> = HashMap::default();
+        assert!(
+            !strip_column_visibility(&[WindowId::new(1, 1)], &frames, 0.0, 1710.0),
+            "no frame means nothing on screen — must not divide by an empty range"
+        );
+    }
+
+    #[test]
+    fn fully_offscreen_left_column_is_not_visible() {
+        let off = WindowId::new(1, 1);
+        let frames: HashMap<WindowId, CGRect> =
+            [(off, rect(-4255.0, 38.0, 1183.0, 1064.0))].into_iter().collect();
+        assert!(!strip_column_visibility(&[off], &frames, 0.0, 1710.0));
     }
 }
