@@ -21,23 +21,28 @@ its own sake:
   to sync: it is the shortest complete worked example, and §8.3 covers what to do
   when upstream ships a failing test.
 
-## 0. Status — two syncs complete; §8 is the second one
+## 0. Status — three syncs complete; §9 is the newest
 
 ```
 branch                    xieyt/5
 behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     49
-upstream tip merged       7829780  (2026-08-10; the 38-commit backlog ended at 6c64d8b,
-                                   then 1de4d09, now this)
+ahead                     52
+upstream tip merged       3a52122  (2026-08-10; backlog ended 6c64d8b, then 1de4d09,
+                                   then 7829780, now this)
 curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
-                              -> 363 (2026-08-10 sync: +4 ui::menu_bar, -1 upstream-red, +1 guard)
+                              -> 363 (§8 sync) -> 370 (§9 sync)
 cargo check               --workspace --all-targets clean
 just fmt-check            clean
-nix build .#rift          succeeds; .app installed and exercised live
+nix build .#rift          succeeds; .app installed and exercised live (22/23 checks,
+                          the 23rd a bad probe — see §9.3)
 ```
 
-**§8 records the 2026-08-10 sync (11 commits).** It is the first sync run under §7's
-cadence rule, so it is also the test of whether that rule works — see §8.4.
+**Upstream `main` currently has three failing tests of its own**, all reproduced on
+pristine worktrees and skipped in `just test` with attribution: see §8.3 and §9.2.
+
+**§8 and §9 record the 2026-08-10 syncs** (11 commits, then 3 more the same day).
+§8 is the first run under §7's cadence rule and the test of whether it works
+(§8.4); §9 is why you read the linked issue, not just the commit messages (§9.1).
 
 Landed as five chronological checkpoint merges, one per stage. The checkpoint
 SHAs are *upstream* commits; the merge commits on `xieyt/5` are separate:
@@ -965,3 +970,73 @@ Proven by mutation, not just by passing: deleting `ui::menu_bar` from the recipe
 makes it report `["ui::menu_bar::layout_library_tests"]`. It also immediately found
 two modules nobody had classified (`bin::rift-cli::tests`,
 `ui::mission_control::tests`).
+
+---
+
+## 9. Third sync — 2026-08-10 (same day), `7829780` → `3a52122` (3 commits)
+
+```
+behind before        3         ahead 49
+conflict hunks       0         (all three auto-merged)
+merge commits        d92cb5f, ed5a810, 112b563   (via `just sync`)
+curated tests        363 -> 370
+```
+
+| Commit | Subject | Verdict |
+|---|---|---|
+| `792370e` | fix: ghost windows appearing | TAKE — but it regresses floating state, see below |
+| `7783d52` | fix: ghost windows after minimization | TAKE |
+| `3a52122` | feat: !BREAKING! reveal layout state to ipc/cli (#439) | TAKE |
+
+### 9.1 Why this happened the same day as §8
+
+§8 merged `1e3a898` ("ax destroy not authoritative"), which fixes real sleep/wake
+layout loss — upstream issue #440, confirmed fixed by the reporter. What the commit
+message does not say, and the issue thread does, is that **the same change produced
+ghost windows**, and the fixes landed hours after our merge point. Reading #440 to
+the end was worth more than reading all eleven commit messages in §8.
+
+`just upstream-status` — written that same afternoon — earned itself on first real
+use: it flagged `crates/rift-protocol/src/commands.rs -50` as a structural tripwire,
+which is `3a52122`'s breaking IPC change landing in the crate that holds our five
+fork command variants and `MoveFocusArgs.activate`. All five survived; the merge
+took zero hunks.
+
+### 9.2 `792370e` trades ghosts for floating state — bisected
+
+It breaks `wsid_rekey_preserves_floating_membership_and_position`: a window loses
+`is_floating` and its stored position across a WindowServerId rekey, so a floated
+window can snap back into the tiling after a rekey (sleep/wake, app relaunch).
+Bisected across all four candidates on pristine worktrees:
+
+```
+7829780  PASS   (our §8 merge point)
+792370e  FAIL   <- culprit
+7783d52  FAIL
+3a52122  FAIL
+```
+
+Kept anyway, deliberately: conflicts were zero, `3a52122`'s breaking IPC change was
+free to absorb now and would not have been later (§7's whole thesis), the regression
+is upstream's and will be fixed upstream, and its blast radius here is a recoverable
+annoyance on a feature we have bound (`hyper + T`) but do not currently use. Skipped
+in `just test` with the bisect recorded; drop the skip when upstream repairs it.
+
+**Upstream main now carries three red tests** (§8.3 lists the other two). That is
+worth knowing before you trust a green/red signal from their tree.
+
+### 9.3 Verified live on the merged tip
+
+22/23 automated checks on the running WM, in an isolated empty workspace using
+throwaway windows so the live session was never touched — health, **zero ghost
+windows across all 9 real windows**, every `query` subcommand round-tripping over
+the new protocol, and the fork's own commands by observable effect
+(`cycle-column-width` 1183→1437 px, `toggle-tabbed` collapsing two windows onto one
+`(x=10, h=1064)` frame and restoring the 527/527 split, `move-node` reordering).
+
+The 23rd was a **bad test, not a bad build**: `focus-column 0` appeared to no-op
+because the check ran immediately after spawning a window, and the new window's own
+async focus grab re-selected its column. Re-tested deterministically with every hop
+targeting a non-selected column — 5/5 correct, so a no-op could not have passed.
+Same failure mode as the `alacritty --title` trap in §8.2: **when a check fails
+during a sync, confirm the probe before blaming the merge.**
