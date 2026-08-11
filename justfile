@@ -52,12 +52,20 @@ fmt-check:
 # reactor test that fails on upstream too.
 # ---------------------------------------------------------------------------
 
-# fast deterministic logic tests (layout, raise, reactor, config, stack-line,
-# hints-bar, menu-bar) — no GUI. Every new `ui::`/`sys::` test module MUST get a
-# filter here: a curated allowlist fails *silent*, so adding a test module without
-# adding its filter is a no-op that looks like coverage. `ui::hints_bar` was missing
-# for months while FORK.md §2.E claimed those tests ran; `ui::menu_bar` was added
-# with upstream's `abdbcc8` and would have repeated it.
+# Fast deterministic logic tests — everything that runs without a GUI.
+#
+# This list was curated by *assumption* until 2026-08-11, and the assumption was
+# expensive: 13 modules were sitting in the "needs a GUI" bucket while passing
+# perfectly well headless, so 148 real tests never ran in the fast suite (`model`
+# alone is 70, `actor::spaces` 42). Measured module by module: only `sys` genuinely
+# aborts headless (objc weak-reference error from the SkyLight/window-server tests).
+#
+# Every new test module MUST be added here, or classified in the
+# `GUI_OR_DEFERRED` list in `common::config`'s
+# `just_test_allowlist_classifies_every_test_module` — that test fails by name if a
+# module is in neither, because a curated allowlist fails *silent*: adding a test
+# module without adding its filter is a no-op that looks like coverage.
+# `ui::hints_bar` was missing for months while FORK.md §2.E claimed those tests ran.
 #
 # THREE skips, all upstream failures reproduced on a pristine `upstream/main`
 # worktree via `just upstream-test <TEST>` — not our regressions. UPSTREAM-SYNC.md §9.
@@ -71,7 +79,7 @@ fmt-check:
 # (sleep/wake, app relaunch). Recoverable by re-floating; drop this skip once
 # upstream repairs it.
 test:
-    nix develop -c cargo test --lib -- layout_engine actor::raise_manager actor::reactor::tests common::config ui::stack_line ui::hints_bar ui::menu_bar --skip topology_change_clears_stale_pending_hide_target --skip ax_invalidation_after_quarantine_release_preserves_live_layout_state --skip wsid_rekey_preserves_floating_membership_and_position
+    nix develop -c cargo test --lib -- layout_engine model ipc common::config actor::raise_manager actor::reactor::tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::drag_swap actor::event_tap actor::menu_bar actor::notification_center actor::stack_line actor::window_notify ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip ax_invalidation_after_quarantine_release_preserves_live_layout_state --skip wsid_rekey_preserves_floating_membership_and_position
 
 # whole library suite — only meaningful in a real GUI session
 test-all:

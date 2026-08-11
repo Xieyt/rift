@@ -1984,37 +1984,31 @@ mod tests {
     fn just_test_allowlist_classifies_every_test_module() {
         /// Test modules deliberately outside `just test`. Removing an entry here
         /// without adding a `test:` filter re-opens the silent-coverage hole.
+        ///
+        /// This list started out much longer, populated by assuming anything under
+        /// `actor::`/`model::`/`ui::` needed a GUI. Measured module by module on
+        /// 2026-08-11, that was wrong for 13 of them — 148 tests that pass perfectly
+        /// well headless were being skipped. **Only `sys` genuinely aborts** (objc
+        /// weak-reference error from the SkyLight/window-server tests). Before adding
+        /// an entry here, run it: `cargo test --lib -- <module> --test-threads=1`.
         const GUI_OR_DEFERRED: &[&str] = &[
             // Not reachable from `cargo test --lib` at all: `src/bin/rift-cli.rs` is a
             // separate bin target, so `--lib` never compiles it. `just test-all` does
             // not cover it either; only a bare `cargo test` would.
             "bin::rift-cli",
-            // Need a real GUI session / live window server. Headless these abort with
-            // an objc weak-reference error rather than failing, which is why they are
-            // out of the fast recipe — see `just test-all` and FORK.md §8.
+            // Genuinely needs a real GUI session / live window server: aborts headless
+            // rather than failing. This is the one the fast recipe must skip.
+            "sys",
+            // Test-support and no-#[test] modules: a `#[cfg(test)]` module that
+            // declares helpers or fixtures only, so no filter would match anything.
             "actor::app",
-            "actor::drag_swap",
-            "actor::event_tap",
-            "actor::menu_bar",
             "actor::mission_control",
-            "actor::notification_center",
-            "actor::reactor::animation",
-            "actor::reactor::events",
-            "actor::reactor::main_window",
-            "actor::reactor::managers",
             "actor::reactor::replay",
             "actor::reactor::SpaceEventHandler",
             "actor::reactor::testing",
-            "actor::spaces",
-            "actor::stack_line",
-            "actor::window_notify",
             "actor::wm_controller",
             "common::collections",
             "common::log",
-            "ipc",
-            "model",
-            "sys",
-            "ui::mission_control",
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

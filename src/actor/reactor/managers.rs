@@ -208,6 +208,37 @@ fn bound_scrolling_tiled_frames_to_screen(
     }
 }
 
+/// Group a space's laid-out frames into the scrolling strip's columns, keyed by
+/// rounded x-origin so a `BTreeMap` orders them left -> right.
+///
+/// Two windows are excluded, and the first one is the subtle one:
+///
+/// 1. **Windows outside the active workspace.** `layout` covers the whole *space*,
+///    and the scrolling layout parks every inactive workspace's windows off-screen
+///    at a shared x. Without this filter they all collapse into one phantom column
+///    that earns its own hint letter and a member-count badge — observed as chip
+///    "D" with badge "8" while the active workspace held just two windows.
+///    `bound_scrolling_tiled_frames_to_screen` filters on the same set.
+/// 2. **Floating windows**, which are not part of the strip at all.
+///
+/// Split out from `build_hints_bar_cells` so the rule is testable without standing
+/// up a whole `Reactor`.
+fn scrolling_strip_columns(
+    layout: &[(WindowId, CGRect)],
+    active_workspace_windows: &HashSet<WindowId>,
+    is_floating: impl Fn(WindowId) -> bool,
+) -> std::collections::BTreeMap<i64, Vec<(WindowId, CGRect)>> {
+    let mut columns: std::collections::BTreeMap<i64, Vec<(WindowId, CGRect)>> =
+        std::collections::BTreeMap::new();
+    for (wid, frame) in layout {
+        if !active_workspace_windows.contains(wid) || is_floating(*wid) {
+            continue;
+        }
+        columns.entry(frame.origin.x.round() as i64).or_default().push((*wid, *frame));
+    }
+    columns
+}
+
 /// Build the scrolling strip cells: group the active workspace's tiled windows
 /// into columns by x-origin (ordered left -> right), then decorate each with a
 /// hint letter, its app, focus, and whether it lies inside the screen viewport.
@@ -217,6 +248,7 @@ fn build_hints_bar_cells(
     screen: CGRect,
     hb: &crate::common::config::HintsBarSettings,
     groups: &[crate::layout_engine::engine::GroupContainerInfo],
+    active_workspace_windows: &HashSet<WindowId>,
 ) -> Vec<crate::ui::hints_bar::ColumnCell> {
     let focused = reactor.layout_manager.layout_engine.focused_window();
     let resolve = |wid: WindowId| -> (String, String) {
@@ -235,15 +267,9 @@ fn build_hints_bar_cells(
         (label, title)
     };
 
-    // BTreeMap keeps columns ordered left -> right by rounded x-origin.
-    let mut columns: std::collections::BTreeMap<i64, Vec<(WindowId, CGRect)>> =
-        std::collections::BTreeMap::new();
-    for (wid, frame) in layout {
-        if reactor.layout_manager.layout_engine.is_window_floating(*wid) {
-            continue;
-        }
-        columns.entry(frame.origin.x.round() as i64).or_default().push((*wid, *frame));
-    }
+    let columns = scrolling_strip_columns(layout, active_workspace_windows, |wid| {
+        reactor.layout_manager.layout_engine.is_window_floating(wid)
+    });
 
     let keys: Vec<char> = hb.keys.chars().collect();
     let screen_left = screen.origin.x;
@@ -577,7 +603,22 @@ impl LayoutManager {
                                 == LayoutMode::Scrolling;
                         let cells = if is_scrolling {
                             let hb = &reactor.config.settings.ui.hints_bar;
-                            build_hints_bar_cells(reactor, &layout, screen_frame, hb, &group_infos)
+                            // Computed here rather than hoisted: only the scrolling
+                            // strip needs it, and only when the bar is enabled.
+                            let active_ws: HashSet<WindowId> = reactor
+                                .layout_manager
+                                .layout_engine
+                                .windows_in_active_workspace(&reactor.state.windows, space)
+                                .into_iter()
+                                .collect();
+                            build_hints_bar_cells(
+                                reactor,
+                                &layout,
+                                screen_frame,
+                                hb,
+                                &group_infos,
+                                &active_ws,
+                            )
                         } else {
                             Vec::new()
                         };
@@ -825,7 +866,8 @@ pub struct PendingSpaceChangeManager {
 mod tests {
     use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 
-    use super::bound_frame_to_screen;
+    use super::{HashSet, bound_frame_to_screen, scrolling_strip_columns};
+    use crate::actor::app::WindowId;
 
     fn rect(x: f64, y: f64, w: f64, h: f64) -> CGRect {
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
@@ -865,5 +907,73 @@ mod tests {
         let bounded = bound_frame_to_screen(frame, screen);
         assert_eq!(bounded.origin.x, 2998.0);
         assert_eq!(bounded.size.width, 600.0);
+    }
+
+    /// The hint bar showed a third chip ("D", badge "8") while the active workspace
+    /// held two windows: `layout` spans the whole space, and the eight windows parked
+    /// off-screen for three *other* workspaces shared one x-origin, so they grouped
+    /// into one phantom column with its own hint letter.
+    #[test]
+    fn strip_columns_exclude_windows_from_other_workspaces() {
+        let active_a = WindowId::new(1, 1);
+        let active_b = WindowId::new(1, 2);
+        // Eight parked windows from other workspaces, all at the same x — this is
+        // what the scrolling layout does with inactive workspaces.
+        let parked: Vec<WindowId> = (10..18).map(|i| WindowId::new(2, i)).collect();
+
+        let mut layout = vec![
+            (active_a, rect(10.0, 38.0, 1183.0, 1064.0)),
+            (active_b, rect(1203.0, 38.0, 1183.0, 1064.0)),
+        ];
+        layout.extend(parked.iter().map(|w| (*w, rect(-4255.0, 38.0, 1183.0, 1064.0))));
+
+        let active: HashSet<WindowId> = [active_a, active_b].into_iter().collect();
+        let columns = scrolling_strip_columns(&layout, &active, |_| false);
+
+        assert_eq!(columns.len(), 2, "parked windows must not add a phantom column");
+        assert_eq!(
+            columns.keys().copied().collect::<Vec<_>>(),
+            vec![10, 1203],
+            "columns keyed by x, ordered left -> right"
+        );
+        assert!(
+            columns.values().all(|c| c.len() == 1),
+            "no column should collect the parked windows as members (the badge \"8\")"
+        );
+    }
+
+    #[test]
+    fn strip_columns_group_a_stack_and_drop_floating() {
+        let stacked_a = WindowId::new(1, 1);
+        let stacked_b = WindowId::new(1, 2);
+        let floater = WindowId::new(1, 3);
+        let layout = vec![
+            (stacked_a, rect(10.0, 38.0, 1183.0, 527.0)),
+            (stacked_b, rect(10.0, 575.0, 1183.0, 527.0)),
+            (floater, rect(400.0, 300.0, 600.0, 400.0)),
+        ];
+        let active: HashSet<WindowId> = [stacked_a, stacked_b, floater].into_iter().collect();
+
+        let columns = scrolling_strip_columns(&layout, &active, |w| w == floater);
+        assert_eq!(columns.len(), 1, "a vertical stack is one column");
+        assert_eq!(columns[&10].len(), 2, "both stacked windows are members");
+        assert!(
+            !columns.values().flatten().any(|(w, _)| *w == floater),
+            "floating windows are not on the strip"
+        );
+    }
+
+    /// x-origins are rounded before keying, so sub-pixel drift must not split a column.
+    #[test]
+    fn strip_columns_round_subpixel_x_into_one_column() {
+        let a = WindowId::new(1, 1);
+        let b = WindowId::new(1, 2);
+        let layout = vec![
+            (a, rect(10.2, 38.0, 1183.0, 527.0)),
+            (b, rect(9.8, 575.0, 1183.0, 527.0)),
+        ];
+        let active: HashSet<WindowId> = [a, b].into_iter().collect();
+        let columns = scrolling_strip_columns(&layout, &active, |_| false);
+        assert_eq!(columns.len(), 1, "10.2 and 9.8 both round to 10");
     }
 }
