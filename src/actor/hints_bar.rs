@@ -49,6 +49,18 @@ pub struct Snapshot {
     pub overflow_frame: Option<CGRect>,
 }
 
+/// Should the bar hide entirely for this snapshot?
+///
+/// Only when there is nothing at all to draw. An empty workspace has no column
+/// chips but still has a workspace rail, and that is precisely when the rail earns
+/// its keep — it is the only thing showing where your windows actually are, and its
+/// pills are clickable, so hiding it strands you. This used to key on
+/// `cells.is_empty()` alone, which made the bar vanish on every empty workspace even
+/// under `visibility = "always"` with `show_workspace = true`.
+fn should_hide_bar(enabled: bool, snapshot: &Snapshot) -> bool {
+    !enabled || (snapshot.cells.is_empty() && snapshot.workspaces.is_empty())
+}
+
 #[derive(Debug)]
 pub enum Event {
     /// New strip state for the active display space (empty cells = nothing to show).
@@ -257,7 +269,7 @@ impl HintsBar {
         let Some(snapshot) = self.last_snapshot.clone() else {
             return;
         };
-        if !self.is_enabled() || snapshot.cells.is_empty() {
+        if should_hide_bar(self.is_enabled(), &snapshot) {
             self.hide();
             return;
         }
@@ -469,5 +481,91 @@ impl HintsBar {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+
+    use super::{Snapshot, should_hide_bar};
+    use crate::common::config::HintsBarOverflow;
+    use crate::sys::screen::SpaceId;
+    use crate::ui::hints_bar::{ColumnCell, WindowMember, WorkspaceCell};
+
+    fn snapshot(cells: Vec<ColumnCell>, workspaces: Vec<WorkspaceCell>) -> Snapshot {
+        let frame = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1710.0, 26.0));
+        Snapshot {
+            space_id: SpaceId::new(1),
+            bar_frame: frame,
+            screen_frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1710.0, 1074.0)),
+            cells,
+            workspaces,
+            overflow: HintsBarOverflow::Bar,
+            top_count: 0,
+            overflow_frame: None,
+        }
+    }
+
+    fn cell() -> ColumnCell {
+        ColumnCell {
+            hint: "a".into(),
+            members: vec![WindowMember {
+                window_id: crate::actor::app::WindowId::new(1, 1),
+                label: "alacritty".into(),
+                title: "term".into(),
+            }],
+            active: 0,
+            tabbed: false,
+            focused: true,
+            visible: true,
+        }
+    }
+
+    fn pill(label: &str) -> WorkspaceCell {
+        WorkspaceCell {
+            label: label.into(),
+            index: 0,
+            active: false,
+            pids: vec![1],
+        }
+    }
+
+    /// The reported bug: switching to an empty workspace hid the whole bar, taking
+    /// the workspace rail with it — the one thing still worth showing there.
+    #[test]
+    fn empty_workspace_keeps_the_rail_visible() {
+        let snap = snapshot(Vec::new(), vec![pill("1"), pill("3")]);
+        assert!(
+            !should_hide_bar(true, &snap),
+            "no columns but occupied workspaces: the rail must still render"
+        );
+    }
+
+    #[test]
+    fn nothing_at_all_hides_the_bar() {
+        let snap = snapshot(Vec::new(), Vec::new());
+        assert!(
+            should_hide_bar(true, &snap),
+            "no chips and no pills: nothing to draw"
+        );
+    }
+
+    #[test]
+    fn columns_alone_are_enough_to_show() {
+        let snap = snapshot(vec![cell()], Vec::new());
+        assert!(
+            !should_hide_bar(true, &snap),
+            "show_workspace = false still shows column chips"
+        );
+    }
+
+    #[test]
+    fn disabled_hides_regardless_of_content() {
+        let snap = snapshot(vec![cell()], vec![pill("1")]);
+        assert!(
+            should_hide_bar(false, &snap),
+            "the enabled flag wins over content"
+        );
     }
 }

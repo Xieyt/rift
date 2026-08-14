@@ -79,7 +79,7 @@ fmt-check:
 # (sleep/wake, app relaunch). Recoverable by re-floating; drop this skip once
 # upstream repairs it.
 test:
-    nix develop -c cargo test --lib -- layout_engine model ipc common::config actor::raise_manager actor::reactor::tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::drag_swap actor::event_tap actor::menu_bar actor::notification_center actor::stack_line actor::window_notify ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip ax_invalidation_after_quarantine_release_preserves_live_layout_state --skip wsid_rekey_preserves_floating_membership_and_position
+    nix develop -c cargo test --lib -- layout_engine model ipc common::config actor::raise_manager actor::reactor::tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::drag_swap actor::event_tap actor::menu_bar actor::notification_center actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip ax_invalidation_after_quarantine_release_preserves_live_layout_state --skip wsid_rekey_preserves_floating_membership_and_position
 
 # whole library suite — only meaningful in a real GUI session
 test-all:
