@@ -72,6 +72,26 @@
           default = null;
         };
 
+        extraPath = lib.mkOption {
+          type = lib.types.listOf lib.types.str;
+          default = [ ];
+          example = [
+            "/etc/profiles/per-user/alice/bin"
+            "/opt/homebrew/bin"
+          ];
+          description = ''
+            Directories prepended to the launchd agent's PATH.
+
+            An agent gets a minimal PATH, not your login shell's, and that PATH is
+            all an `exec` keybinding can see. Your per-user nix profile is not on it
+            by default, so a binding like
+            `{ exec = ["/usr/bin/env" "emacsclient" ...] }` fails with exit 127 and
+            no visible symptom beyond an `ERROR` line in the log — the key just does
+            nothing. Either list the directory here or use an absolute path in
+            `exec`.
+          '';
+        };
+
         logLevel = lib.mkOption {
           type = lib.types.str;
           default = "error,warn,info,rift_wm::actor::reactor=debug,rift_wm::layout_engine=debug,rift_wm::actor::raise_manager=debug,rift_wm::actor::stack_line=debug,rift_wm::layout_engine::systems::scrolling=debug";
@@ -225,8 +245,23 @@
               ++ lib.optionals (configFile != null) [ "--config" (toString configFile) ];
             EnvironmentVariables = {
               RUST_LOG = cfg.logLevel;
-              # todo improve
-              PATH = "/run/current-system/sw/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+              # launchd hands an agent a minimal PATH, so `exec` keybindings only see
+              # what is listed here. The system profile is on it; a per-user nix
+              # profile (`/etc/profiles/per-user/<you>/bin`) and Homebrew are NOT,
+              # which is why `{ exec = ["/usr/bin/env", "emacsclient", ...] }` exits
+              # 127 and the bind silently does nothing. Prepend those via
+              # `services.rift.extraPath` — or use absolute paths in `exec`.
+              PATH = lib.concatStringsSep ":" (
+                cfg.extraPath
+                ++ [
+                  "/run/current-system/sw/bin"
+                  "/usr/local/bin"
+                  "/usr/bin"
+                  "/bin"
+                  "/usr/sbin"
+                  "/sbin"
+                ]
+              );
             };
             RunAtLoad = true;
             KeepAlive = {
