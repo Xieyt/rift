@@ -640,12 +640,25 @@ impl State {
     async fn handle_raises(this: &RefCell<Self>, mut rx: actor::Receiver<RaiseRequest>) {
         while let Some((span, raise)) = rx.recv().await {
             let RaiseRequest(wids, token, sequence_id, quiet, activate) = raise;
+            // Captured before the move; `Copy`, so no allocation on the hot path.
+            let (first, count) = (wids.first().copied(), wids.len());
             if let Err(e) =
                 Self::handle_raise_request(this, wids, &token, sequence_id, quiet, activate)
                     .instrument(span)
                     .await
             {
-                debug!("Raise request failed: {e:?}");
+                // `warn!`, not `debug!`: this is the ONLY record of why a raise never
+                // reported completion, and `raise_manager`'s 250ms timeout warns
+                // loudly when that happens. At `debug` on `actor::app` — which the
+                // default `RUST_LOG` does not enable — the timeout looks like an
+                // unexplained stall while the actual reason sits invisible. Rare
+                // enough to afford a warn: ~12 in 6h of normal use.
+                warn!(
+                    ?sequence_id,
+                    ?first,
+                    count,
+                    "Raise request failed, so no RaiseCompleted will be sent: {e:?}"
+                );
             }
         }
     }
