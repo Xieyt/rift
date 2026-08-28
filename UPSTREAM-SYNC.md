@@ -21,24 +21,31 @@ its own sake:
   to sync: it is the shortest complete worked example, and §8.3 covers what to do
   when upstream ships a failing test.
 
-## 0. Status — three syncs complete; §9 is the newest
+## 0. Status — four syncs complete; §10 is the newest
 
 ```
 branch                    xieyt/5
 behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     52
-upstream tip merged       3a52122  (2026-08-10; backlog ended 6c64d8b, then 1de4d09,
-                                   then 7829780, now this)
+ahead                     62
+upstream tip merged       74ce00d  (2026-08-28; backlog ended 6c64d8b, then 1de4d09,
+                                   then 7829780, then 3a52122, now this)
 curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
-                              -> 363 (§8 sync) -> 370 (§9 sync)
+                              -> 363 (§8) -> 370 (§9) -> 520 (guard widened)
+                              -> 549 (§10 sync)
 cargo check               --workspace --all-targets clean
 just fmt-check            clean
-nix build .#rift          succeeds; .app installed and exercised live (22/23 checks,
-                          the 23rd a bad probe — see §9.3)
+nix build .#rift          succeeds; .app installed and exercised live (16/16 — see §10.6)
 ```
 
-**Upstream `main` currently has three failing tests of its own**, all reproduced on
-pristine worktrees and skipped in `just test` with attribution: see §8.3 and §9.2.
+**Upstream `main` currently has two failing tests of its own**, both reproduced on
+pristine worktrees and skipped in `just test` with attribution: see §8.3 and §10.4.
+There were three until §10 found that one of the skips named a test upstream had
+already renamed — a silent no-op filter.
+
+**§10 records the 2026-08-28 sync** (22 commits, 6 hunks, 0 SKIPs) and is the one to
+read for the failure mode this series had not yet hit: two fork features nearly lost
+through hunks git merged *cleanly*. §10.2 is the first time we retired a fork
+feature as superseded rather than defending it.
 
 **§8 and §9 record the 2026-08-10 syncs** (11 commits, then 3 more the same day).
 §8 is the first run under §7's cadence rule and the test of whether it works
@@ -1098,3 +1105,126 @@ from a single run:
 Plus the dirty-tree refusal, and `just upstream-test` on a *passing* test (exit 0,
 temp worktree removed by its trap) — the path never exercised when it was written,
 since both real uses hit failing tests.
+
+---
+
+## 10. Fourth sync — 2026-08-28, `3a52122` → `74ce00d` (22 commits)
+
+18 days elapsed, 22 commits, **6 conflict hunks in 5 files**, 0 SKIPs. The largest
+backlog since §4 and the cheapest per commit. Verdicts: **22 TAKE** (4 needing
+rework), nothing refused.
+
+Analysed in five parallel read-only clusters before touching the tree, because the
+churn is concentrated in files we diverge in: `gesture_tap.rs`, `scrolling.rs`,
+`reactor.rs`, `commands.rs`.
+
+### 10.1 The headline: a clean auto-merge is not a safe auto-merge
+
+Two fork features would have been silently lost through hunks git merged without
+complaint. Neither is visible in the conflict list, and neither breaks the build.
+
+1. **`9215d53 "improved gestures"` rewrites `gesture_tap.rs` — 870 of 878 lines** —
+   onto a new `sys/gesture.rs` IOHID sensing layer, and drops our `scroll_speed`.
+   The 2 conflict hunks *are* our three fork lines, so that part announced itself.
+   The trap is the port: upstream moved `invert_horizontal` to **before**
+   accumulation, so transcribing our old emission-site expression
+   (`cfg.speed * if cfg.invert_horizontal { -accum } else { accum }`) would
+   **double-invert**. Correct port is `cfg.speed * state.accum_dx`.
+2. **The same commit's new `snap_to_nearest_column`** now *selects* a window (it
+   used to only scroll), indexing the target column by the source column's row and
+   never writing `Column.active`. That breaks §2.D tab memory two ways: wrong tab
+   picked, and stale memory left behind. Textually clean, compiles, 547 tests still
+   green. Only a new test catches it — added two, mutation-checked against
+   upstream's exact block (both fail with `active: None`).
+
+Lesson for §7: the tripwire counts *commits touching our churny files*, which
+fired correctly here. What it cannot see is a semantic collision inside a file that
+merges cleanly. Budget review time per **rewritten** file, not per conflict hunk.
+
+### 10.2 Where upstream is simply better than us — and we deleted our version
+
+`cce710a` + `0475baf` replace the admission model. Our fork carried
+`ignore_app_rule: bool`, written at **five** reactor callsites. Upstream's
+`manage_override: Option<bool>` is written **once** centrally
+(`virtual_workspace.rs:1040`), is consulted by a single documented policy
+(`WindowState::is_admitted`), is tri-state rather than boolean, and distinguishes
+`AppRuleRejection::ExplicitRule` from `Heuristic` — a conflation our bool had.
+
+The cluster analysis flagged our dropped lines as "a real semantic collision that
+must be re-applied". Reading the replacement showed the opposite: re-applying would
+fight the central write. **Dropped ours deliberately.** First time this sync series
+has retired a fork feature as superseded rather than defended it.
+
+Kept fork-local for the opposite reason: `active_workspace_columns`. `38eacff`
+exposes ordered columns, but only privately in `query.rs` and only to enrich IPC
+`WindowData` — not a superset. Same call as §5.2 made for `5c0b38d`: take the
+upstream event, keep the in-process feed. `7d026c4`'s `layout_changed` likewise
+carries no per-column pixel frames, so it cannot drive the hint bar.
+
+### 10.3 Two tooling defects, both found by the tools themselves
+
+**The `just sync` range merge was right and the per-commit alternative was a trap.**
+`fad6498` does not compile alone: its own new test calls a helper that only
+`5262221` adds, 25 seconds later. A commit-by-commit gate breaks there. §9.4's
+measured preference for range merges is now confirmed by a second, independent
+mechanism — not just a smaller conflict set, but *compilability*.
+
+**The allowlist guard fired for the fifth time**, naming `actor::gesture_tap::tests`
+(upstream's 5 new palm-rejection tests, all headless-clean). 547 → 549 tests.
+
+**And a skip list rotted exactly like an allowlist.** The
+`--skip ax_invalidation_after_quarantine_release_preserves_live_layout_state`
+filter named a test `792370e` had already renamed — a **silent no-op**, which is
+precisely the failure mode the comment above it warns about. Deleted; its successor
+`current_ax_destruction_after_quarantine_release_removes_window` passes. The guard
+covers test *modules*, not skip *names*, so this class is still unguarded. Verify
+skips by deletion at every sync.
+
+### 10.4 `#440` is fixed, the floating regression is not
+
+`f2a9349 "fix: ghost windows + layout reset (#440)"` **reverts `792370e`'s reactor
+branch** (deletes `handle_window_ax_invalidated` outright) but leaves the
+`identify_stale_windows` predicate `792370e` changed — which §9.2 bisected as the
+cause of losing floating state across a WindowServerId rekey. Different file,
+different function: upstream repaired the ghost windows and never noticed the
+rekey. `wsid_rekey_preserves_floating_membership_and_position` is still red on
+pristine `upstream/main`, body unchanged in this range.
+
+**Skip stays, re-attributed** from "792370e" to the surviving predicate. Two skips
+now, both upstream's.
+
+### 10.5 Known, unfixed: centered floats and our external-bar insets
+
+`54ac143` adds `toggle_window_floating = { center = true, size = ... }`, closing the
+last gap in `FORK.md` §8 roadmap item 3. Its screen rect is built from
+`active_size` (the **tiling** area, which *our* `external_bar_top/bottom` insets
+shrink) combined with `visible_space_centers` (the **native** screen centre,
+`reactor.rs:3323`). Mixing them offsets a centered float by half the total inset.
+
+Fork-induced: upstream has no insets, so for them the two agree. **Latent** —
+nothing binds the options form (`rift.default.toml:550` and `dev-config.toml:149`
+both bind plain `toggle_window_floating`; the option forms are commented examples).
+Not fixed here on purpose: the honest fix extracts the inset math at
+`managers.rs:441-475` into one helper shared with `visible_spaces_for_layout`, and
+that refactor does not belong in the same commit as a 22-commit merge. Do it before
+binding `center = true`.
+
+### 10.6 Verified
+
+549 tests, `fmt` clean, 0 behind upstream, `.app` built and installed.
+
+Live, 16/16, on scratch windows in an empty workspace (never the user's): all six
+`query` subcommands round-trip after `a4d70a4` moved the Mach server onto the
+reactor; `focus-column`, `cycle-column-width` (1180 → 1435), `consume-or-expel`,
+`toggle-tabbed` (2 windows sharing one frame) all work over the rewritten protocol;
+`scroll-strip`/`snap-strip` — the commands gestures emit — drive the new handler
+with zero panics; no hints-bar warnings; workspaces restored exactly.
+
+**A live probe was the wrong instrument for tab memory, and said so twice.**
+`container_tree` reports a scrolling column's `layout_kind` as `Vertical` whether
+or not it is tabbed, so tabbedness is not observable over IPC; and
+`consume-or-expel` can leave a single column where `move-focus left/right` is a
+no-op that passes vacuously. Both produced a confident wrong reading before the
+in-process test settled it. Fourth bad probe in this series (`--title`,
+`focus-column` spawn race, the pid-under-`id` ghost check, now this): **when a live
+check disagrees with the code, suspect the probe first.**

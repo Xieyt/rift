@@ -993,12 +993,17 @@ per-workspace layouts. So this is the *gaps* worth stealing, ranked.
    (cycle 33/50/66%) and independent per-column widths. Pure layout math in
    `scrolling.rs` + a couple of `LayoutCommand`s.
 3. **Richer window-rule *open* actions** — `open_floating`, `open_maximized`,
-   `default_column_width`. *(Partly upstream as of `6c64d8b` "more app rule
-   fields": `floating` now has real adoption-time effect via
-   `AppRulePlacement::resolve_frame`, and tiled `size.w` covers
-   `default_column_width` in **pixels, not a ratio**; `open_maximized` is still
-   missing. `95bc739`'s `BaseLayoutSettings::resolved_base_for(mode)` is the
-   override-resolution seam to extend.)*
+   `default_column_width`. *(Mostly upstream now. `6c64d8b` "more app rule fields"
+   gave `floating` real adoption-time effect via `AppRulePlacement::resolve_frame`,
+   and tiled `size.w` covers `default_column_width` in **pixels, not a ratio**.
+   `54ac143` "center/size window on float" (2026-08-26) closes the last gap:
+   `toggle_window_floating = { center = true, size = "smart" | { w, h } }`, where
+   `smart` is 80% × 93% of the work area — effectively `open_maximized`. **Read
+   UPSTREAM-SYNC.md §10.5 before binding `center = true`**: its screen rect mixes
+   the inset-adjusted `active_size` with the *native* screen centre, so a centered
+   float lands off by half our `external_bar_top/bottom` inset. Latent until the
+   options form is bound. `95bc739`'s `BaseLayoutSettings::resolved_base_for(mode)`
+   is still the override-resolution seam to extend.)*
 4. **Workspace reordering / on-the-fly named workspaces** — niri's
    move-workspace-up/down. We have create/switch/move-to; reordering is missing.
 5. **Interactive mouse resize of tiles** — we have drag-*swap*
