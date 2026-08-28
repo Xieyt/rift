@@ -2184,6 +2184,68 @@ mod tests {
         );
     }
 
+    /// `FORK.md` §6 "Enforced guards" tabulates every TTSR rule in `.omp/rules/`.
+    /// A rule nobody documented is a rule nobody knows will interrupt them, and a
+    /// documented rule that no longer exists is a promise the repo does not keep.
+    ///
+    /// This only checks *existence*, both directions — no test can verify that a
+    /// rule's argument still matches the policy it cites. That part is on you: the
+    /// `description` line is the contract, the body is the argument.
+    #[test]
+    fn every_ttsr_rule_is_documented_in_fork_md() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let rules_dir = root.join(".omp/rules");
+
+        // Absent inside the nix build sandbox: `nix/package.nix` filters `src` to
+        // `commonCargoSources` (*.rs / *.toml / Cargo.lock) plus plists, so `.omp/`
+        // is genuinely not there. Skip rather than fail a legitimate build.
+        let Ok(entries) = std::fs::read_dir(&rules_dir) else {
+            return;
+        };
+
+        let doc = std::fs::read_to_string(root.join("FORK.md")).expect("FORK.md must exist");
+
+        let mut on_disk: Vec<String> = Vec::new();
+        for entry in entries {
+            let path = entry.expect("readable dir entry").path();
+            if path.extension().is_none_or(|ext| ext != "md" && ext != "mdc") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            on_disk.push(stem.to_owned());
+        }
+        assert!(
+            !on_disk.is_empty(),
+            "{} exists but holds no rules",
+            rules_dir.display()
+        );
+
+        let undocumented: Vec<&String> =
+            on_disk.iter().filter(|name| !doc.contains(name.as_str())).collect();
+        assert!(
+            undocumented.is_empty(),
+            "these TTSR rules exist but FORK.md never mentions them, so nobody knows \
+             they can interrupt a turn: {undocumented:#?}\n\
+             Add a row to FORK.md §6 \"Enforced guards\".",
+        );
+
+        // The other direction: a row naming a rule file that is gone.
+        let dangling: Vec<String> = doc
+            .lines()
+            .filter_map(|line| line.split('`').nth(1))
+            .filter(|token| token.starts_with("fork-") && !token.contains(' '))
+            .filter(|token| !on_disk.iter().any(|name| name == token))
+            .map(str::to_owned)
+            .collect();
+        assert!(
+            dangling.is_empty(),
+            "FORK.md documents these rules but no file backs them in .omp/rules/: \
+             {dangling:#?}\nEither restore the rule or drop its row.",
+        );
+    }
+
     #[test]
     fn layout_insertion_point_supports_global_default_and_per_mode_override() {
         let settings: LayoutSettings = toml::from_str(

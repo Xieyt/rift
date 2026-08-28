@@ -1228,3 +1228,44 @@ no-op that passes vacuously. Both produced a confident wrong reading before the
 in-process test settled it. Fourth bad probe in this series (`--title`,
 `focus-column` spawn race, the pid-under-`id` ghost check, now this): **when a live
 check disagrees with the code, suspect the probe first.**
+
+### 10.7 What is now enforced instead of remembered
+
+This sync's failures were all the same shape: **a curated list or a habit that
+nothing checked.** A dead `--skip`, a test module upstream added, a fork feature
+dropped by a clean auto-merge, a push state read from a stale ref. Prose asking the
+next person to remember has now failed on every one of these at least once.
+
+So the load-bearing invariants moved out of prose, split by *when* they can be
+caught. Both halves are listed in `FORK.md` §6 "Enforced guards".
+
+**TTSR rules (`.omp/rules/*.md`) — fire while the mistake is being made.** Five,
+covering: pushing to `upstream`, rebasing onto `upstream`, reading `origin/<b>` from
+a stale ref, adding an unclassified `#[cfg(test)]` module, and writing a
+`state.selected` assignment without pairing `Column.active`. The first two interrupt;
+the rest fold a reminder into the tool result.
+
+**Guard tests — fire on every `just test`.** `just_test_skips_all_name_a_real_test`
+is new here, closing the hole §10.3 found. The allowlist guard has now caught five
+modules. The `snap_*` pair guards §10.1's silent collision.
+
+Three things learned building them, all of which cost a correction:
+
+1. **Write the probes, then trust nothing else.** Every rule carries
+   `probes: fire/silent`, and `omp ttsr test --rule <f>` runs them through omp's
+   real matcher. **Two of five regexes were wrong on first write** — `git\s+rebase`
+   missed `git -C <dir> rebase upstream/main`, and an unbounded gap let
+   `git push origin x && git fetch upstream` match as a violation. Both were found
+   by running the probes, not by reading the regex.
+2. **A false positive is worse than it looks.** `repeatMode` defaults to `once`, so
+   one bad fire *burns the rule* for the session — the next, real violation passes
+   silently. Hence gaps that exclude `;`, `&`, `|` rather than merely shorter gaps.
+3. **Rules are not a place to move tests to.** A rule matches a *stream*, so it can
+   only ever see what is being written, never the resulting state. The §2.D pairing
+   rule prompts you to decide; the `snap_*` tests prove the decision held. Deleting
+   either in favour of the other loses the property that made it work.
+
+One structural caveat for whoever reads this next: **rules load at session start**,
+so a rule authored mid-session does not protect that session. The ones above were
+validated with `omp ttsr test` rather than by triggering them live, which is the
+honest bound on that verification.

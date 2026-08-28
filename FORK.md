@@ -766,17 +766,19 @@ just test-all        # whole lib suite — only in a real GUI session
 ```
 
 `just test` runs through `nix develop` so it links even without direnv. It is a
-curated allowlist, currently **363 tests** (327 before the 2026-08 upstream merge;
-352 after it; 359 once the hint-bar filter was added; 363 after the 2026-08-10
-sync). Four things to know:
+curated allowlist, currently **550 tests** (327 before the 2026-08 upstream merge;
+352 after it; 359 with the hint-bar filter; 363 after 2026-08-10; 520 once the
+allowlist was widened to every headless-clean module; 550 after the 2026-08-28
+sync). Five things to know:
 
-- **Two known upstream failures**, both re-verified by running them on a pristine
-  `upstream/main` worktree — neither is ours, don't chase them. Use
-  `just upstream-test <TEST>` to re-check either one, or any future red test:
+- **Two known upstream failures**, both re-verified on a pristine `upstream/main`
+  worktree — neither is ours, don't chase them. Use `just upstream-test <TEST>` to
+  re-check either, or any future red test:
   - `topology_change_clears_stale_pending_hide_target_before_next_workspace_layout`
-  - `ax_invalidation_after_quarantine_release_preserves_live_layout_state` — arrived
-    with upstream's `1e3a898`; the model survives an AX-element swap but the layout
-    node does not. See UPSTREAM-SYNC.md §8.3.
+  - `wsid_rekey_preserves_floating_membership_and_position` — bisected to `792370e`;
+    a floated window loses its floating state across a WindowServerId rekey.
+    Upstream's `f2a9349` (#440) reverted that commit's reactor branch but **not**
+    the `identify_stale_windows` predicate that causes this. UPSTREAM-SYNC.md §10.4.
 - **Window-server tests need a real GUI session.** Tests touching SkyLight
   (`SLS…`) abort with an objc weak-reference error in a headless/agent shell,
   so `just test` excludes them; use `just test-all` from your logged-in desktop.
@@ -791,17 +793,18 @@ sync). Four things to know:
   the abort:
   `cargo test --lib -- <test> --test-threads=1 --nocapture`
   Without it you learn which test died; with it you learn why.
-- **The allowlist hole is closed mechanically, not by promise.** Its seven module
-  filters are `layout_engine`, `actor::raise_manager`, `actor::reactor::tests`,
-  `common::config`, `ui::stack_line`, `ui::hints_bar`, `ui::menu_bar`. The last three
-  were each missing at some point — §2.E's hint-bar tests silently never ran for
-  months while §2.E claimed they did, and `ui::menu_bar` arrived with upstream's
-  `abdbcc8` carrying four tests that would have gone the same way. Two doc notes
-  asking the next person to remember failed twice, so the invariant is now a test:
-  `common::config::tests::just_test_allowlist_classifies_every_test_module` parses
-  this recipe out of the `justfile` and asserts every `#[cfg(test)] mod` in `src/` is
-  either allowlisted or in its explicit `GUI_OR_DEFERRED` list. Add a test module
-  without classifying it and that test fails by name.
+- **The allowlist hole is closed mechanically, not by promise.** Do not enumerate the
+  filters here — that list rotted twice already. The `test:` recipe in `justfile` *is*
+  the list, and `common::config::tests::just_test_allowlist_classifies_every_test_module`
+  parses it and asserts every `#[cfg(test)] mod` in `src/` is either allowlisted or in
+  its explicit `GUI_OR_DEFERRED` list. Add a test module without classifying it and
+  that test fails by name. It has caught five, most recently upstream's
+  `actor::gesture_tap::tests`.
+- **Skip names rot the same way, and now have their own guard.**
+  `just_test_skips_all_name_a_real_test` fails when a `--skip` matches no test in
+  `src/`. Added 2026-08-28 after a skip was found naming a test upstream had renamed
+  months earlier — libtest treats an unmatched `--skip` as filtering zero tests, so
+  the suppression looked honoured while being a no-op. Verify skips by deletion.
 
 **Install / test on this Mac.** Real builds and the running WM are driven via
 `just` (see the `justfile`):
@@ -955,6 +958,55 @@ build covers both sides. For a wall-clock cross-check, sample the process instea
 `ps -o cputime= -p "$(pgrep -f Rift.app/Contents/MacOS/rift)"` before/after a
 fixed workload and diff — lower CPU-time for the same work = win.
 
+### Enforced guards (`.omp/rules/` + guard tests)
+
+Some invariants in this document used to be *requests to remember*, and those failed
+every time they were tested: the allowlist hole survived two doc notes asking the
+next person to remember it; a `--skip` name rotted unnoticed for months; hints-bar
+hot reload is one careless "take theirs" away from silent deletion. So the load-bearing
+ones are now enforced, in one of two places depending on **when** they can be caught.
+
+**TTSR rules — `.omp/rules/*.md`.** Time Traveling Stream Rules. A `condition` regex
+or `astCondition` pattern is matched against the assistant's live stream (prose,
+thinking, or tool arguments); a hit interrupts generation, discards the partial
+output, and re-injects the rule. They stop a mistake *while it is being made*, which
+is the only useful moment for a policy violation that a compiler cannot see.
+
+| rule | catches | doc it enforces |
+|---|---|---|
+| `fork-never-push-upstream` | `git push … upstream …` | §1 |
+| `fork-sync-never-rebase` | `git rebase … upstream …` | §3 |
+| `fork-remote-state-not-cached` | reading `origin/<b>` counts from a stale ref | UPSTREAM-SYNC.md §10.6 |
+| `fork-test-module-needs-allowlist` | a new `#[cfg(test)]` module | §6 "Tests" |
+| `fork-scrolling-selection-pairs-active` | `state.selected = Some(..)` unpaired with `Column.active` | §2.D |
+
+Each rule carries `probes: fire/silent` — worked examples that MUST and MUST NOT
+match. Validate them against omp's own matcher, never by eye:
+
+```bash
+omp ttsr list                                    # discovered rules + parsed conditions
+omp ttsr test --rule .omp/rules/<name>.md \
+  --source tool --tool bash 'git push upstream x' # does it fire on what you think?
+```
+
+Two of the five regexes were wrong on first write and the probes caught both: one
+missed `git -C <dir> rebase …`, the other let a compound (`git push origin x && git
+fetch upstream`) bridge two innocent clauses. **False positives are expensive** —
+`repeatMode` defaults to `once`, so one bad fire burns the rule for the session.
+Gaps in these regexes therefore exclude `;`, `&`, `|`.
+
+**Guard tests — invariants, not moments.** Anything checkable after the fact belongs
+in the suite instead, where it runs on every `just test`:
+`just_test_allowlist_classifies_every_test_module` (five catches),
+`just_test_skips_all_name_a_real_test`, `default_config_parses` (the
+`MoveFocusArgs::Repr::Bare` landmine, §4 item 5), and the `snap_*` pair guarding
+§2.D tab memory.
+
+**Do not migrate one into the other.** A rule fires before the edit exists; a test
+fires after it lands. Converting either direction loses the property that made it
+work. And when you change a policy in this document, change its rule too — the
+`description` line is the contract, the body is the argument.
+
 ---
 
 ## 7. Quick reference
@@ -972,6 +1024,10 @@ git diff --stat upstream/main..xieyt/5
 # structural tripwires — any hit means sync now, not later (UPSTREAM-SYNC.md §7)
 git diff --stat HEAD..upstream/main -- Cargo.toml Cargo.lock crates/
 git log --oneline HEAD..upstream/main -- src/layout_engine/systems/scrolling.rs
+
+# what is enforced automatically (§6 "Enforced guards")
+omp ttsr list                          # TTSR rules + their parsed conditions
+just test                              # guard tests, incl. the allowlist/skip guards
 ```
 
 ---
