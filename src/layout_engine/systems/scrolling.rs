@@ -2368,6 +2368,118 @@ mod tests {
         );
     }
 
+    /// Upstream's `9215d53` rewrote `snap_to_nearest_column` to also *select* a
+    /// window (it used to only scroll). Its version indexes the target column by
+    /// the source column's row and never touches `Column.active`, which silently
+    /// breaks tab memory: the merge is textually clean, so only a test catches it.
+    #[test]
+    fn snap_restores_the_target_columns_active_tab() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let a = wid(1, 1);
+        let b1 = wid(2, 1);
+        let b2 = wid(2, 2);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![
+                Column {
+                    windows: vec![a],
+                    width_offset: 0.0,
+                    width_overridden: false,
+                    height_weights: vec![1.0],
+                    tabbed: false,
+                    active: None,
+                },
+                Column {
+                    windows: vec![b1, b2],
+                    width_offset: 0.0,
+                    width_overridden: false,
+                    height_weights: vec![1.0, 1.0],
+                    tabbed: true,
+                    // The user last looked at the second tab.
+                    active: Some(b2),
+                },
+            ];
+            // Selection sits in column 0 at row 0, so a row-indexed snap would
+            // land on `b1` - the discriminating case.
+            state.selected = Some(a);
+        }
+
+        let gaps = GapSettings::default();
+        let scr = screen(1000.0, 800.0);
+        let _ = render(&system, layout, scr, &gaps);
+
+        {
+            // Park the strip far right so the nearest boundary is column 1.
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.scroll_offset_px.store(1.0e6f64.to_bits(), Ordering::Relaxed);
+        }
+
+        assert_eq!(
+            system.snap_to_nearest_column(layout),
+            Some(b2),
+            "snapping onto a tabbed column restores its remembered tab, not row 0"
+        );
+
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.selected, Some(b2));
+        assert_eq!(
+            state.columns[1].active,
+            Some(b2),
+            "tab memory must stay paired with the selection"
+        );
+    }
+
+    /// The pairing half, on a plain stack: snap still selects by row there, but
+    /// whatever it selects must become that column's remembered window.
+    #[test]
+    fn snap_pairs_tab_memory_with_the_selection_on_a_plain_stack() {
+        let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
+        let layout = system.create_layout();
+        let a = wid(1, 1);
+        let b1 = wid(2, 1);
+        let b2 = wid(2, 2);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.columns = vec![
+                Column {
+                    windows: vec![a],
+                    width_offset: 0.0,
+                    width_overridden: false,
+                    height_weights: vec![1.0],
+                    tabbed: false,
+                    active: None,
+                },
+                Column {
+                    windows: vec![b1, b2],
+                    width_offset: 0.0,
+                    width_overridden: false,
+                    height_weights: vec![1.0, 1.0],
+                    tabbed: false,
+                    active: None,
+                },
+            ];
+            state.selected = Some(a);
+        }
+
+        let gaps = GapSettings::default();
+        let scr = screen(1000.0, 800.0);
+        let _ = render(&system, layout, scr, &gaps);
+        {
+            let state = system.layouts.get_mut(layout).expect("layout state missing");
+            state.scroll_offset_px.store(1.0e6f64.to_bits(), Ordering::Relaxed);
+        }
+
+        let landed = system.snap_to_nearest_column(layout).expect("snap selects a window");
+        let state = system.layouts.get(layout).expect("layout state missing");
+        assert_eq!(state.selected, Some(landed));
+        assert_eq!(
+            state.columns[1].active,
+            Some(landed),
+            "every selection write pairs with the owning column's active"
+        );
+    }
+
     #[test]
     fn respects_min_width_and_min_height_independently() {
         let mut system = ScrollingLayoutSystem::new(&ScrollingLayoutSettings::default());
