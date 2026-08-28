@@ -2118,6 +2118,72 @@ mod tests {
         );
     }
 
+    /// The allowlist guard above covers test *modules*. Nothing covered the
+    /// `--skip` names until 2026-08-28, when a sync found
+    /// `--skip ax_invalidation_after_quarantine_release_preserves_live_layout_state`
+    /// naming a test upstream had renamed months earlier. A `--skip` that matches
+    /// nothing is not an error to libtest — it silently filters zero tests, so the
+    /// skip looks honoured while the test it was meant to suppress either runs
+    /// (and passes, hiding that the skip is stale) or no longer exists at all.
+    ///
+    /// Same failure shape as the allowlist hole: a curated list that fails *silent*.
+    /// Upstream renames tests freely, so this rots on their schedule, not ours.
+    #[test]
+    fn just_test_skips_all_name_a_real_test() {
+        let recipe = include_str!("../../justfile")
+            .lines()
+            .find(|line| line.contains("cargo test --lib --") && line.contains("--skip"))
+            .expect("justfile must still have a `test:` recipe running `cargo test --lib`");
+
+        let skips: Vec<&str> = recipe
+            .split("--skip")
+            .skip(1)
+            .filter_map(|rest| rest.split_whitespace().next())
+            .collect();
+        assert!(!skips.is_empty(), "recipe shape changed: no --skip names parsed");
+
+        // Every `fn NAME` under src/. `--skip` is a substring match against the
+        // full test path, so a prefix of a test's name is a legitimate skip
+        // (`topology_change_clears_stale_pending_hide_target` is one).
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut fn_names: Vec<String> = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("source must be readable");
+                for line in body.lines() {
+                    let Some(rest) = line.trim_start().strip_prefix("fn ") else {
+                        continue;
+                    };
+                    if let Some(name) = rest.split(['(', '<', ' ']).next() {
+                        fn_names.push(name.to_owned());
+                    }
+                }
+            }
+        }
+
+        let dead: Vec<&str> = skips
+            .iter()
+            .copied()
+            .filter(|skip| !fn_names.iter().any(|name| name.contains(skip)))
+            .collect();
+        assert!(
+            dead.is_empty(),
+            "these `just test` --skip names match no test in src/, so they filter \
+             nothing and the suppression they claim is imaginary: {dead:#?}\n\
+             Either the test was renamed upstream (re-point the skip and re-verify \
+             with `just upstream-test <TEST>`) or it is gone (delete the skip).",
+        );
+    }
+
     #[test]
     fn layout_insertion_point_supports_global_default_and_per_mode_override() {
         let settings: LayoutSettings = toml::from_str(
