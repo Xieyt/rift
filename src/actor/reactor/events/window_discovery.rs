@@ -2,10 +2,11 @@ use tracing::{debug, trace, warn};
 
 use super::window;
 use crate::actor::app::{AppInfo, WindowId, WindowInfo, pid_t};
-use crate::actor::reactor::{LayoutEvent, WindowFilter, WindowState, utils};
+use crate::actor::reactor::{LayoutEvent, WindowState, utils};
 use crate::common::collections::{BTreeMap, HashMap, HashSet};
-use crate::model::AppRuleResult;
+use crate::layout_engine::ResolvedWindow;
 use crate::model::virtual_workspace::WorkspaceError;
+use crate::model::{AppRuleEffects, AppRuleResult};
 use crate::sys::screen::SpaceId;
 use crate::sys::window_server::WindowServerId;
 
@@ -18,10 +19,7 @@ fn sync_existing_window_state(
     active_space: Option<SpaceId>,
 ) -> anyhow::Result<crate::actor::reactor::events::EventOutcome> {
     let was_minimized = state.windows.window(wid).is_some_and(|window| window.info.is_minimized);
-    let was_manageable = state
-        .windows
-        .window(wid)
-        .is_some_and(|window| window.matches_filter(WindowFilter::EffectivelyManageable));
+    let was_manageable = state.windows.window(wid).is_some_and(WindowState::is_admitted);
 
     if let Some(existing) = state.windows.window_mut(wid) {
         existing.info.title = info.title.clone();
@@ -51,18 +49,12 @@ fn sync_existing_window_state(
             })?
         }
         _ => {
-            let manageable = utils::compute_window_manageability(
-                info.sys_id,
-                info.is_minimized,
-                info.is_standard,
-                info.is_root,
-                |wsid| state.windows.get_window_server_info(wsid),
-            );
             if let Some(existing) = state.windows.window_mut(wid) {
                 existing.info.is_minimized = info.is_minimized;
-                existing.is_manageable = manageable;
             }
-            if was_manageable && !manageable {
+            let is_admitted = utils::refresh_heuristic(state, wid)
+                .is_some_and(|transition| transition.is_admitted);
+            if was_manageable && !is_admitted {
                 crate::actor::reactor::events::EventOutcome::default()
                     .with_layout_event(LayoutEvent::WindowRemoved(wid))
             } else {
@@ -121,9 +113,15 @@ fn sync_window_server_id_mapping(
         if let Some(previous_wid) = state.windows.track_window_server_id(new_wsid, wid)
             && previous_wid != wid
         {
+            let previous_state = state.windows.window(previous_wid).cloned();
             layout
                 .layout_engine
                 .rekey_window_identity(&mut state.windows, previous_wid, wid);
+            if let Some(previous_state) = previous_state
+                && !state.windows.contains_window(wid)
+            {
+                state.windows.insert_window(wid, previous_state);
+            }
             outcome =
                 outcome.with_layout_event(LayoutEvent::WindowRemovedPreserveFloating(previous_wid));
             state.windows.remove_window(previous_wid);
@@ -180,7 +178,6 @@ pub(crate) fn identify_stale_windows(
         .iter_visible_window_server_ids()
         .any(|wsid| state.windows.tracked_window_id(wsid).is_some_and(|wid| wid.pid == pid));
     let skip_stale_cleanup = snapshot.suppressed
-        || pending_refresh
         || snapshot.mission_control_active
         || snapshot.drag_active
         || (known_visible_set.is_empty() && !has_visible_window_server_ids);
@@ -235,7 +232,9 @@ pub(crate) fn identify_stale_windows(
             let height = info.frame.size.height.abs();
 
             // A failed private WindowServer query is not evidence that a window died.
-            // Only explicit negative observations may retire an AX-omitted window.
+            // Only explicit negative observations may retire an AX-omitted window. This also
+            // applies to the first tracked recovery refresh: blanket suppression there leaves
+            // genuine closes that occurred during sleep/display churn as layout ghosts.
             let unsuitable = matches!(observation.suitable, Some(false));
             let invalid_layer = info.layer != 0;
             let too_small = width < MIN_REAL_WINDOW_DIMENSION || height < MIN_REAL_WINDOW_DIMENSION;
@@ -330,25 +329,18 @@ pub(crate) fn process_window_list(
                     outcome.absorb(existing_outcome);
                 }
             } else {
-                let mut window_state: WindowState = WindowState::from((*info).clone());
-                let manageable = utils::compute_window_manageability(
-                    window_state.info.sys_id,
-                    window_state.info.is_minimized,
-                    window_state.info.is_standard,
-                    window_state.info.is_root,
-                    |wsid| state.windows.get_window_server_info(wsid),
-                );
-                window_state.is_manageable = manageable;
+                outcome.absorb(sync_window_server_id_mapping(
+                    state,
+                    layout,
+                    wid,
+                    None,
+                    info.sys_id,
+                    window.current_native_space,
+                ));
+                let window_state: WindowState = WindowState::from((*info).clone());
                 state.windows.insert_window(wid, window_state);
+                let _ = utils::refresh_heuristic(state, wid);
             }
-            outcome.absorb(sync_window_server_id_mapping(
-                state,
-                layout,
-                wid,
-                None,
-                info.sys_id,
-                window.current_native_space,
-            ));
         }
         // fall through
     }
@@ -399,16 +391,9 @@ pub(crate) fn update_window_states(
 ) {
     // Update or insert window states
     for (wid, info) in new_windows {
-        let mut state: WindowState = info.into();
-        let manageable = utils::compute_window_manageability(
-            state.info.sys_id,
-            state.info.is_minimized,
-            state.info.is_standard,
-            state.info.is_root,
-            |wsid| rift_state.windows.get_window_server_info(wsid),
-        );
-        state.is_manageable = manageable;
+        let state: WindowState = info.into();
         rift_state.windows.insert_window(wid, state);
+        let _ = utils::refresh_heuristic(rift_state, wid);
     }
 }
 
@@ -445,33 +430,26 @@ fn apply_assignment_result(
     wid: WindowId,
     space: SpaceId,
     assign_result: Result<AppRuleResult, WorkspaceError>,
-) -> crate::actor::reactor::events::EventOutcome {
+) -> (
+    crate::actor::reactor::events::EventOutcome,
+    Option<AppRuleEffects>,
+) {
     let mut outcome = crate::actor::reactor::events::EventOutcome::default();
-    match assign_result {
-        Ok(AppRuleResult::Managed(_)) => {
-            if let Some(window) = state.windows.window_mut(wid) {
-                window.ignore_app_rule = false;
-            }
-        }
-        Ok(AppRuleResult::Unmanaged) => {
-            if let Some(window) = state.windows.window_mut(wid) {
-                window.ignore_app_rule = true;
-            }
-            let needs_removal = {
-                let engine = &layout.layout_engine;
-                engine
-                    .virtual_workspace_manager()
-                    .workspace_for_window(&state.windows, space, wid)
-                    .is_some()
-                    || engine.is_window_floating(wid)
-            };
-            if needs_removal {
+    let effects = match assign_result {
+        Ok(AppRuleResult::Managed(effects)) => Some(effects),
+        Ok(AppRuleResult::Rejected(_)) => {
+            if utils::rejection_needs_removal(state, layout, wid, space) {
                 outcome = outcome.with_layout_event(LayoutEvent::WindowRemoved(wid));
             }
+            None
         }
-        Err(e) => warn!("Failed to assign window {:?} to workspace: {:?}", wid, e),
-    }
-    outcome
+        Err(e) => {
+            warn!("Failed to assign window {:?} to workspace: {:?}", wid, e);
+            utils::clear_rule_admission(state, wid);
+            None
+        }
+    };
+    (outcome, effects)
 }
 
 pub(crate) struct EmitLayoutPayload<'a> {
@@ -511,9 +489,7 @@ pub(crate) fn emit_layout_events(
         .filter_map(|wsid| state.windows.tracked_window_id(wsid))
         .any(|wid| {
             wid.pid == pid
-                && state.windows.window(wid).is_some_and(|window| {
-                    window.matches_filter(WindowFilter::EffectivelyManageable)
-                })
+                && state.windows.window(wid).is_some_and(WindowState::can_reconcile_admission)
         });
 
     // Collect windows from visible window server IDs
@@ -522,12 +498,7 @@ pub(crate) fn emit_layout_events(
         .iter_visible_window_server_ids()
         .filter_map(|wsid| state.windows.tracked_window_id(wsid))
         .filter(|wid| wid.pid == pid)
-        .filter(|wid| {
-            state
-                .windows
-                .window(*wid)
-                .is_some_and(|window| window.matches_filter(WindowFilter::EffectivelyManageable))
-        })
+        .filter(|wid| state.windows.window(*wid).is_some_and(WindowState::can_reconcile_admission))
     {
         let Some(space) = discovery_spaces.get(&wid).copied() else {
             continue;
@@ -543,10 +514,7 @@ pub(crate) fn emit_layout_events(
     // fall back to the app-reported known_visible list for this pid.
     for wid in known_visible.iter().copied().filter(|wid| wid.pid == pid) {
         if included.contains(&wid)
-            || !state
-                .windows
-                .window(wid)
-                .is_some_and(|window| window.matches_filter(WindowFilter::EffectivelyManageable))
+            || !state.windows.window(wid).is_some_and(WindowState::can_reconcile_admission)
         {
             continue;
         }
@@ -592,51 +560,41 @@ pub(crate) fn emit_layout_events(
     let discovered_spaces = active_spaces.iter().copied().collect::<Vec<_>>();
     for space in active_spaces {
         let windows_for_space = app_windows.remove(&space).unwrap_or_default();
+        let mut resolved_app_rules = HashMap::default();
 
         if !windows_for_space.is_empty() {
             for &wid in &windows_for_space {
                 let assign_result = assignment_results.remove(&(space, wid)).unwrap_or_else(|| {
                     assign_discovered_window_to_space(state, layout, wid, space, app_info)
                 });
-                let apply_outcome =
+                let (apply_outcome, effects) =
                     apply_assignment_result(state, layout, wid, space, assign_result);
                 outcome.absorb(apply_outcome);
+                if let Some(effects) = effects {
+                    resolved_app_rules.insert(wid, effects);
+                }
             }
         }
 
-        let windows_with_titles: Vec<(
-            WindowId,
-            Option<String>,
-            Option<String>,
-            Option<String>,
-            bool,
-            objc2_core_foundation::CGSize,
-            Option<objc2_core_foundation::CGSize>,
-            Option<objc2_core_foundation::CGSize>,
-        )> = windows_for_space
-            .iter()
-            .filter_map(|&wid| {
+        let windows: Vec<_> = windows_for_space
+            .into_iter()
+            .filter_map(|wid| {
+                let effects = resolved_app_rules.remove(&wid)?;
                 let window = state.windows.window(wid)?;
-                if !window.matches_filter(WindowFilter::EffectivelyManageable) {
+                if !window.is_admitted() {
                     return None;
                 }
-                Some((
-                    wid,
-                    Some(window.info.title.clone()),
-                    window.info.ax_role.clone(),
-                    window.info.ax_subrole.clone(),
-                    window.info.is_resizable,
-                    window.frame_monotonic.size,
-                    window.info.min_size,
-                    window.info.max_size,
-                ))
+                Some(ResolvedWindow {
+                    info: window.layout_info(wid),
+                    effects,
+                })
             })
             .collect();
 
         outcome = outcome.with_layout_event(LayoutEvent::WindowsOnScreenUpdated(
             space,
             pid,
-            windows_with_titles.clone(),
+            windows,
             app_info.clone(),
         ));
     }

@@ -5,9 +5,10 @@ pub mod systems;
 pub mod utils;
 mod workspaces;
 
+pub(crate) use engine::WindowLayoutInfo;
 pub use engine::{
     EventResponse, LayoutCommand, LayoutEngine, LayoutEvent, LayoutEventOutcome, MoveFocusArgs,
-    RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning,
+    ResolvedWindow, RestoreReport, RestoreRequest, RestoreScope, RestoreSource, RestoreWarning,
 };
 pub(crate) use floating::FloatingManager;
 pub use graph::{Direction, LayoutKind, Orientation, ResizeOrientation};

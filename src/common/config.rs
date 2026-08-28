@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::bail;
+use regex::RegexBuilder;
 pub use rift_protocol::{AnimationEasing, ConfigCommand, LayoutMode, WorkspaceSelector};
 use serde::{Deserialize, Serialize};
 
@@ -64,7 +65,7 @@ pub struct WorkspaceLayoutRule {
 
 // Allow specifying a workspace by numeric index or by name in the config.
 // This supports both `workspace = 2` and `workspace = "coding"` in app rules.
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AppWorkspaceRule {
     /// Application bundle identifier (e.g., "com.apple.Terminal")
@@ -82,10 +83,11 @@ pub struct AppWorkspaceRule {
     /// Focus the window after applying this rule, switching virtual workspaces if needed.
     #[serde(default)]
     pub focus: bool,
-    /// Whether Rift should manage matching windows (defaults to true). `false` makes the
-    /// window invisible to Rift (no tiling, floating, or assignments).
-    #[serde(default = "yes")]
-    pub manage: bool,
+    /// An explicit management override. `false` makes the window invisible to Rift;
+    /// `true` overrides normal manageability heuristics for a visible window. When
+    /// omitted, the matching rule leaves Rift's normal manageability decision intact.
+    #[serde(default)]
+    pub manage: Option<bool>,
     /// Optional: Application name pattern (alternative to app_id)
     pub app_name: Option<String>,
     /// Optional: Regular expression to match window title (applies to window.title)
@@ -265,9 +267,29 @@ impl VirtualWorkspaceSettings {
             if let Some(ref title_re) = rule.title_regex {
                 if title_re.is_empty() {
                     issues.push(format!("App rule {} has empty title_regex", index));
+                } else if let Err(error) =
+                    RegexBuilder::new(title_re).case_insensitive(true).build()
+                {
+                    issues.push(format!(
+                        "App rule {} has invalid title_regex '{}': {}",
+                        index, title_re, error
+                    ));
                 } else if !seen_title_regexes.insert(title_re) {
                     issues.push(format!("Duplicate title_regex '{}' in rule {}", title_re, index));
                 }
+            }
+
+            if rule.manage == Some(false)
+                && (rule.workspace.is_some()
+                    || rule.floating
+                    || rule.position.is_some()
+                    || rule.size.is_some()
+                    || rule.focus)
+            {
+                issues.push(format!(
+                    "App rule {} sets manage = false, so its workspace, floating, position, size, and focus effects are ignored",
+                    index
+                ));
             }
 
             if let Some(ref title_sub) = rule.title_substring {
@@ -2184,7 +2206,7 @@ mod tests {
                 h: Some(f64::NAN),
             }),
             focus: false,
-            manage: true,
+            manage: Some(true),
             app_name: None,
             title_regex: None,
             title_substring: None,
@@ -2196,6 +2218,24 @@ mod tests {
         assert!(issues.iter().any(|issue| issue.contains("between 0 and 1")));
         assert!(issues.iter().any(|issue| issue.contains("only applies")));
         assert!(issues.iter().any(|issue| issue.contains("finite positive")));
+    }
+
+    #[test]
+    fn app_rule_validation_reports_invalid_regex_and_ignored_effects() {
+        let mut settings = VirtualWorkspaceSettings::default();
+        settings.app_rules.push(AppWorkspaceRule {
+            app_id: Some("com.example.Tool".into()),
+            workspace: Some(WorkspaceSelector::Index(1)),
+            floating: true,
+            focus: true,
+            manage: Some(false),
+            title_regex: Some("[".into()),
+            ..Default::default()
+        });
+
+        let issues = settings.validate();
+        assert!(issues.iter().any(|issue| issue.contains("invalid title_regex")));
+        assert!(issues.iter().any(|issue| issue.contains("effects are ignored")));
     }
 
     #[test]

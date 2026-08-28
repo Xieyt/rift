@@ -12,14 +12,14 @@ mod selectors;
 mod transport;
 
 pub use commands::{
-    AnimationEasing, ConfigCommand, LayoutCommand, MetricsCommand, MoveFocusArgs, ReactorCommand,
-    RiftCommand,
+    AnimationEasing, ConfigCommand, FloatingWindowSize, FloatingWindowSizePreset, LayoutCommand,
+    MetricsCommand, MoveFocusArgs, ReactorCommand, RiftCommand, ToggleWindowFloatingOptions,
 };
 pub use events::{EventKind, RiftEvent, StackInfo, WorkspaceId};
 pub use layout::{Direction, LayoutKind, LayoutMode, Orientation, ResizeOrientation};
 pub use queries::{
     ApplicationData, ContainerNodeType, ContainerTreeNode, DisplayData, LayoutStateData, Point,
-    Rect, Size, WindowData, WindowId, WorkspaceData, WorkspaceLayoutData,
+    Rect, Size, WindowData, WindowId, WindowLayoutPosition, WorkspaceData, WorkspaceLayoutData,
 };
 pub use selectors::{DisplaySelector, RestoreScope, RestoreSource, WorkspaceSelector};
 pub use transport::{JsonRiftResponse, RiftRequest, RiftResponse};

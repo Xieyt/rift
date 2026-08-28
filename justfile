@@ -67,19 +67,27 @@ fmt-check:
 # module without adding its filter is a no-op that looks like coverage.
 # `ui::hints_bar` was missing for months while FORK.md §2.E claimed those tests ran.
 #
-# THREE skips, all upstream failures reproduced on a pristine `upstream/main`
+# TWO skips, both upstream failures reproduced on a pristine `upstream/main`
 # worktree via `just upstream-test <TEST>` — not our regressions. UPSTREAM-SYNC.md §9.
 #   topology_change_clears_stale_pending_hide_target        long-standing
-#   ax_invalidation_after_quarantine_release_preserves_live_layout_state   (1e3a898)
 #   wsid_rekey_preserves_floating_membership_and_position   (792370e, bisected)
 #
-# The third is the one to watch: `792370e "fix: ghost windows appearing"` trades a
-# ghost-window fix for losing a window's floating state across a WindowServerId
-# rekey, so a floated window can snap back into the tiling after a rekey
-# (sleep/wake, app relaunch). Recoverable by re-floating; drop this skip once
-# upstream repairs it.
+# There were THREE until the 2026-08-28 sync. The dropped one skipped
+# `ax_invalidation_after_quarantine_release_preserves_live_layout_state`, a test
+# `792370e` had already renamed — so the filter had been a silent no-op, which is
+# the exact failure mode the paragraph above warns about. Deleted, and its
+# successor `current_ax_destruction_after_quarantine_release_removes_window`
+# passes. Skip lists rot the same way allowlists do: verify by deletion.
+#
+# The remaining rekey skip is the one to watch: `792370e "fix: ghost windows
+# appearing"` trades a ghost-window fix for losing a window's floating state
+# across a WindowServerId rekey, so a floated window can snap back into the tiling
+# after a rekey (sleep/wake, app relaunch). Recoverable by re-floating. Upstream's
+# `f2a9349 "fix: ghost windows + layout reset (#440)"` reverts 792370e's reactor
+# branch but leaves the `identify_stale_windows` predicate that actually causes
+# this, so the skip stays; drop it once that predicate is repaired.
 test:
-    nix develop -c cargo test --lib -- layout_engine model ipc common::config actor::raise_manager actor::reactor::tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::drag_swap actor::event_tap actor::menu_bar actor::notification_center actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip ax_invalidation_after_quarantine_release_preserves_live_layout_state --skip wsid_rekey_preserves_floating_membership_and_position
+    nix develop -c cargo test --lib -- layout_engine model ipc common::config actor::raise_manager actor::reactor::tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::drag_swap actor::event_tap actor::gesture_tap actor::menu_bar actor::notification_center actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip wsid_rekey_preserves_floating_membership_and_position
 
 # whole library suite — only meaningful in a real GUI session
 test-all:

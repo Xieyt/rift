@@ -244,8 +244,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
         loop {
             match rx.blocking_recv() {
                 Some((_span, event)) => {
-                    let state = server_state.read();
-                    state.publish(event);
+                    server_state.publish(event);
                 }
                 None => {
                     break;

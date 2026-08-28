@@ -4,8 +4,8 @@ use super::*;
 use crate::actor::app::WindowInfo;
 use crate::common::config::LayoutMode;
 use crate::layout_engine::{LayoutEvent, LayoutSystemKind};
-use crate::model::VirtualWorkspace;
 use crate::model::reactor::WindowState;
+use crate::model::{AppRuleResult, VirtualWorkspace};
 use crate::sys::window_server::WindowServerId;
 
 fn test_engine() -> LayoutEngine {
@@ -81,6 +81,88 @@ fn identity_transfer_preserves_window_tree_position_and_fingerprint() {
 }
 
 #[test]
+fn restored_workspace_is_resolved_before_app_rule_assignment() {
+    let settings = VirtualWorkspaceSettings {
+        app_rules: vec![crate::common::config::AppWorkspaceRule {
+            app_id: Some("com.example.terminal".into()),
+            workspace: Some(crate::common::config::WorkspaceSelector::Index(0)),
+            manage: Some(true),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let mut engine = LayoutEngine::new(&settings, &LayoutSettings::default(), None);
+    let mut window_store = WindowStore::default();
+    let space = SpaceId::new(78);
+    let window = WindowId::new(10, 3);
+    let frame = objc2_core_foundation::CGRect::new(
+        objc2_core_foundation::CGPoint::new(0.0, 0.0),
+        CGSize::new(800.0, 600.0),
+    );
+    let _ = engine.handle_event(
+        &mut window_store,
+        LayoutEvent::SpaceExposed(space, CGSize::new(1200.0, 800.0)),
+    );
+    let restored_workspace = engine.virtual_workspace_manager.list_workspaces(space)[1].0;
+    let restored_layout = engine.workspace_layouts.active(space, restored_workspace).unwrap();
+    engine
+        .workspace_tree_mut(restored_workspace)
+        .add_window_after_selection(restored_layout, window);
+    engine.persistence.windows.insert(window, WindowFingerprint {
+        window_server_id: Some(7803),
+        title: Some("Restored terminal".into()),
+        width: 800.0,
+        height: 600.0,
+        app_id: Some("com.example.terminal".into()),
+    });
+    engine.persistence.pending_windows.insert(window);
+    window_store.insert_window(window, WindowState {
+        info: WindowInfo {
+            is_standard: true,
+            is_root: true,
+            is_minimized: false,
+            is_resizable: true,
+            min_size: None,
+            max_size: None,
+            title: "Restored terminal".into(),
+            frame,
+            sys_id: Some(WindowServerId::new(7803)),
+            bundle_id: Some("com.example.terminal".into()),
+            path: None,
+            ax_role: None,
+            ax_subrole: None,
+        },
+        frame_monotonic: frame,
+        is_manageable: true,
+        manage_override: None,
+    });
+
+    let result = engine
+        .assign_window_with_app_info(
+            &mut window_store,
+            window,
+            space,
+            Some("com.example.terminal"),
+            Some("Terminal"),
+            Some("Restored terminal"),
+            None,
+            None,
+        )
+        .unwrap();
+    let AppRuleResult::Managed(effects) = result else {
+        panic!("restored live window should be managed")
+    };
+
+    assert_eq!(effects.workspace_id, restored_workspace);
+    assert_eq!(
+        engine
+            .virtual_workspace_manager
+            .workspace_for_window(&window_store, space, window),
+        Some(restored_workspace)
+    );
+}
+
+#[test]
 fn save_and_load_arms_fingerprint_reconciliation() {
     let mut engine = test_engine();
     let window = WindowId::new(42, 7);
@@ -151,7 +233,7 @@ fn full_save_records_floating_window_in_its_inactive_workspace() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -212,7 +294,7 @@ fn full_save_removes_stale_floating_frame_from_a_tiled_window() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -481,7 +563,7 @@ fn workspace_restore_keeps_current_windows_absent_from_snapshot() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     };
     window_store.insert_window(live, live_state("Live", "com.example.live", 7101));
     window_store.insert_window(
@@ -594,7 +676,7 @@ fn scoped_restore_does_not_consume_same_id_live_window_on_another_space() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -703,7 +785,7 @@ fn space_restore_uses_workspace_assignment_over_stale_window_server_space() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -804,7 +886,7 @@ fn workspace_restore_does_not_consume_live_window_from_sibling_workspace() {
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -893,7 +975,7 @@ fn workspace_restore_preserves_live_window_when_saved_process_local_id_is_reused
         },
         frame_monotonic: frame,
         is_manageable: true,
-        ignore_app_rule: false,
+        manage_override: None,
     });
     assert!(engine.virtual_workspace_manager.assign_window_to_workspace(
         &mut window_store,
@@ -976,11 +1058,12 @@ fn completed_app_discovery_discards_unmatched_startup_ghosts() {
     engine.floating.set_last_focus(Some(ghost));
     assert!(engine.workspace_tree(workspace).contains_window(layout, ghost));
 
-    let _ = engine.handle_event(
+    let completion = engine.handle_event(
         &mut window_store,
         LayoutEvent::WindowDiscoveryCompleted(ghost.pid, None, vec![space]),
     );
 
+    assert!(completion.response.changed);
     assert!(!engine.workspace_tree(workspace).contains_window(layout, ghost));
     assert!(!engine.persistence.windows.contains_key(&ghost));
     assert!(!engine.persistence.pending_windows.contains(&ghost));
