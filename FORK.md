@@ -57,21 +57,65 @@ Everything we carry lives in a **handful of single-purpose commits** on top of
   - **rustfmt is pinned to nightly** (`latest.rustfmt`), not stable: `rustfmt.toml`
     enables unstable options, so stable `cargo fmt` would silently reflow the
     whole tree. See §6 "Formatting".
+  - That pin is the single most expensive thing in the shell: fenix runs
+    `install_name_tool -add_rpath ${rustc}/lib` on rustfmt because the dist
+    binary links `@rpath/librustc_driver-*.dylib`, so 2.1 MiB of nightly rustfmt
+    drags in the **106 MiB nightly `rustc` tarball** next to the stable one. It
+    is not removable while nightly `cargo fmt` has to work in the shell, and
+    having it in `PATH` is also what stops an ambient *stable* rustfmt from
+    reflowing the tree.
+- **All flake inputs follow the one `nixpkgs`.** `devshell`'s `nixpkgs` and
+  `flake-parts`' `nixpkgs-lib` are pinned to ours, and fenix's
+  `rust-analyzer-src` — source for the rust-analyzer *package*, which this flake
+  never builds — is pointed at `nixpkgs` too. Unfollowed, the lock carried a
+  second nixpkgs (45.9 MiB fetch, 183 MiB unpacked, plus a second full nixpkgs
+  evaluation on every shell entry) and two source trees nothing reads.
 - **ScreenCaptureKit SDK pin.** Upstream's Mission Control runs on
   ScreenCaptureKit, which needs the macOS **12.3+** SDK. The shared crane `args`
-  pin it explicitly — `buildInputs = [ pkgs.apple-sdk_15 (pkgs.darwinMinVersionHook "12.3") ]`
+  pin it explicitly — `buildInputs = [ pkgs.apple-sdk_14 ]`
   — instead of inheriting whatever `clangStdenv` happens to default to, so a
-  nixpkgs bump can't silently break the `objc2` framework link. No explicit
-  `-framework` flags are needed (the `objc2-*` crates emit
-  `#[link(kind = "framework")]`), and both are `buildInputs`, so `strictDeps = true`
-  stays valid. The devShell needs the SDK **and** an explicit
-  `DEVELOPER_DIR = "${pkgs.apple-sdk_15}"`: it uses a naked stdenv, so **no setup
-  hook fires** — neither apple-sdk's `DEVELOPER_DIR` hook nor
-  `darwinMinVersionHook` applies — and the cc/bintools wrappers read
-  `DEVELOPER_DIR` at runtime, so without it an ambient `cargo build` cannot find
-  ScreenCaptureKit. Deliberately **no** `MACOSX_DEPLOYMENT_TARGET` there:
-  `darwinMinVersionHook` is a *floor*, the ambient default already sits above 12.3,
-  and pinning it would diverge from the crane build.
+  nixpkgs bump can't silently break the `objc2` framework link. The pin is
+  `apple-sdk_14`, **not** `_15`, because 14.4 is *also* the current nixpkgs
+  stdenv default: the clang/bintools wrappers already reference that exact store
+  path, so the pin is free, whereas `_15` added a second SDK to every closure
+  (31 MiB fetch, 459 MiB unpacked) for APIs this tree does not call — every SCK
+  symbol used here (`SCShareableContent`, `SCContentFilter`,
+  `SCStreamConfiguration`, `SCScreenshotManager`, `SCCaptureResolutionType`) is
+  ≤ 14.0. If a future nixpkgs moves stdenv off 14.x, bump the pin to the new
+  default rather than leaving two SDKs in the closure. The SDK is the *only*
+  entry there now — see the next bullet for the min-version hook that used to sit
+  beside it. No explicit `-framework` flags are needed (the `objc2-*` crates emit
+  `#[link(kind = "framework")]`), and it is a `buildInputs` entry, so
+  `strictDeps = true` stays valid. The devShell needs the SDK **and** an explicit
+  `DEVELOPER_DIR = "${pkgs.apple-sdk_14}"`: it uses a naked stdenv, so **no setup
+  hook fires** — apple-sdk's `DEVELOPER_DIR` hook included — and the cc/bintools
+  wrappers read `DEVELOPER_DIR` at runtime, so without it an ambient
+  `cargo build` cannot find ScreenCaptureKit.
+- **Minimum macOS is 14.0, and it comes from nixpkgs — not from a choice of
+  ours.** There used to be a `(pkgs.darwinMinVersionHook "12.3")` next to the SDK
+  in `args.buildInputs`, on the theory that ScreenCaptureKit's weak-linked
+  symbols need a 12.3 floor. The hook only *raises* `MACOSX_DEPLOYMENT_TARGET`,
+  and nixpkgs gives aarch64-darwin `darwinMinVersion = "14.0"`
+  (`lib/systems/default.nix`), so it never fired: every binary this flake has
+  ever shipped is stamped `LC_BUILD_VERSION minos 14.0` (`otool -l`). It was a
+  no-op asserting a floor the build does not honour, so it is **gone**, and 14.0
+  is now stated instead of implied. `nix/package.nix` reads the number back from
+  `pkgs.stdenv.hostPlatform.darwinMinVersion` into one `minOsVersion` binding
+  that feeds all three places that must agree:
+  1. the crane build's stamped `minos` (implicitly — stdenv already uses it);
+  2. `LSMinimumSystemVersion` in the generated bundle plist, which previously
+     declared **no** minimum at all;
+  3. the devShell's `MACOSX_DEPLOYMENT_TARGET`.
+  (3) is not redundant: rustc ignores the cc wrapper's `-mmacosx-version-min` and
+  stamps its own built-in default for `aarch64-apple-darwin` — 11.0, as
+  `rustc --print deployment-target` shows — whenever the variable is unset, so
+  devShell builds used to claim macOS 11 while the packaged binary claimed 14.
+  Both are 14.0 now, verified by `otool -l` on `target/debug/rift-cli` and on
+  `result/Applications/Rift.app/Contents/MacOS/rift`. Setting the platform
+  default rather than a lower floor also keeps the linker quiet — a lower target
+  against nixpkgs' 14.0 dylibs earns "built for newer macOS version than being
+  linked" on every build. If a nixpkgs bump ever drops the default below what
+  ScreenCaptureKit needs, reintroduce the hook **and** fix the plist together.
 - **Workspace scoping — placement is the whole trick.** Upstream is now a cargo
   workspace: the root `rift-wm` package plus two upstream crates,
   `crates/rift-protocol` and `crates/rift-client`.
@@ -500,6 +544,13 @@ file upstream owns but away from its SCK plumbing.
 ---
 
 ## 3. Syncing with upstream (rebase vs merge)
+
+> **Currently 77 commits behind `upstream/main` (`74ce00d` → `83f3b66`), with a
+> measured plan in `UPSTREAM-SYNC.md` §11.** Read §11.4 (hazard register) and
+> §11.6 (ten-checkpoint stage plan) before starting a merge. This one is a
+> *migration*, not a conflict pass: upstream deleted `src/actor/event_tap.rs` and
+> `src/actor/gesture_tap.rs` — both of which carry fork hunks — into a single
+> `src/actor/input.rs`.
 
 **Use `merge`, not `rebase`, for routine syncs.** We carry a large feature set (see
 §2) and sync periodically, so upstream deltas are non-trivial. A merge resolves the

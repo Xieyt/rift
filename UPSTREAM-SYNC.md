@@ -21,21 +21,29 @@ its own sake:
   to sync: it is the shortest complete worked example, and §8.3 covers what to do
   when upstream ships a failing test.
 
-## 0. Status — four syncs complete; §10 is the newest
+## 0. Status — four syncs complete, a fifth **planned in §11**
 
 ```
 branch                    xieyt/5
-behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     62
+behind upstream           77       (git rev-list --left-right --count HEAD...upstream/main)
+ahead                     64
 upstream tip merged       74ce00d  (2026-08-28; backlog ended 6c64d8b, then 1de4d09,
-                                   then 7829780, then 3a52122, now this)
+                                   then 7829780, then 3a52122, then this)
+upstream tip available    83f3b66  (2026-09-17) — 77 commits, planned in §11
 curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
                               -> 363 (§8) -> 370 (§9) -> 520 (guard widened)
                               -> 549 (§10 sync)
-cargo check               --workspace --all-targets clean
+cargo check               --workspace --all-targets clean  (at 74ce00d + fork work)
 just fmt-check            clean
 nix build .#rift          succeeds; .app installed and exercised live (16/16 — see §10.6)
 ```
+
+**§11 is the plan for the fifth sync and the thing to read first if you are about to
+merge.** 77 commits behind; every §7 structural tripwire fired (§11.1). The shape of
+this one is different from all four before it: only 13 hunks, but upstream **deleted
+two files we had edited** (`event_tap.rs`, `gesture_tap.rs` → `input.rs`), so the
+cost is a migration, not a conflict-resolution pass. §11.4 is the hazard register —
+twelve places that merge clean and lose a fork behaviour.
 
 **Upstream `main` currently has two failing tests of its own**, both reproduced on
 pristine worktrees and skipped in `just test` with attribution: see §8.3 and §10.4.
@@ -340,16 +348,47 @@ target app is already frontmost). Do not "fix" the `Quiet::No`.
 Mission Control's rewrite turned a pure-code change into a packaging + permissions
 change for our `.app` bundle. What shipped:
 
-- **SDK pin:** `nix/package.nix`'s shared `args.buildInputs` is now
-  `[ pkgs.apple-sdk_15 (pkgs.darwinMinVersionHook "12.3") ]`. The devShell gets
-  `pkgs.apple-sdk_15` too, plus an explicit `DEVELOPER_DIR = "${pkgs.apple-sdk_15}"`
-  — the devShell uses a naked stdenv, so **no setup hook fires** and neither
-  apple-sdk's `DEVELOPER_DIR` hook nor `darwinMinVersionHook` applies; the cc /
-  bintools wrappers read `DEVELOPER_DIR` at runtime, so without it an ambient
-  `cargo build` cannot find ScreenCaptureKit. Deliberately **no**
-  `MACOSX_DEPLOYMENT_TARGET` in the devShell: the ambient default is already above
-  the 12.3 floor and pinning it there would diverge from the crane build.
+- **SDK pin:** `nix/package.nix`'s shared `args.buildInputs` is
+  `[ pkgs.apple-sdk_14 ]`. The devShell gets `pkgs.apple-sdk_14` too, plus an
+  explicit `DEVELOPER_DIR = "${pkgs.apple-sdk_14}"` — the devShell uses a naked
+  stdenv, so **no setup hook fires**, apple-sdk's `DEVELOPER_DIR` hook included;
+  the cc / bintools wrappers read `DEVELOPER_DIR` at runtime, so without it an
+  ambient `cargo build` cannot find ScreenCaptureKit.
   **This pin was not the blocker it was billed as — see §4.6, correction 1.**
+  **Downgraded `_15` → `_14` (2026-09-18, flake download audit).** 14.4 is what
+  the pinned nixpkgs' stdenv already defaults to, so the clang/bintools wrappers
+  reference that store path regardless: the pin is now free, while `_15` had been
+  adding a whole second SDK (31 MiB fetch, 459 MiB unpacked) to the crane build,
+  the devShell, and therefore to `.direnv`'s GC root. Every SCK symbol this tree
+  touches is ≤ 14.0 (`SCShareableContent`, `SCContentFilter`,
+  `SCStreamConfiguration`, `SCScreenshotManager`, `SCCaptureResolutionType`), and
+  `apple-sdk_12` no longer exists in nixpkgs (removed in 25.11: "Nixpkgs no longer
+  supports macOS 12"), so 14.4 is the floor available anyway. Verified by building
+  both paths: `nix develop -c cargo build` and `nix build .#rift` both succeed,
+  and both binaries link `/System/Library/Frameworks/ScreenCaptureKit.framework`
+  plus `libiconv.2.dylib`.
+- **`darwinMinVersionHook "12.3"` is GONE (2026-09-18, same audit), and 14.0 is
+  now declared.** The hook only *raises* `MACOSX_DEPLOYMENT_TARGET`, and nixpkgs
+  sets `darwinMinVersion = "14.0"` for aarch64-darwin
+  (`lib/systems/default.nix:364`), so it never fired — the shipped binary has
+  always been `LC_BUILD_VERSION minos 14.0`, not 12.3. It asserted a floor the
+  build does not honour; §4.2's original claim that the devShell's "ambient
+  default is already above the 12.3 floor" was true of the cc wrapper and
+  irrelevant to rustc. Replaced by one `minOsVersion =
+  pkgs.stdenv.hostPlatform.darwinMinVersion` binding wired into three places that
+  must agree: the crane build (implicitly, via stdenv), the bundle plist's new
+  `LSMinimumSystemVersion` (there was **none** before — the `.app` advertised no
+  minimum OS), and the devShell's `MACOSX_DEPLOYMENT_TARGET`. That last one is
+  load-bearing: rustc ignores the cc wrapper's `-mmacosx-version-min` and stamps
+  its own `aarch64-apple-darwin` default of 11.0 when the variable is unset
+  (`rustc --print deployment-target`), so devShell binaries claimed macOS 11 while
+  the packaged one claimed 14. **Verified:** in the shell
+  `MACOSX_DEPLOYMENT_TARGET=14.0` and `rustc --print deployment-target` agree,
+  `otool -l target/debug/rift-cli` → `minos 14.0`, and the packaged
+  `Rift.app/Contents/MacOS/rift` → `minos 14.0` with
+  `LSMinimumSystemVersion = 14.0` in its plist. No "built for newer macOS version
+  than being linked" warnings, since the target equals nixpkgs' dylib target
+  instead of undercutting it.
 - **Frameworks:** no explicit `-framework` flags — the `objc2-*` crates emit
   `#[link(kind="framework")]`. SDK availability is sufficient. `strictDeps = true`
   stays valid (these are `buildInputs`).
@@ -493,6 +532,16 @@ nixpkgs default bump), but it was insurance, and sequencing stage 3 behind it wa
 wasted caution. `darwinMinVersionHook` is a *floor*: it raises
 `MACOSX_DEPLOYMENT_TARGET` only if lower, so at 14.0 it is a no-op.
 **Lesson: read the default out of the nixpkgs you actually pin, not out of memory.**
+**Followed through on 2026-09-18 (flake download audit):** "still the right
+change" only half survived. The *SDK* pin stays but moved `_15` → `_14`, since
+14.4 is the default and pinning anything else buys a second SDK in the closure
+for nothing. The *hook* was deleted: a no-op that asserts a floor the build never
+applies is not insurance, it is a false claim in the source — and it hid the fact
+that rift's real requirement is **macOS 14.0**, now declared in the bundle plist
+(`LSMinimumSystemVersion`, previously absent entirely) and mirrored into the
+devShell's `MACOSX_DEPLOYMENT_TARGET`. Same lesson, one step further: after
+reading the default out of the nixpkgs you pin, check what the *artifact* ends up
+stamped with — `otool -l` was the thing nobody ran for a year.
 
 **2. §4.4's "second `Config::default()` panic" did not exist.**
 The claim was that `MoveWindowToWorkspace.follow` losing `#[serde(default)]` in the
@@ -1269,3 +1318,462 @@ One structural caveat for whoever reads this next: **rules load at session start
 so a rule authored mid-session does not protect that session. The ones above were
 validated with `omp ttsr test` rather than by triggering them live, which is the
 honest bound on that verification.
+
+---
+
+## 11. Fifth sync — **plan**, `74ce00d` → `83f3b66` (77 commits)
+
+Written 2026-09-18, not yet executed. Everything below is measured on the real
+trees — no estimates. Line numbers and hunk counts come from a throwaway full-jump
+probe, recreated with:
+
+```bash
+git worktree add --detach /tmp/rift-probe HEAD
+git -C /tmp/rift-probe -c rerere.enabled=false merge --no-commit --no-ff upstream/main
+git -C /tmp/rift-probe diff --name-only --diff-filter=U    # 12 UU
+git -C /tmp/rift-probe status --short | grep -E '^(UD|DU)'  # the 2 deletions
+```
+
+Read §11.3 and §11.4 before touching a merge; §11.6 is the order to work in.
+
+### 11.0 Situation (measured)
+
+```
+merge-base            74ce00dd8cb6cf15cba3ef7459af70ddff51a562   (§10's tip)
+behind / ahead        77 / 64
+upstream churn        85 files, +9480 / -4956
+full-jump conflicts   14 files — 12 UU (13 hunks), 2 UD
+new upstream files    src/actor/input.rs (+1850)
+                      src/layout_engine/systems/floating.rs (+807)
+                      src/sys/cocoa.rs (+329, entirely cfg-gated)
+                      crates/rift-protocol/src/transport.rs (+65)
+                      .github/workflows/{tag,docs}.yml
+upstream test delta   reactor/tests.rs 141 -> 165 #[test]
+```
+
+The two **`UD`** entries are the headline: `src/actor/event_tap.rs` and
+`src/actor/gesture_tap.rs` are *modified by us, deleted by them* — upstream folded
+both into `src/actor/input.rs` (`2ec9881`, extended by `1c57b5f`). Fork commits
+`4b460a0` (configurable horizontal scroll speed) and `42c9376` (hint-bar click
+routing) live in those files.
+
+### 11.1 Tripwire verdict — this is a sync-now, and it is late
+
+Every §7 tripwire fired:
+
+| Tripwire | Hit |
+|---|---|
+| `Cargo.toml` structural change | `[features] default/experimental/custom-event-loop/disable-axuielement-destroyed` (`1c57b5f`, `83f3b66`); `continue` + `futures-task` deps dropped (`0d17a7a`); version `0.1.0` → `0.5.9` |
+| field added to `Column` | `node_id` (`7e76bdb`) — lands beside our `tabbed`/`active` |
+| `EventOutcome` fan-out rewritten | `52a5425` (`outcome.rs` +63/-161), `f9854b7` (`WindowLayoutInfo` replaces the big tuple), `c33cf4a` |
+| `scrolling.rs` rewritten | `cf102d4` (#320) + `b3e916e` + the two #466 commits |
+| crate moved / added | `crates/rift-protocol/src/transport.rs`; `ContainerTreeNode` gains two required fields |
+
+§7's rule was "sync on structural change, not on a calendar". Five structural
+changes accumulated over three weeks. The cost is visible in §11.3: one 1850-line
+file replacing two files we had edited.
+
+### 11.2 Verdicts — all 77 commits
+
+Chronological index `#N` is `git log --reverse 74ce00d..upstream/main`. Verdict
+vocabulary as in §3: `TAKE`, `TAKE-REWORK`, `DEFEND-OURS`, `DROP-OURS`, `SKIP`.
+
+**Totals: 59 TAKE · 16 TAKE-REWORK · 2 SKIP · 0 DROP-OURS · 0 ALREADY-HAVE.**
+Nothing upstream shipped here duplicates a fork fix, and nothing of ours is
+superseded outright — the whole cost is in 16 reworks and the twelve hazards in
+§11.4. Per cluster: A 21 · B 17 · C 16 · D 12 · E 11 = 77.
+
+#### A. AX / app-lifecycle / window-discovery (21)
+
+| # | sha | subject | verdict | note |
+|---|---|---|---|---|
+| 2 | `46f5ba0` | reject ordered-out windows during discovery (#460) | TAKE | fork owns nothing in that region |
+| 3 | `59b9033` | layout/workspace resets (#456)(#440) | TAKE | reconciles from the WindowServer-authoritative snapshot |
+| 4 | `e4aa60d` | axwindows update resetting layouts (#440) | TAKE-REWORK | `WindowInventoryToken` pipeline replaces `GetVisibleWindows`; ~5 fork call sites break **loudly** (`main_window.rs:351`, `testing.rs:141,554`) |
+| 5 | `f9b152d` | duplication of child windows (#462) | TAKE | `seen_wids` dedup |
+| 6 | `6d7b21c` | refresh stale ax identifies | TAKE-REWORK | adds `RaiseTargetsMissing` self-heal **inside** our rewritten `handle_raises` — app.rs conflict |
+| 9 | `b1060de` | window_spaces returning >1 spaces | TAKE | `spaces.rs` only |
+| 10 | `21efa52` | reject snapshots with `space: None` | TAKE | one-line tighten + tests |
+| 14 | `372fcd2` | reap child when NOTE_EXIT beats zombie (#465) | TAKE | `sys/dispatch.rs`; no overlap with `c32893b`/`b31dddf` |
+| 19 | `d095bb6` | refresh stale AX inventories after display wake | TAKE | needs #4's `in_flight` map |
+| 20 | `d8214ba` | don't reset layout across display sizes (#440) | TAKE | size-keyed restore |
+| 21 | `e7eb854` | loginwindow activation authoritative (#456) | TAKE | `process.rs`/`spaces.rs`; **complements** §2.B, never touches it |
+| 22 | `251fe8b` | don't destroy on InvalidUIElement (#456) | TAKE | `WindowInvalidated(source)` keeps the logical window |
+| 24 | `1714f90` | windowtitlechanged not firing (#471) | TAKE | app-level observer; makes our §2.C/§2.E titles *fresher* |
+| 25 | `beeac0e` | track dragged frame while swap pending (#475) | TAKE | `DragState::PendingSwap`; hint-bar clicks never enter `DragState` |
+| 28 | `556b7ad` | only rerun title rule | TAKE | `engine.rs:2837`, far from our hunks |
+| 49 | `0121cf2` | keep self-initiated focus raises quiet (#485) | TAKE-REWORK | `Quiet::No` → `Quiet::Yes` at two sites that carry our `activate` — see hazard H1/H2 |
+| 53 | `3689e81` | prevent duplicate app threads | TAKE | `ExitGuard`→`AppExited`; merges around our `wm_controller` wiring |
+| 73 | `311d57e` | handle slow launching apps (#491) | TAKE | **must land with #75** |
+| 75 | `c4ad9b5` | apps reporting wrong pid at startup (#491) | TAKE | partially reverts #73; threads the Carbon pid |
+| 76 | `5ab67c2` | add another window close event (#486) | TAKE | SLS-authoritative `WindowClosed(wsid)`; the guard that makes #77 safe |
+| 77 | `83f3b66` | experimentally ignore AXUIElementDestroyed | TAKE | inert: `disable-axuielement-destroyed` is non-default, and `nix/package.nix` passes no `--features` (verified: `cargoExtraArgs = "--locked --package rift-wm --bins"`). **Do not enable.** |
+
+Closest call to an `ALREADY-HAVE`: our `7ceb4d5` `warn!` *diagnoses* exactly what
+`6d7b21c` *cures* (raise to a stale AX element → silent 250 ms `raise_manager`
+timeout). Keep both — upstream's fix covers `NotFound`/`InvalidUIElement`, our warn
+still covers every other `RaiseError`.
+
+#### B. Layout engine + layout systems (17)
+
+| # | sha | subject | verdict | note |
+|---|---|---|---|---|
+| 15 | `ed3b6c5` | master-stack: preserve membership on removal (#469) | TAKE | `master_stack.rs` is fork-free |
+| 26 | `b9e6d6c` | bsp: raise only the focus target (#478) | TAKE | `bsp.rs` is fork-free |
+| 27 | `6baa565` | avoid redundant layout passes | TAKE | reverted by #40; **never cherry-pick alone** |
+| 30 | `9b4f133` | traditional: panic when join collapses parent (#470) | TAKE | our `46a983a` proptest (`traditional_tiles_partition_the_area`) does **not** cover `join` — not an `ALREADY-HAVE` |
+| 32 | `3cd61ac` | add tests | TAKE | free |
+| 33 | `563d54a` | persistence matching more permissive (#481) | TAKE | `persistence/` is fork-free; our "layout snapshotting" (`d5e827e`) is a `justfile` recipe, not engine code |
+| 35 | `f9854b7` | `WindowLayoutInfo` replaces large tuple | TAKE-REWORK | compile-enumerated sweep |
+| 36 | `52a5425` | clean up event outcome | TAKE-REWORK | `outcome.rs` −161; `outcome.rs` is fork-free, but our `EventResponse.activate` must survive the struct edit |
+| 37 | `b3e916e` | cleanup layout system | TAKE-REWORK | touches `scrolling.rs`/`systems.rs` |
+| 40 | `7a59369` | Revert #27 | TAKE | net-zero with #27 (reverse patch-id differs: an intervening commit widened the block) |
+| 41 | `c33cf4a` | add missing outcome | TAKE | +5 lines in `outcome.rs` |
+| 50 | `cf102d4` | hide off-screen scrolling columns + boundary (#320) | TAKE-REWORK | see §11.5 — this is **our dropped "off-left snap", re-invented better**, plus a `move_focus` early return |
+| 51 | `f5c2b76` | build error | TAKE | fixes #50 |
+| 52 | `1628c1c` | floating layout | TAKE-REWORK | new `LayoutMode::Floating` + `floating.rs`; +285 in `engine.rs`, +57 in `systems.rs`, +45 in `traditional.rs` |
+| 67 | `8b07cef` | cleanup | TAKE | |
+| 68 | `e4cf6f0` | cleanup | TAKE | |
+| 69 | `46e1ff5` | layout cleanup | TAKE | |
+
+#### C. Query/perf gating, IPC, protocol, event surface (16)
+
+| # | sha | subject | verdict | note |
+|---|---|---|---|---|
+| 7 | `9deb843` | dock orientation values | TAKE | `sys/screen.rs` fork-free |
+| 11 | `8a1cad0` | warp cursor after `move_node` | TAKE | gated on `mouse_follows_focus`; adds `EventOutcome.post_arrange_mouse_warp` |
+| 12 | `afa767f` | real window focus on `focus_display` (#332) | TAKE-REWORK | new `focus_window_raise_request()` builds a **4-field** `RaiseRequest`; ours has 5 |
+| 13 | `b67cf2e` | warp cursor to focused window | TAKE | `focus_window_center` on `DisplayFocusPayload` |
+| 16 | `487168d` | frame in `container_tree` (#466) | TAKE-REWORK | `ContainerTreeNode.frame` now required |
+| 17 | `7e76bdb` | stable `node_id` (#466) | TAKE-REWORK | `Column.node_id` — ~15 fork-only `Column` literals break |
+| 18 | `7821dd3` | selection changed event (#466) | TAKE | additive `EventKind::SelectionChanged`; `RIFT_EVENT_TYPE` now `event.kind()` |
+| 38 | `be3bbea` | memory leaks in ipc | TAKE | mach dead-name notifications; `ipc.rs` is fork-free |
+| 45 | `6d66b90` | gate `window_spaces` query | TAKE | different pipeline stage from our bar dedup |
+| 46 | `a8a1079` | only request stale observations when needed | TAKE | splits `identify_stale_windows` |
+| 47 | `d7c7734` | reuse native id resolutions | TAKE | `NativeWindowIdentity` memo |
+| 48 | `d3be1bc` | bulk window attributes (2–4×) | TAKE | `AXUIElementCopyMultipleAttributeValues` |
+| 63 | `52b2846` | move-workspace-to-display (#314) | TAKE-REWORK | big `engine.rs` refactor; **not** roadmap item 4 |
+| 66 | `634be2b` | query windows/workspace by display id | TAKE | additive |
+| 72 | `44d7fa1` | more display/space scoping | TAKE | restructures `QueryCommands`/`DisplayCommands` only; our verbs live in `LayoutCommands`/`ExecuteCommands` |
+| 71 | `05fbe10` | release display-churn gate on an edge (#503) | TAKE | kills a 320-refresh/241-raise storm; doubly valuable for us because spurious raises also trigger §2.B activation |
+
+#### D. Input / event pipeline (12)
+
+| # | sha | subject | verdict | note |
+|---|---|---|---|---|
+| 8 | `0f70787` | hotkey parsing/key list | TAKE | fixes **9 letters** (I J K L M N O P U) rendering as `Other`, which silently dropped bindings; #54 imports its helpers |
+| 54 | `2ec9881` | combine event taps | TAKE-REWORK | **the UD migration** — §11.3 item 1 |
+| 55 | `44af72d` | brandng | TAKE | README |
+| 56 | `1c57b5f` | experimental custom event loop | TAKE | fully `#[cfg(feature)]`-gated, `default = []`; take the code, never enable it |
+| 57 | `0d17a7a` | get rid of continuation | TAKE | drops two deps |
+| 58 | `f3264ba` | thread mouse location through | TAKE | `input.rs` internal |
+| 59 | `c1f809a` | nits on custom event loop | TAKE | `sys/cocoa.rs`, gated |
+| 60 | `c975499` | branding | TAKE | README/roadmap |
+| 61 | `6b1db00` | focus-follows-mouse flakiness | TAKE-REWORK | pull-based `MouseFocusPublisher`; its `get_window_at_point` now skips **all** rift-owned windows — strictly good for §2.E |
+| 62 | `28f0733` | get rid of gesture cooldown | TAKE | deletes `FocusSuppression`; **do not defend it** — obsolete under pull-based FFM |
+| 70 | `b48fde1` | gesture scrolling | TAKE | contact-only decode; emission site untouched, so our speed knob is unaffected |
+| 74 | `e9eafba` | pause mouse focus while menu open | TAKE | `NSMenuDelegate` → `MenuOpened`/`MenuClosed` |
+
+#### E. UI, CI, docs, chore (11)
+
+| # | sha | subject | verdict | note |
+|---|---|---|---|---|
+| 1 | `73a475f` | perf: menu bar | TAKE | `sig()` shrink |
+| 23 | `dd9ad8f` | perf: menu bar | TAKE | `MenuIconRenderKey` render-skip cache; **no** shared surface with our hint bar — §5.2 bullet 2 holds verbatim |
+| 29 | `a3e6bfb` | trigger docs build on release | **SKIP** | `repository-dispatch` → `acsandmann/rift-docs` with `HOMEBREW_TAP_TOKEN`; the missing secret fails `build-and-publish`, which skips our `update-nix` through `needs:` |
+| 31 | `9d6913c` | update latest docs on every commit | **SKIP** | new `docs.yml`, same hardcoded upstream repo; a permanent red run on the fork |
+| 34 | `83830a7` | fmt | TAKE | `rustfmt.toml` is byte-identical HEAD↔upstream |
+| 39 | `48e2f1e` | THE DOCS | TAKE | re-points README/menu links at upstream's docs site; adds no in-repo infra |
+| 42 | `4bb2328` | cli docs | TAKE | clap fixes; our four verbs untouched |
+| 43 | `04defb3` | cli docs^2 | TAKE | doc comments |
+| 44 | `f2691fd` | fmt | TAKE | |
+| 64 | `072411b` | better release workflow | TAKE-REWORK | tag-verify, `--package rift-wm`, packaged-version check, `build.rs` `RIFT_VERSION` stamping, **new `tag.yml`** |
+| 65 | `1444fa0` | bump 0.5.9 | TAKE-REWORK | clean take-theirs in `Cargo.toml`; `nix/package.nix:116` must be hand-bumped |
+
+### 11.3 The six pieces of real work
+
+Ordered by cost, not by date.
+
+**1. The input fold — `event_tap.rs` + `gesture_tap.rs` → `input.rs` (`2ec9881`).**
+Upstream's rewrite is near-verbatim, so every fork hunk has an exact destination:
+
+| Fork hunk (deleted file) | Destination in `src/actor/input.rs` |
+|---|---|
+| `42c9376`: `hints_bar` import, `EventTap.hints_bar_tx` / `hints_bar_hit_rects` + `new()` params | `struct Input` (~57), `Input::new` (~258) |
+| `42c9376`: LeftMouseDown hit-test → `hints_bar::Event::MouseDown(loc)` | `on_event`'s `LeftMouseDown \| RightMouseDown` arm, after the `state.stack_line_enabled` block (~592) |
+| `4b460a0`: `ScrollConfig.speed = g.scroll_speed.clamp(0.1, 20.0)` | `struct ScrollConfig` (~1327) + `from_config` (~1336) |
+| `4b460a0`: `let delta = cfg.speed * state.accum_dx;` | `handle_scroll` (~1679); upstream already applies `invert_horizontal` before accumulation, same order our comment documents — keep the comment |
+| wiring | `src/bin/rift.rs` `spawn_supervised("input", …)` (~387): delete the `EventTap::new`/`GestureTap::new` blocks, extend `Input::new` with `hints_bar_tx.clone()` + `hints_bar_hit_rects` |
+| module list | `src/actor.rs`: drop `event_tap`/`gesture_tap`, keep `hints_bar`, take `input` |
+
+**The one piece that is *not* a port: the dynamic event mask.** Our old
+`build_event_mask(keyboard, mouse_move)` added Left/RightMouseDown/Up
+*unconditionally*. Upstream's 6-arg `build_event_mask` + `desired_event_mask`
+(~170) enable mouse buttons only when
+`state.event_processing_enabled && (state.stack_line_enabled || state.mouse_hides_on_focus)`.
+So a faithful port of our hit-test block **still dies** whenever `stack_line` is
+disabled — the configuration §2.E actually recommends. Required: add
+`hints_bar_enabled` to `struct State`, initialize from
+`config.settings.ui.hints_bar.enabled` beside `stack_line_enabled` (~276), refresh
+it in the `Request::ConfigUpdated` arm (~429-456 — which also gives our scroll-speed
+knob hot reload for free through `build_gesture_handlers`), and OR it into the
+buttons argument.
+
+**2. `activate` through upstream's new raise helpers.** Upstream extracted
+`focus_window_raise_request()` (`command.rs`, `afa767f`) and flipped
+`focus_quiet` to `Quiet::Yes` at two sites (`0121cf2`). Ours is the 5-tuple
+`RaiseRequest(wids, token, sequence_id, quiet, activate)` and `EventResponse`
+carries `activate: bool` (upstream's has only `changed/raise_windows/focus_window/boundary_hit`).
+Resolutions, per site:
+
+- `events/window.rs` (~477, competing edit): `focus_quiet: Quiet::Yes` **and**
+  `activate: false`. Neither side alone is correct.
+- `events/command.rs` (~405): take upstream's helper, add `activate: false` inside it.
+- `app.rs` `handle_raises` (~691-727): keep our destructure, our pre-captured
+  `(first, count)` and our `7ceb4d5` `warn!`; change `handle_raise_request` to
+  upstream's `wids: &[WindowId]` **plus** our trailing `activate: bool`; add
+  upstream's `RaiseTargetsMissing` emission for
+  `AxError::NotFound | AXError::InvalidUIElement`.
+- 35 `activate:` literals exist across 7 files; the compiler enumerates every one.
+
+**3. `e4aa60d`'s window-inventory token migration.** `Request::GetVisibleWindows`
+and the 4-field `Event::WindowsDiscovered` are gone, replaced by
+`WindowInventoryToken { request_id, topology_revision }` +
+`Request::RefreshWindowInventory`. Known fork-side sites: `main_window.rs:351`
+(a §2.B test), `testing.rs:141` (`discover_test_windows`), `testing.rs:554`. Wide
+but mechanical, and every missed site is a hard error.
+
+**4. `Column.node_id` / `ContainerTreeNode` sweep, and two additive unions.**
+`7e76bdb` adds `Column.node_id` and `487168d` adds `ContainerTreeNode.frame`;
+both are required fields. Upstream's own constructor sites auto-merge with our
+`tabbed`/`active`, but ~15 **fork-only** `Column` literals (tests, the
+`toggle_selection_tabbed` split, expel paths) break. Resolve with `node_id: 0` —
+safe **only because** `Column::stable_node_id()` falls back to
+`column_node_id(first_window)`; do not "simplify" that fallback away, or
+fork-created tabbed columns emit colliding ids (upstream's `assert_stable_unique_ids`
+in `systems.rs` catches duplicates — keep it).
+
+The two conflicts here are the familiar additive pattern (§4 playbook) and both
+resolve as *both sides*:
+
+- `scrolling.rs` L57-77: our `CachedTabGroup` struct vs upstream's
+  `packed_window_id`/`window_node_id`/`column_node_id` helpers.
+- `systems.rs`: our `toggle_selection_tabbed` / `cycle_column_width_preset` trait
+  methods vs upstream giving `windows_in_selection_stack` /
+  `parent_of_selection_is_stacked` / `unjoin_selection` **default bodies** (needed
+  by `floating.rs`). Keep our two methods, take their defaults.
+- `engine.rs` L211-273: our `active_workspace_columns` (the hint-bar feed) vs
+  upstream's new `pub(crate) calculate_workspace_layout`. Keep both.
+
+**5. Release/CI and the version jump.** `release.yml` is fork-owned only by
+*addition* — `9575958` appended an `update-nix` job to upstream's
+`build-and-publish`, so `072411b`'s hardening merges clean and there is exactly one
+conflict hunk (ours: the whole `update-nix` job; theirs: `a3e6bfb`'s docs-dispatch
+step). Resolve `@ours`. Then, in the same merge commit:
+
+- **`tag.yml`** (new, merges clean) auto-tags `v<version>` on any push to `main`
+  that touches `Cargo.toml`, using the default `GITHUB_TOKEN`. On this fork that
+  mints a fork-local `v0.5.9` pointing at a different commit than upstream's —
+  a permanent collision for any dual-remote clone. Guard with
+  `if: github.repository == 'acsandmann/rift'` or delete.
+- **`docs.yml`** (new, merges clean) dispatches to `acsandmann/rift-docs` on every
+  `main` push using a secret we do not have: guard or delete (verdict `SKIP`, #31).
+- **Version skew.** `Cargo.toml` takes `0.5.9` with no conflict; `nix/package.nix:116`
+  still says `0.1.0` and is only auto-updated by `update-nix` on a *published*
+  release. Hand-bump it.
+- **`build.rs` `RIFT_VERSION`.** All its `git()` calls fail in the crane sandbox, so
+  nix-built binaries will report `0.5.9+unknown.dirty`. Either plumb an env override
+  from `nix/package.nix` or accept the cosmetic suffix — decide, don't discover it.
+
+**6. The layout refactor group + floating layout.** `f9854b7`/`52a5425`/`b3e916e`
+plus the four `chore: cleanup` commits are compile-enumerated churn over
+`engine.rs` (+944/-531) and `outcome.rs` (+63/-161); `outcome.rs`, `bsp.rs`,
+`master_stack.rs` and `persistence/` carry **zero** fork commits, so the only fork
+surface is `EventResponse.activate` and our `engine.rs` additions.
+`1628c1c` adds a genuine new layout mode (`LayoutMode::Floating`, `floating.rs`,
+config + menu-bar entries) — adopt as-is, and note the §11.5 inset consequence.
+
+### 11.4 Hazard register — clean merges that silently drop fork behaviour
+
+This is the §10.1 failure mode. Each row merges *without a conflict* (or conflicts
+in a way that a plausible "take one side" resolution satisfies) and loses a fork
+behaviour with no test failure.
+
+| # | Where | What is lost if resolved naively | Detection |
+|---|---|---|---|
+| H1 | `events/window.rs` ~477 | `@ours` keeps `Quiet::No` → silently reverts #485 (a stale main window switches workspace under FFM) | upstream's new test `focus_follows_mouse_raise_is_quiet_…` — **only if the `tests.rs` hunk is taken** |
+| H2 | `events/command.rs` ~405 | `@ours` drops #485's quiet for the `focus-window` IPC command | **no test covers the command-site quiet** — add one asserting `focus_quiet == Quiet::Yes` |
+| H3 | `app.rs` `handle_raises` | `@ours` loses `RaiseTargetsMissing` entirely: post-wake raises to stale AX elements go back to silent 250 ms timeouts | `grep RaiseTargetsMissing src/actor/app.rs` must hit after the merge; no test covers the emission |
+| H4 | `reactor.rs` ~443 | upstream deletes the wiring block that holds **our `hints_bar_tx` registration** alongside its own `gesture_tap_tx` removal → §2.E hint bar disconnected, still compiles | `just test` hint-bar filters, plus the bar simply never renders |
+| H5 | `src/bin/rift.rs` `spawn_supervised("input", …)` | taking upstream's `Input::new` call verbatim leaves `hints_bar_hit_rects` unused → every hint-bar click dead | `cargo check` unused-variable **warning** only |
+| H6 | `input.rs` `desired_event_mask` | faithful port of our hit-test block still yields no `LeftMouseDown` when `stack_line` is off (§11.3 item 1) | no test; live: `stack_line.enabled=false` + `hints_bar.enabled=true`, click a chip |
+| H7 | `.github/workflows/{tag,docs}.yml` | arrive as new files with zero conflicts; fork starts tagging and dispatching to upstream's docs repo | post-merge sweep of `.github/workflows/` for `repository-dispatch` / `acsandmann/rift-docs` |
+| H8 | `release.yml` hunk #3 | `@theirs` deletes the whole `update-nix` job | `grep update-nix .github/workflows/release.yml` |
+| H9 | `reactor/testing.rs` (`05fbe10`) | `forwarded_space_state` default `releases_display_churn_refresh_quarantine` flips `false → true`; fork tests built on that helper keep passing while covering a different regime | re-read the churn-adjacent fork tests after the stage that lands `05fbe10` |
+| H10 | `Cargo.toml` dev-deps | upstream **deleted `proptest = "1"`**; our `46a983a` proptests need it. The probe merge kept our line by line position, i.e. by luck | `grep -n proptest Cargo.toml` after every stage |
+| H11 | `reactor.rs` log arms (`b31dddf`) | new `WindowInvalidated`/`WindowClosed`/`WindowsDiscovered{..}` variants land next to our trace-demotion comment; a re-resolution could promote `WindowTitleChanged` back to `debug!` (the 1108 → 5 MiB/day fix) | confirm `WindowTitleChanged` stays in the `trace!` arm |
+| H12 | `Event::ApplicationThreadTerminated` (`3689e81`) | upstream removed both `send_event` sites in favour of `ExitGuard`→`AppExited`; the variant still exists, so any fork test awaiting it compiles and waits forever | `grep -n ApplicationThreadTerminated src/actor/reactor/tests.rs src/actor/reactor/main_window.rs` |
+
+### 11.5 Where we stand — what to retire, rewrite, and newly own
+
+**§5.2 bullet 1 is factually obsolete; its conclusion survives on new grounds.**
+That bullet rejected upstream's broadcast as a hint-bar feed because it was
+"geometry-free" and "fires on a strict subset". Both claims are now dead:
+`487168d` puts per-node **pixel frames** in `container_tree` (root = tiling area,
+columns = union of window target frames) and `7e76bdb` adds **stable `node_id`s`**,
+and `LayoutChanged` fires on every `layout_changed` outcome. Keep our
+per-layout-apply feed anyway, for four *different* reasons, all verified against
+`upstream/main:crates/rift-protocol/src/events.rs`:
+
+1. no `WindowMember.label`/title in `LayoutStateData` — our `show_titles` and hover
+   pill would need a `GetWindows` join per event;
+2. no cross-workspace occupancy — the workspace rail needs every workspace's pids,
+   the event carries only the active workspace;
+3. no representation of our fork-only `Column.tabbed` (upstream's tree says
+   `role:"column", layout_kind:Vertical` either way — the same blindness `e533c69`
+   already recorded);
+4. mach + per-subscriber `serde_json` delivery would discard the `ee2abe4` dedup and
+   coalescing layers.
+
+**Rewrite that bullet when the sync lands.** One genuine simplification is now
+available: source the feed's frames from upstream's new public
+`LayoutEngine::calculate_workspace_layout` instead of any parallel derivation.
+
+**Our dropped "off-left snap" is now upstream's own design (`cf102d4`).** §2's
+"Dropped / superseded" list says we reverted a per-column `x` clamp because
+"upstream already clamps the scroll offset". Upstream has now shipped the per-column
+clamp itself — and better: it parks off-viewport columns at `screen.origin.x -
+column_width` / `screen.max().x`, i.e. beyond the *physical* display rather than the
+tiling edge, so outer-gap pixels cannot leak and adjacent displays cannot overlap.
+It also adds an early `return EventResponse::default()` that stops horizontal
+`move_focus` from crossing displays in the scrolling layout. Amend the dropped-list
+entry: the revert was still right (we would have conflicted every sync for a worse
+version of this), and the feature arrives for free.
+
+**Our hint bar is immune to that parking — by design, already.**
+`active_workspace_columns`'s doc comment states it exists precisely because
+"the scrolling layout parks columns that are scrolled off the right edge at a shared
+sliver x, so grouping windows by frame position merges distinct columns". `7438671`
+made the feed read `container_tree` structure instead of frames; `cf102d4` extends
+the parking to both edges and off-display, and the feed does not care.
+
+**`1628c1c` makes §10.5 actionable, not moot.** `floating.rs` computes
+`default_frame` and `cascade_frame` from the raw `screen` rect
+(`screen.mid().x - size.width/2.`), not from the inset-adjusted tiling area, so the
+new floating layout centres windows *under* an external bar exactly like §10.5's
+centered floats. Our `6f9ebca` insets are the only thing that knows about the bar.
+Fork follow-up after the sync: pass the inset-adjusted rect into
+`FloatingLayoutSystem`'s frame helpers — a real feature, scoped to one file, and now
+with upstream test coverage to extend (`floating.rs:753+`).
+
+**`FORK.md` §8 roadmap after this sync.**
+
+| Item | Status |
+|---|---|
+| 1. Tabbed column display | ours; upstream still has nothing |
+| 2. Per-column width presets | ours; upstream still has nothing |
+| 3. Richer window-rule open actions | unchanged since §5.3 (`open_maximized` still absent) |
+| 4. Workspace reordering / named workspaces | **still open.** `52b2846` moves the active workspace to another *display* at the same ordinal — adjacent ergonomics, not reordering |
+| 5. Interactive mouse resize | not delivered |
+| (new) floating-layout insets | **new fork item**, created by `1628c1c` (above) |
+
+### 11.6 Stage plan — ten checkpoints
+
+`git merge <sha>` in order, each gated on
+`cargo check --workspace --all-targets` + `just test` **before** its merge commit is
+finalized (§7). Conflict counts are measured from the full-jump probe and are
+upper bounds per stage.
+
+| Stage | Checkpoint | `#` | Commits | Conflicts | The work |
+|---|---|---|---|---|---|
+| 1 | `21efa52` | 1–10 | 10 | app.rs ×1 | §11.3 item 3 (inventory tokens) **and** item 2's `handle_raises` merge. Gate hard — this is the heaviest stage after 8. |
+| 2 | `372fcd2` | 11–14 | 4 | command.rs ×1 | cursor-warp trio; `RaiseRequest.activate` into `focus_window_raise_request` |
+| 3 | `251fe8b` | 15–22 | 8 | scrolling.rs ×1, engine.rs ×1 | #466 surface: `Column.node_id` + `ContainerTreeNode.frame` sweep; wake/session family |
+| 4 | `83830a7` | 23–34 | 12 | release.yml ×1 | mostly free; **`docs.yml` arrives here — guard it in this merge commit** (H7) |
+| 5 | `f2691fd` | 35–44 | 10 | engine.rs, systems.rs | the refactor group (`WindowLayoutInfo`, outcome cleanup); compile-enumerated |
+| 6 | `0121cf2` | 45–49 | 5 | window.rs ×1, command.rs ×1 | perf quartet (free) + the `Quiet::Yes` flip → H1/H2 |
+| 7 | `1628c1c` | 50–52 | 3 | scrolling.rs, systems.rs | off-screen parking + boundary early-return + floating layout |
+| 8 | `28f0733` | 53–62 | 10 | actor.rs, bin/rift.rs ×2, reactor.rs, mission_control.rs ×2, event_tap.rs **UD**, gesture_tap.rs **UD** | **the input fold** (§11.3 item 1) → H4/H5/H6. Do **not** split this range: `f3264ba`/`28f0733`/`b48fde1` rewrite the exact regions our hunks target, and a mid-range boundary migrates them onto code the next commit deletes. |
+| 9 | `46e1ff5` | 63–69 | 7 | release.yml ×1 | release hardening + `0.5.9` + `tag.yml` guard + `nix/package.nix` bump (§11.3 item 5). `072411b` and `1444fa0` **must land together**. |
+| 10 | `83f3b66` | 70–77 | 8 | — | gesture perf, churn-gate edge (H9), display scoping, slow-launch pair (`311d57e`+`c4ad9b5` together), `5ab67c2`, then `83f3b66` (inert) |
+
+Must-land-together sets, all verified as blob chains or change/partial-revert pairs:
+`59b9033`→`e4aa60d`→`f9b152d`→`6d7b21c`; `8a1cad0`→`afa767f`→`b67cf2e`;
+`487168d`→`7e76bdb`→`7821dd3`; `6baa565`+`7a59369`; `d7c7734`→`d3be1bc`;
+`cf102d4`+`f5c2b76`; `2ec9881`…`28f0733`; `072411b`+`1444fa0`;
+`634be2b`+`44d7fa1`; `311d57e`+`c4ad9b5`.
+
+### 11.7 Tooling this sync must fix (found while planning, not after)
+
+1. **`just test` filters go stale the moment stage 8 lands.** The recipe names
+   `actor::event_tap` and `actor::gesture_tap`; upstream deletes both modules. A
+   filter that matches nothing is not an error to libtest — it is the *same silent
+   failure* as the dead `--skip` §10.3 found, in the opposite direction. Replace
+   with `actor::input` (which covers upstream's new `input::tests` **and**
+   `input::gesture_tests`).
+2. **The allowlist guard only checks one direction.**
+   `just_test_allowlist_classifies_every_test_module` walks `src/` and asserts every
+   test module is classified; nothing asserts every *filter* still names a real
+   module. Add the mirror (`just_test_filters_all_name_a_real_module`) — it is the
+   same walk, already written, compared the other way.
+3. **`crates/` tests never run at all.** `just test` and `just test-all` both run
+   `cargo test --lib`, which builds only the root lib. `crates/rift-protocol/src/transport.rs`
+   arrives in this sync with a `#[cfg(test)] mod tests`, and the guard above cannot
+   see it either (it walks `src/` only). Either add a workspace test recipe or
+   extend the guard's walk to `crates/*/src`.
+4. **New test modules to classify in stage order:** `actor::input::{tests,gesture_tests}`
+   (stage 8 — covered once item 1 lands), `layout_engine::systems::floating::tests`
+   (stage 7 — covered by the existing `layout_engine` filter),
+   `sys::cocoa::tests` (stage 8 — falls under `sys` in `GUI_OR_DEFERRED`, but it is
+   pure atomic-counter logic; **measure it** with
+   `cargo test --lib -- sys::cocoa --test-threads=1` before accepting the exclusion,
+   per the rule's own instruction).
+5. **Re-verify the surviving `--skip`.** `e4aa60d` rewrote `identify_stale_windows`,
+   the subject of `wsid_rekey_preserves_floating_membership_and_position`'s
+   failure, but kept a predicate with no rekey suppression — so the skip probably
+   survives. Settle it in a pristine worktree
+   (`git worktree add /tmp/rift-up upstream/main && cargo test --lib wsid_rekey…`)
+   rather than assuming: if it is green, delete the skip; if red, re-point the
+   comment at the new predicate.
+6. **`[[bin]] rift-cli test = false`.** Upstream deleted it (its rift-cli tests now
+   run); our merge keeps it. `GUI_OR_DEFERRED` justifies excluding `bin::rift-cli`
+   on the grounds that `--lib` never compiles it — still true, but the *reason*
+   changes if we take upstream's removal. Decide explicitly in stage 9.
+
+### 11.8 Live verification checklist (after stage 10)
+
+The pattern from §4.7/§10.6: the gates prove it compiles and the logic tests pass;
+only the live pass finds the rest. Minimum set, all on scratch windows:
+
+- **Hint bar with `stack_line.enabled = false`** — click a column chip and a
+  workspace pill. This is H6, and nothing else detects it.
+- **Scroll speed** — a non-default `scroll_speed` still scales two-finger scrolling
+  (proves the `4b460a0` port landed on `handle_scroll`, not on a dead struct field),
+  and hot reload of that key still works through `Request::ConfigUpdated`.
+- **§2.B activation** — `focus_window --activate` foregrounds; FFM hover does **not**
+  foreground (H1 in the wrong direction is `activate: true`, which no test catches).
+- **Post-wake raise** — sleep/wake, then focus a window on another workspace: with
+  `6d7b21c` the raise self-heals instead of logging our `7ceb4d5` warn.
+- **Off-screen parking (`cf102d4`)** — scroll a strip so columns leave the viewport;
+  confirm no cross-app overlap at the edges, that hint-bar letters still match
+  `focus-column N`, and that horizontal `move_focus` no longer jumps displays.
+- **Floating layout** — `LayoutMode::Floating` on a scratch workspace, with an
+  external bar configured: expect the §11.5 inset bug, and record it.
+- **`rift --version`** under the nix build (expect `0.5.9+unknown.dirty` unless
+  `build.rs` is patched).
+- **Menu open** pauses mouse focus (`e9eafba`), and menu-bar rendering still tracks
+  workspace switches after `dd9ad8f`'s render-skip cache.
+
+### 11.9 Open questions (settle by doing, not by reading)
+
+1. Does `wsid_rekey_preserves_floating_membership_and_position` still fail on
+   upstream tip? (§11.7 item 5 — the only thing that can delete a skip.)
+2. Should the fork enable `custom-event-loop`? Default is off, upstream calls it
+   experimental, and §2.B's `ActivateIgnoringOtherApps` timing has only ever been
+   validated under the AppKit pump. Recommendation: **no**, and revisit only with a
+   measured reason.
+3. Does the fork ever publish GitHub releases on `origin`? If not, the pre-existing
+   homebrew-tap steps in `release.yml` are dead weight that will fail loudly the
+   first time someone does — decide whether to guard them while §11.3 item 5 is open.
+4. `RIFT_VERSION` under nix: env override in `nix/package.nix`, or accept
+   `+unknown.dirty`?
