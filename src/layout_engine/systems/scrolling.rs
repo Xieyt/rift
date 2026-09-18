@@ -1101,7 +1101,20 @@ impl LayoutSystem for ScrollingLayoutSystem {
                 Self::proportional_column_width(tiling.size.width, gap_x, ratio)
             });
             let start = column_starts.get(col_idx).copied().unwrap_or(0.0);
-            let x = anchor_x + start - offset;
+            let mut x = anchor_x + start - offset;
+            // Detect columns outside the tiling viewport, but park them beyond
+            // the physical screen edge. Using the tiling edge as the parking
+            // position would leave outer-gap pixels on-screen and can still
+            // overlap an adjacent display.
+            let visible_left = tiling.origin.x;
+            let visible_right = tiling.origin.x + tiling.size.width;
+            if x + column_width <= visible_left {
+                // Column is fully off-screen left.
+                x = screen.origin.x - column_width;
+            } else if x >= visible_right {
+                // Column is fully off-screen right.
+                x = screen.max().x;
+            }
             if col.windows.is_empty() {
                 continue;
             }
@@ -3405,10 +3418,16 @@ mod tests {
         #![proptest_config(ProptestConfig::with_cases(200))]
 
         /// Freshly-added single-window columns form a contiguous, non-overlapping
-        /// horizontal strip: each column starts exactly `gap_x` after the previous
-        /// one ends, every column fills the tiling height, and focus is always
-        /// resolvable. Offset-invariant (scrolling shifts the whole strip, not the
-        /// relative spacing).
+        /// horizontal strip *within the viewport*: each visible column starts exactly
+        /// `gap_x` after the previous one ends, every visible column fills the tiling
+        /// height, and focus is always resolvable. Offset-invariant (scrolling shifts
+        /// the whole strip, not the relative spacing).
+        ///
+        /// Columns scrolled out of the viewport are excluded, and separately asserted
+        /// to be *fully* outside it: upstream `cf102d4` (#320) parks them past the
+        /// physical screen edge rather than leaving them to overlap other apps, so
+        /// contiguity is a property of the visible strip only. Parking is the reason
+        /// the fork's own off-left snap was dropped — see FORK.md §2's dropped list.
         #[test]
         fn scrolling_columns_are_contiguous_and_non_overlapping(
             n in 1usize..=6,
@@ -3441,7 +3460,17 @@ mod tests {
             rects.sort_by(|a, b| a.origin.x.partial_cmp(&b.origin.x).unwrap());
 
             let eps = 1.5;
-            for pair in rects.windows(2) {
+            let viewport_left = tiling.origin.x;
+            let viewport_right = tiling.origin.x + tiling.size.width;
+            let (visible, parked): (Vec<CGRect>, Vec<CGRect>) = rects
+                .iter()
+                .copied()
+                .partition(|r| {
+                    r.origin.x + r.size.width > viewport_left + eps
+                        && r.origin.x < viewport_right - eps
+                });
+
+            for pair in visible.windows(2) {
                 let (cur, next) = (pair[0], pair[1]);
                 let cur_right = cur.origin.x + cur.size.width;
                 prop_assert!(
@@ -3454,9 +3483,18 @@ mod tests {
                     "columns not contiguous: gap={} expected={}", gap, gx
                 );
             }
-            for r in &rects {
+            for r in &visible {
                 prop_assert!((r.origin.y - tiling.origin.y).abs() <= eps, "not top-aligned: {:?}", r);
                 prop_assert!((r.size.height - tiling.size.height).abs() <= eps, "not full height: {:?}", r);
+            }
+            // `cf102d4`: a column that left the viewport parks *past the physical
+            // screen edge*, never half-on-screen where it would overlap another app.
+            for r in &parked {
+                prop_assert!(
+                    r.origin.x + r.size.width <= scr.origin.x + eps
+                        || r.origin.x + eps >= scr.origin.x + scr.size.width,
+                    "off-viewport column is not parked off-screen: {:?}", r
+                );
             }
         }
     }
