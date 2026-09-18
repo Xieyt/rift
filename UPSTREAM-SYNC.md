@@ -21,34 +21,36 @@ its own sake:
   to sync: it is the shortest complete worked example, and §8.3 covers what to do
   when upstream ships a failing test.
 
-## 0. Status — four syncs complete, a fifth **planned in §11**
+## 0. Status — five syncs complete; §11 is the newest
 
 ```
 branch                    xieyt/5
-behind upstream           77       (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     64
-upstream tip merged       74ce00d  (2026-08-28; backlog ended 6c64d8b, then 1de4d09,
-                                   then 7829780, then 3a52122, then this)
-upstream tip available    83f3b66  (2026-09-17) — 77 commits, planned in §11
+behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
+ahead                     78
+upstream tip merged       83f3b66  (2026-09-17; backlog ended 6c64d8b, then 1de4d09,
+                                   then 7829780, then 3a52122, then 74ce00d, now this)
 curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
                               -> 363 (§8) -> 370 (§9) -> 520 (guard widened)
-                              -> 549 (§10 sync)
-cargo check               --workspace --all-targets clean  (at 74ce00d + fork work)
+                              -> 549 (§10) -> 605 (§11), plus 14 crate tests
+                              that had never run at all before §11
+cargo check               --workspace --all-targets clean
 just fmt-check            clean
-nix build .#rift          succeeds; .app installed and exercised live (16/16 — see §10.6)
+nix build .#rift          succeeds; `nix eval .#rift.version` reads 0.5.9
 ```
 
-**§11 is the plan for the fifth sync and the thing to read first if you are about to
-merge.** 77 commits behind; every §7 structural tripwire fired (§11.1). The shape of
-this one is different from all four before it: only 13 hunks, but upstream **deleted
-two files we had edited** (`event_tap.rs`, `gesture_tap.rs` → `input.rs`), so the
-cost is a migration, not a conflict-resolution pass. §11.4 is the hazard register —
-twelve places that merge clean and lose a fork behaviour.
+**§11 records the 2026-09-18 sync** (77 commits, 13 hunks, 2 deleted files we had
+edited, 2 SKIPs) and is the one to read if you are about to sync. It is the first
+of these where the cost was a **migration, not conflict resolution**: upstream
+folded `event_tap.rs` + `gesture_tap.rs` — both carrying fork hunks — into a single
+`input.rs`. §11.4 is the hazard register (twelve clean merges that lose a fork
+behaviour); **§11.10 scores the plan's predictions, including the one that was
+wrong by a whole workday in the cheap direction.**
 
-**Upstream `main` currently has two failing tests of its own**, both reproduced on
-pristine worktrees and skipped in `just test` with attribution: see §8.3 and §10.4.
-There were three until §10 found that one of the skips named a test upstream had
-already renamed — a silent no-op filter.
+**Upstream `main` currently has ONE failing test of its own**, reproduced on a
+pristine worktree and skipped in `just test` with attribution: see §8.3.
+There were three. §10 found one of the skips named a test upstream had already
+renamed (a silent no-op filter); §11 found the second had been *repaired* upstream
+by `e4aa60d` and deleted it. Skips are verified by deletion, never by belief.
 
 **§10 records the 2026-08-28 sync** (22 commits, 6 hunks, 0 SKIPs) and is the one to
 read for the failure mode this series had not yet hit: two fork features nearly lost
@@ -698,14 +700,24 @@ and `toggle_column_tabbed` recovers whole-column movement whenever you want it.
 
 ### 5.2 Upstream features we should *not* adopt into our subsystems
 
-- **`5c0b38d` focused-window broadcast is not a cheaper hint-bar feed.** Take the
-  commit (external consumers want it — upstream's own `dimmer` example uses it),
-  but keep §2.E's per-layout-apply feed. The broadcast payload is geometry-free
-  (`window_id`, `workspace_*`, `space_id`, `display_uuid`), while the bar needs
-  per-column composition *and* pixel frames. Worse, it fires on a strict subset:
-  a scroll, a column resize, a window opening in a non-focused column, and an
-  overflow re-split all change bar content **without** changing the focused
-  window. A broadcast-driven bar renders stale.
+- **The event surface is not a cheaper hint-bar feed — but the old reason for that
+  is dead.** This bullet used to reject `5c0b38d`'s focused-window broadcast
+  because the payload was "geometry-free" and fired "on a strict subset" of the
+  events the bar cares about. **Both claims stopped being true in the fifth sync**:
+  `487168d` puts per-node pixel `frame`s in `container_tree` (root = tiling area,
+  columns = union of window target frames), `7e76bdb` adds stable `node_id`s, and
+  `LayoutChanged` now fires on every `layout_changed` outcome — scroll, resize,
+  window-open-in-an-unfocused-column included.
+  Keep §2.E's per-layout-apply feed anyway, for four reasons that survive:
+  (a) `LayoutStateData` carries no `WindowMember` title, so `show_titles` and the
+  hover pill would need a `GetWindows` join per event; (b) the workspace rail needs
+  occupancy across *all* workspaces and the event carries only the active one;
+  (c) nothing in upstream's tree distinguishes a tabbed column from a plain stack
+  (`role:"column", layout_kind:Vertical` either way — the same blindness `e533c69`
+  recorded); (d) mach + per-subscriber `serde_json` delivery would throw away the
+  `ee2abe4` dedup and coalescing layers. Take the events for external consumers;
+  the one real simplification available is sourcing the feed's frames from
+  upstream's new `LayoutEngine::calculate_workspace_layout` seam.
 - **Our hint-bar perf work stays, all four layers.** Upstream's `6a2b3ad` /
   `b9b79be` cut the *number of arranges*; our dedup cuts *sends per arrange*.
   Different pipeline stages. Ours still uniquely covers multi-pass arranges
@@ -1321,10 +1333,12 @@ honest bound on that verification.
 
 ---
 
-## 11. Fifth sync — **plan**, `74ce00d` → `83f3b66` (77 commits)
+## 11. Fifth sync — 2026-09-18, `74ce00d` → `83f3b66` (77 commits)
 
-Written 2026-09-18, not yet executed. Everything below is measured on the real
-trees — no estimates. Line numbers and hunk counts come from a throwaway full-jump
+Planned and executed the same day. **§11.10 is the outcome**; §11.0–§11.9 are the
+plan as written *before* the merges, kept unedited so the predictions can be
+scored. Everything below is measured on the real trees — no estimates.
+Line numbers and hunk counts come from a throwaway full-jump
 probe, recreated with:
 
 ```bash
@@ -1777,3 +1791,100 @@ only the live pass finds the rest. Minimum set, all on scratch windows:
    first time someone does — decide whether to guard them while §11.3 item 5 is open.
 4. `RIFT_VERSION` under nix: env override in `nix/package.nix`, or accept
    `+unknown.dirty`?
+
+### 11.10 Outcome — executed 2026-09-18, as planned
+
+```
+behind upstream           0        (was 77)
+ahead                     78
+upstream tip merged       83f3b66
+curated tests             549 -> 605, plus 14 crate tests that had NEVER run
+conflict hunks resolved   13 by hand, in 8 of the 10 stages
+UD migrations             2 (event_tap.rs, gesture_tap.rs -> input.rs)
+cargo check               --workspace --all-targets clean at every stage gate
+just test / test-crates   green at every stage gate
+just fmt-check            clean
+```
+
+| Stage | Checkpoint | Commits | Conflicts | Cost beyond the merge |
+|---|---|---|---|---|
+| 1 | `21efa52` | 10 | 1 | `handle_raises` union; the predicted inventory-token migration cost **nothing** |
+| 2 | `372fcd2` | 4 | 1 | `activate: false` inside `focus_window_raise_request` |
+| 3 | `251fe8b` | 8 | 2 | 16 `Column` literals swept; one hand brace; `actor::process::tests` allowlisted |
+| 4 | `83830a7` | 12 | 1 | `release.yml` `@ours`; `docs.yml` guarded |
+| 5 | `f2691fd` | 10 | 1 | trait-default union; a dropped `LayoutKind` import |
+| 6 | `0121cf2` | 5 | 2 | `Quiet::Yes` + `activate` at both sites; new H2 guard test |
+| 7 | `1628c1c` | 3 | **0** | proptest restated for parked columns; one `MoveFocusArgs` adaptation |
+| 8 | `28f0733` | 10 | 5 + 2 UD | the input fold; new H6 gate + guard test; three filter/allowlist holes |
+| 9 | `46e1ff5` | 7 | 1 | `tag.yml` guarded; two version lies fixed at the source |
+| 10 | `83f3b66` | 8 | **0** | symbol-level verification only |
+
+**Predictions that held.** All 16 `TAKE-REWORK`s were rework and nothing else was.
+Every hazard H1–H8 was real and arrived exactly where §11.4 said. The `Column`
+`node_id` sweep was 16 literals against a predicted "~15". The two `SKIP`s were
+correct: both docs workflows reference `acsandmann/rift-docs` and a secret no fork
+has.
+
+**Predictions that were wrong, and in which direction.**
+
+1. **§11.3 item 3 (the inventory-token migration) cost zero.** It was budgeted as
+   "the largest chunk of cluster hours" — wide but mechanical, ~5 fork call sites.
+   Git migrated all of them; `GetVisibleWindows` has no occurrences left in `src/`
+   and `cargo check` was clean on the first try. The lesson is the same one §4.6
+   recorded: *predicted* mechanical sweeps are the least reliable estimate in a
+   sync plan, in both directions.
+2. **Two silent losses the plan did not anticipate**, both from upstream's own
+   cleanup rather than from a conflict: `b3e916e` dropped `scrolling.rs`'s
+   `LayoutKind` import that our `group_containers()` needs (stage 5, E0433), and
+   the stage-3 `engine.rs` union cut *inside* two function bodies, so `@both`
+   produced an unclosed delimiter. Both loud, both cheap — but both are evidence
+   for §4's "reconstruct the region, don't patch the markers".
+3. **H6 needed new code, not a port.** The plan said to widen
+   `desired_event_mask`; what it did not say is that this is the only place in the
+   whole sync where a *faithful* port of fork code would still have been a
+   regression. Worth stating plainly: porting a hunk to its exact destination is
+   not the same as preserving its behaviour.
+4. **The `0.5.9` bump was not a hand-bump.** §11.3 item 5 said to hand-bump
+   `nix/package.nix:116`. That would have re-created the same skew next release, so
+   `riftVersion` now reads `Cargo.toml` (`lib.importTOML`), and `build.rs` honours
+   `RIFT_VERSION_OVERRIDE` so nix binaries stop reporting `+unknown.dirty`. Two
+   version lies, both structural, both closed at the source.
+5. **One skip died.** `wsid_rekey_preserves_floating_membership_and_position`
+   passes on `upstream/main` (`83f3b66`) and here — `e4aa60d` repaired the
+   `identify_stale_windows` predicate §9.2 bisected. `just test` now carries **one**
+   skip. `topology_change_clears_stale_pending_hide_target` still fails upstream;
+   its assertion message now names `RefreshWindowInventory`, so it is the same
+   long-standing failure wearing the new pipeline's clothes.
+
+**The three tooling holes closed themselves, in production.** §11.7's guards were
+written *before* the merges, and every one of them fired on a real hole rather than
+on a hypothetical:
+
+- `just_test_filters_all_name_a_real_module` failed the instant stage 8 deleted
+  `event_tap.rs`/`gesture_tap.rs` — the exact scenario it was written for, one
+  commit after it was written.
+- The same guard then caught `ipc` going dead: upstream moved those tests into
+  `crates/rift-protocol`, which nothing ran until `just test-crates` existed.
+- `just_test_allowlist_classifies_every_test_module` caught three arriving modules
+  (`actor::process`, `actor::config`, `actor::reactor::mouse_focus_publisher_tests`)
+  — takings its lifetime count to eight.
+
+**Two new guard tests, both mutation-checked** (each fails when its fix is
+reverted): `focus_window_command_raise_is_quiet_and_does_not_activate` (H2 — the
+command-site quiet upstream's own test does not reach) and
+`hints_bar_alone_keeps_mouse_button_delivery_in_the_mask` (H6). One fork property
+was **restated rather than deleted**: `scrolling_columns_are_contiguous_and_non_overlapping`
+now partitions visible from parked columns and asserts `cf102d4`'s parking
+invariant on the latter — strictly more property than before.
+
+**Verified beyond the gates.** Both binaries build and run; all four fork verbs
+survive upstream's CLI restructure (`execute layout toggle-tabbed`,
+`cycle-column-width`, `focus-column`, and `execute window focus --activate`);
+`nix eval .#rift.version` reads `0.5.9`; `nix build .#rift` succeeds.
+
+**Still open, deliberately.** The §11.8 live checklist is a *desktop* pass and has
+not been run — hint-bar clicks with `stack_line` disabled (H6's live half), the
+scroll-speed knob, FFM non-activation, post-wake raise self-heal, and the floating
+layout's inset bug (`FORK.md` §8 feature item 6, created by this sync). Nothing in
+the checklist is testable headless, which is exactly why §11.4 lists "no test
+covers this" against six of the twelve hazards.

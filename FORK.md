@@ -520,6 +520,14 @@ file upstream owns but away from its SCK plumbing.
 - **scrolling off-left snap** — a per-column `x` clamp in `scrolling.rs`. Reverted:
   upstream already clamps the scroll offset, so it was a redundant heuristic in
   upstream's most-churned file. Reverted to match upstream exactly.
+  **Update (fifth sync):** upstream then shipped the per-column clamp itself,
+  `cf102d4` (#320), and better — it parks off-viewport columns at
+  `screen.origin.x - column_width` / `screen.max().x`, i.e. past the *physical*
+  display rather than the tiling edge, so outer-gap pixels cannot leak and an
+  adjacent display cannot overlap. The revert was still the right call (we would
+  have re-resolved a worse version of this every sync); the feature arrived free.
+  Our `46a983a` contiguity proptest now partitions visible from parked columns and
+  asserts the parking invariant on the latter.
 - **`5e5916f` "horizontal move shifts non-tabbed stacks as a whole"** — dropped in
   the 2026-08 merge. Upstream has a deliberate, defensible **opposite** behaviour
   (extract the focused window into its own neighbour column), and it lives in
@@ -545,12 +553,13 @@ file upstream owns but away from its SCK plumbing.
 
 ## 3. Syncing with upstream (rebase vs merge)
 
-> **Currently 77 commits behind `upstream/main` (`74ce00d` → `83f3b66`), with a
-> measured plan in `UPSTREAM-SYNC.md` §11.** Read §11.4 (hazard register) and
-> §11.6 (ten-checkpoint stage plan) before starting a merge. This one is a
-> *migration*, not a conflict pass: upstream deleted `src/actor/event_tap.rs` and
-> `src/actor/gesture_tap.rs` — both of which carry fork hunks — into a single
-> `src/actor/input.rs`.
+> **Currently 0 commits behind `upstream/main` (merged through `83f3b66`,
+> 2026-09-18).** That sync is recorded in `UPSTREAM-SYNC.md` §11 — read §11.10
+> first: it scores the plan against what actually happened, and it is the shortest
+> worked example of the failure mode this fork keeps hitting (upstream deleting a
+> file we had edited — `event_tap.rs` + `gesture_tap.rs` → `input.rs`), plus the
+> twelve-entry hazard register in §11.4 for merges that go clean and lose a feature
+> anyway. The **§11.8 live desktop checklist is still unrun.**
 
 **Use `merge`, not `rebase`, for routine syncs.** We carry a large feature set (see
 §2) and sync periodically, so upstream deltas are non-trivial. A merge resolves the
@@ -1113,8 +1122,21 @@ per-workspace layouts. So this is the *gaps* worth stealing, ranked.
    is still the override-resolution seam to extend.)*
 4. **Workspace reordering / on-the-fly named workspaces** — niri's
    move-workspace-up/down. We have create/switch/move-to; reordering is missing.
+   *(Still open after the fifth sync. `52b2846` "move-workspace-to-display" (#314)
+   is adjacent but different: it moves the active workspace to the **same ordinal
+   on another display**, not up/down within one.)*
 5. **Interactive mouse resize of tiles** — we have drag-*swap*
    (`collect_drag_swap_candidates`), not drag-*resize*.
+6. **External-bar insets for the floating layout** *(new, created by upstream
+   `1628c1c` in the fifth sync)*. `systems/floating.rs` computes `default_frame`
+   and `cascade_frame` from the raw `screen` rect
+   (`screen.mid().x - size.width / 2.`), so a floated window centres *under* a
+   configured `external_bar_top/bottom` inset — the same class of bug as §10.5's
+   centered floats, now on a code path that ships by default when
+   `LayoutMode::Floating` is selected. Fix is scoped to one file: thread the
+   inset-adjusted rect (what `compute_tiling_area` already produces) into the
+   frame helpers. Upstream's own tests at `floating.rs:753+` are the place to
+   extend.
 
 **Deliberately skipped (compositor-only, fights macOS):** VRR, direct scanout,
 damage-tracked rendering, block-out-from-screencast. macOS owns the compositor.
