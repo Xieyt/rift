@@ -275,6 +275,9 @@ pub enum Event {
         Option<MouseState>,
     ),
     WindowDestroyed(WindowId),
+    /// this event is only for the sls windowclosed event that provides a wsid
+    #[serde(skip)]
+    WindowClosed(WindowServerId),
     /// The AXUIElement became invalid, but that is not proof that its native
     /// WindowServer window was destroyed. This commonly happens before macOS
     /// publishes sleep/session lifecycle notifications.
@@ -1095,6 +1098,7 @@ impl Reactor {
             Event::WindowMinimized(wid) => Some(wid.idx.get()),
             Event::WindowDeminiaturized(wid) => Some(wid.idx.get()),
             Event::MouseMoved(..) => None,
+            Event::WindowClosed(wsid) => Some(wsid.as_u32()),
             Event::WindowServerDestroyed(wsid, ..) => Some(wsid.as_u32()),
             Event::WindowServerAppeared(wsid, ..) => Some(wsid.as_u32()),
             _ => None,
@@ -1127,6 +1131,7 @@ impl Reactor {
             event,
             Event::WindowCreated(..)
                 | Event::WindowDestroyed(..)
+                | Event::WindowClosed(..)
                 | Event::WindowInvalidated(..)
                 | Event::WindowServerDestroyed(..)
                 | Event::WindowServerAppeared(..)
@@ -1474,6 +1479,19 @@ impl Reactor {
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
+            Event::WindowClosed(wsid) => {
+                let Some(wid) = self.state.windows.tracked_window_id(wsid) else {
+                    return Ok(EventOutcome::default());
+                };
+                let mut outcome = window_workflow::handle_window_destroyed(
+                    &mut self.state,
+                    &self.transaction_manager,
+                    &mut self.drag_manager,
+                    window_workflow::WindowDestroyedPayload { window: wid },
+                )?;
+                outcome.focused_window = raised_window;
+                return Ok(outcome);
+            }
             Event::WindowInvalidated(wid, source) => {
                 // AX elements are routinely invalidated while the display/session is
                 // transitioning, and the notification establishing that transition can
@@ -1697,13 +1715,17 @@ impl Reactor {
                 self.advance_window_inventory_revision_if_needed(&space_state);
                 let releases_lifecycle_refresh_quarantine =
                     space_state.releases_lifecycle_refresh_quarantine;
+                // The spaces actor marks every coherent snapshot as an
+                // acknowledgement of the display-churn gate, so releasing it is an
+                // edge and not a level: act only while the gate is actually held,
+                // or the deferred all-app refresh fires on every snapshot.
+                let display_churn_active = self.refresh_quarantine_manager.display_churn_active;
                 let releases_display_churn_refresh_quarantine =
-                    space_state.releases_display_churn_refresh_quarantine;
+                    space_state.releases_display_churn_refresh_quarantine && display_churn_active;
                 let releases_instability = (releases_lifecycle_refresh_quarantine
                     && (self.refresh_quarantine_manager.awaiting_post_wake_snapshot
                         || self.refresh_quarantine_manager.awaiting_post_session_snapshot))
-                    || (releases_display_churn_refresh_quarantine
-                        && self.refresh_quarantine_manager.display_churn_active);
+                    || releases_display_churn_refresh_quarantine;
                 if releases_instability {
                     self.abandon_window_inventories_from_instability();
                 }
