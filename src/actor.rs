@@ -6,9 +6,8 @@ pub mod app;
 pub mod config;
 pub mod config_watcher;
 pub mod drag_swap;
-pub mod event_tap;
-pub mod gesture_tap;
 pub mod hints_bar;
+pub mod input;
 pub mod menu_bar;
 pub mod mission_control;
 pub mod mission_control_observer;
@@ -30,6 +29,8 @@ pub fn channel<Event>() -> (Sender<Event>, Receiver<Event>) {
 }
 
 impl<Event> Sender<Event> {
+    pub(crate) fn same_channel(&self, other: &Self) -> bool { self.0.same_channel(&other.0) }
+
     pub fn send(&self, event: Event) {
         // Most of the time we can ignore send errors, they just indicate the
         // app is shutting down.
