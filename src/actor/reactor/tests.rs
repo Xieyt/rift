@@ -6,7 +6,7 @@ use super::*;
 use crate::actor::app::{AppThreadHandle, Request, pid_t};
 use crate::actor::wm_controller::WmEvent;
 use crate::common::config::{LayoutMode, OuterGaps, WorkspaceSelector};
-use crate::layout_engine::{Direction, LayoutCommand, LayoutEvent};
+use crate::layout_engine::{Direction, LayoutCommand, LayoutEvent, MoveFocusArgs};
 use crate::model::window_store::NativeFullscreenTransition;
 use crate::sys::app::{AppInfo, WindowInfo};
 use crate::sys::geometry::SameAs;
@@ -494,6 +494,32 @@ fn no_op_workspace_switch_does_not_request_arrangement() {
         reactor.dispatch_test_layout_command(LayoutCommand::SwitchToWorkspace(usize::MAX));
     assert!(!missing.arrange.requested);
     assert!(missing.layout_responses.is_empty());
+}
+
+#[test]
+fn only_move_node_requests_post_arrange_mouse_warp() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let focused = WindowId::new(1, 2);
+
+    reactor.config.settings.mouse_follows_focus = true;
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    make_active_app(&mut apps, &mut reactor, 1, make_windows(2), Some(focused));
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: None,
+        mode: LayoutMode::Scrolling,
+    });
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(reactor.main_window(), Some(focused));
+
+    let move_node = reactor.dispatch_test_layout_command(LayoutCommand::MoveNode(Direction::Left));
+    assert_eq!(move_node.post_arrange_mouse_warp, Some(focused));
+
+    let move_focus = reactor.dispatch_test_layout_command(LayoutCommand::MoveFocus(
+        MoveFocusArgs { direction: Direction::Left, activate: false },
+    ));
+    assert_eq!(move_focus.post_arrange_mouse_warp, None);
 }
 
 #[test]

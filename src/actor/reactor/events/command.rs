@@ -26,6 +26,7 @@ pub struct LayoutCommandPayload {
     pub command_space: Option<SpaceId>,
     pub visible_spaces: Vec<SpaceId>,
     pub visible_space_centers: HashMap<SpaceId, objc2_core_foundation::CGPoint>,
+    pub post_arrange_mouse_warp: Option<WindowId>,
 }
 
 pub fn handle_command_layout(
@@ -39,8 +40,10 @@ pub fn handle_command_layout(
         command_space,
         visible_spaces,
         visible_space_centers,
+        post_arrange_mouse_warp,
     } = payload;
     info!(?cmd);
+    let is_move_node = matches!(cmd, LayoutCommand::MoveNode(_));
     let is_workspace_switch = matches!(
         cmd,
         LayoutCommand::NextWorkspace(_)
@@ -131,9 +134,13 @@ pub fn handle_command_layout(
     }
 
     let arrange_space_scope = is_workspace_switch.then_some(workspace_space).flatten();
-    Ok(EventOutcome::layout_changed(false)
+    let mut outcome = EventOutcome::layout_changed(false)
         .with_layout_response(response, workspace_space)
-        .with_arrange_space_scope(arrange_space_scope))
+        .with_arrange_space_scope(arrange_space_scope);
+    if is_move_node && let Some(window) = post_arrange_mouse_warp {
+        outcome = outcome.with_post_arrange_mouse_warp(window);
+    }
+    Ok(outcome)
 }
 
 fn current_floating_positions(
@@ -292,9 +299,32 @@ pub struct DisplayFocusPayload {
     pub screen: Option<ScreenInfo>,
     pub target_is_active: bool,
     pub focus_window: Option<WindowId>,
+    /// Center of `focus_window`'s frame, used to warp the cursor onto the
+    /// window that receives focus. Falls back to the screen center.
+    pub focus_window_center: Option<objc2_core_foundation::CGPoint>,
 }
 
-pub fn handle_move_mouse_to_display(payload: DisplayFocusPayload) -> anyhow::Result<EventOutcome> {
+fn focus_window_raise_request(apps: &AppManager, window: WindowId) -> raise_manager::Event {
+    let mut app_handles: HashMap<i32, AppThreadHandle> = HashMap::default();
+    if let Some(app) = apps.apps.get(&window.pid) {
+        app_handles.insert(window.pid, app.handle.clone());
+    }
+    raise_manager::Event::RaiseRequest(raise_manager::RaiseRequest {
+        raise_windows: Vec::new(),
+        focus_window: Some((window, None)),
+        app_handles,
+        focus_quiet: Quiet::No,
+        // §2.B: foregrounding is driven by `activate_on_focus` / `MoveFocusArgs`,
+        // never by a bare focus grant, so every caller of this helper (focus_window,
+        // focus_display, move_mouse_to_display) stays non-activating.
+        activate: false,
+    })
+}
+
+pub fn handle_move_mouse_to_display(
+    apps: &AppManager,
+    payload: DisplayFocusPayload,
+) -> anyhow::Result<EventOutcome> {
     let Some(screen) = payload.screen else {
         return Ok(EventOutcome::no_change());
     };
@@ -304,12 +334,17 @@ pub fn handle_move_mouse_to_display(payload: DisplayFocusPayload) -> anyhow::Res
     }
     let mut outcome = EventOutcome::focus_changed(None, false).with_mouse_warp(screen.frame.mid());
     if let (Some(space), Some(window)) = (screen.space, payload.focus_window) {
-        outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window));
+        outcome = outcome
+            .with_layout_event(LayoutEvent::WindowFocused(space, window))
+            .with_raise_request(focus_window_raise_request(apps, window));
     }
     Ok(outcome)
 }
 
-pub fn handle_focus_display(payload: DisplayFocusPayload) -> anyhow::Result<EventOutcome> {
+pub fn handle_focus_display(
+    apps: &AppManager,
+    payload: DisplayFocusPayload,
+) -> anyhow::Result<EventOutcome> {
     let Some(screen) = payload.screen else {
         return Ok(EventOutcome::no_change());
     };
@@ -319,7 +354,9 @@ pub fn handle_focus_display(payload: DisplayFocusPayload) -> anyhow::Result<Even
     }
     if let (Some(space), Some(window)) = (screen.space, payload.focus_window) {
         return Ok(EventOutcome::focus_changed(None, false)
-            .with_layout_event(LayoutEvent::WindowFocused(space, window)));
+            .with_layout_event(LayoutEvent::WindowFocused(space, window))
+            .with_raise_request(focus_window_raise_request(apps, window))
+            .with_mouse_warp(payload.focus_window_center.unwrap_or_else(|| screen.frame.mid())));
     }
     Ok(EventOutcome::focus_changed(None, false).with_mouse_warp(screen.frame.mid()))
 }
@@ -347,18 +384,7 @@ pub fn handle_command_reactor_focus_window(
         }
         outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window_id));
 
-        let mut app_handles: HashMap<i32, AppThreadHandle> = HashMap::default();
-        if let Some(app) = apps.apps.get(&window_id.pid) {
-            app_handles.insert(window_id.pid, app.handle.clone());
-        }
-        let request = raise_manager::Event::RaiseRequest(raise_manager::RaiseRequest {
-            raise_windows: Vec::new(),
-            focus_window: Some((window_id, None)),
-            app_handles,
-            focus_quiet: Quiet::No,
-            activate: false,
-        });
-        outcome = outcome.with_raise_request(request);
+        outcome = outcome.with_raise_request(focus_window_raise_request(apps, window_id));
     } else if let Some(wsid) = window_server_id {
         outcome = outcome.with_make_key_window(window_id.pid, wsid);
     }

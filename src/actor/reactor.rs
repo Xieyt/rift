@@ -1824,10 +1824,12 @@ impl Reactor {
                     .and_then(|screen| screen.space)
                     .is_none_or(|space| self.is_space_active(space));
                 return command_workflow::handle_move_mouse_to_display(
+                    &self.app_manager,
                     command_workflow::DisplayFocusPayload {
                         screen,
                         target_is_active,
                         focus_window,
+                        focus_window_center: None,
                     },
                 );
             }
@@ -1847,15 +1849,22 @@ impl Reactor {
                     .as_ref()
                     .and_then(|screen| screen.space)
                     .is_none_or(|space| self.is_space_active(space));
+                let focus_window_center = focus_window
+                    .and_then(|wid| self.state.windows.window(wid))
+                    .map(|window| window.frame_monotonic.mid());
                 return command_workflow::handle_focus_display(
+                    &self.app_manager,
                     command_workflow::DisplayFocusPayload {
                         screen,
                         target_is_active,
                         focus_window,
+                        focus_window_center,
                     },
                 );
             }
             Event::Command(Command::Layout(command)) => {
+                let post_arrange_mouse_warp =
+                    self.config.settings.mouse_follows_focus.then(|| self.main_window()).flatten();
                 let command_space = self.command_context_space();
                 let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(false);
                 return command_workflow::handle_command_layout(
@@ -1867,6 +1876,7 @@ impl Reactor {
                         command_space,
                         visible_spaces,
                         visible_space_centers,
+                        post_arrange_mouse_warp,
                     },
                 );
             }
@@ -2130,6 +2140,13 @@ impl Reactor {
             self.broadcast_layout_changed(
                 outcome.arrange.space_scope.or_else(|| self.workspace_command_space()),
             );
+        }
+
+        if layout_changed
+            && let Some(window) = outcome.post_arrange_mouse_warp
+            && let Some(center) = self.window_center_on_known_screen(window)
+        {
+            self.warp_mouse(center);
         }
 
         for request in outcome.raise_requests {
