@@ -1984,6 +1984,142 @@ mod tests {
         assert_eq!(move_focus_binds, 4, "expected the four bare move_focus binds");
     }
 
+    /// Locates the `test:` recipe line in the justfile. Shared by both
+    /// module-direction guards below and by `just_test_skips_all_name_a_real_test`.
+    fn test_recipe() -> &'static str {
+        include_str!("../../justfile")
+            .lines()
+            .find(|line| line.contains("cargo test --lib --") && line.contains("--skip"))
+            .expect("justfile must still have a `test:` recipe running `cargo test --lib`")
+    }
+
+    /// Locates the `test-crates` recipe line. Unlike `test:`, it runs each
+    /// workspace-member crate's whole `--lib` suite unfiltered
+    /// (`cargo test -p <crate> --lib`), so it has `-p` package names instead of
+    /// module filters.
+    fn test_crates_recipe() -> &'static str {
+        include_str!("../../justfile")
+            .lines()
+            .find(|line| line.contains("cargo test -p") && line.contains("--lib"))
+            .expect(
+                "justfile must still have a `test-crates` recipe running `cargo test -p ... --lib`",
+            )
+    }
+
+    /// The `-p <crate>` package names `test-crates` passes to cargo. Since that
+    /// recipe runs each named crate's full suite unfiltered, a package name here
+    /// classifies every test module under that crate the same way a `test:`
+    /// filter classifies a `src/` module.
+    fn test_crates_recipe_packages() -> Vec<&'static str> {
+        let tokens: Vec<&str> = test_crates_recipe().split_whitespace().collect();
+        tokens.windows(2).filter(|pair| pair[0] == "-p").map(|pair| pair[1]).collect()
+    }
+
+    /// The `test:` recipe's filters, i.e. everything between `--lib --` and the
+    /// first `--skip`.
+    fn recipe_filters(recipe: &str) -> Vec<&str> {
+        recipe
+            .split_once("--lib --")
+            .expect("recipe shape changed")
+            .1
+            .split("--skip")
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect()
+    }
+
+    /// `a::b` covers `a::b::tests` but must not let `ui::menu` cover `ui::menu_bar`.
+    fn covers(prefix: &str, module: &str) -> bool {
+        module == prefix || module.strip_prefix(prefix).is_some_and(|rest| rest.starts_with("::"))
+    }
+
+    /// Walks one `src`-shaped directory tree, collecting the fully qualified path
+    /// of every `#[cfg(test)] mod NAME` it finds. `crate_prefix` prepends a
+    /// workspace-member crate's directory name for trees under `crates/*/src` so
+    /// their module paths (and the `-p` names that classify them) line up.
+    fn walk_test_modules(root: &std::path::Path, crate_prefix: Option<&str>) -> Vec<String> {
+        let mut modules = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("source dir must be readable") {
+                let path = entry.expect("readable dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let body = std::fs::read_to_string(&path).expect("source must be readable");
+
+                // `src/a/b.rs` -> `a::b`; `src/a/mod.rs` -> `a`; `src/lib.rs` -> ``.
+                let rel = path.strip_prefix(root).expect("under root").with_extension("");
+                let mut owner: Vec<String> = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                if owner.last().is_some_and(|last| last == "mod" || last == "lib") {
+                    owner.pop();
+                }
+                if let Some(prefix) = crate_prefix {
+                    owner.insert(0, prefix.to_owned());
+                }
+
+                // Each `#[cfg(test)]` guarding a `mod NAME` is one test module.
+                for (idx, line) in body.lines().enumerate() {
+                    if line.trim_start() != "#[cfg(test)]" {
+                        continue;
+                    }
+                    let Some(name) = body
+                        .lines()
+                        .skip(idx + 1)
+                        .find(|next| !next.trim_start().starts_with("#["))
+                        .and_then(|decl| decl.trim_start().strip_prefix("mod "))
+                        .and_then(|rest| rest.split([' ', ';', '{']).next())
+                    else {
+                        continue; // `#[cfg(test)] use ...` and friends
+                    };
+                    let module = owner
+                        .iter()
+                        .map(String::as_str)
+                        .chain(std::iter::once(name))
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    modules.push(module);
+                }
+            }
+        }
+        modules
+    }
+
+    /// Every test module in the workspace: `src/` (the root crate) plus every
+    /// `crates/*/src` member. `crates/rift-protocol/src/transport.rs` and its
+    /// siblings only run via `just test-crates`, never through `just test`'s
+    /// filters, so they get their own module-path prefix (the crate directory
+    /// name, matching the `-p` name `test-crates` passes to cargo).
+    fn discover_test_modules() -> Vec<String> {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut modules = walk_test_modules(&manifest_dir.join("src"), None);
+
+        let crates_dir = manifest_dir.join("crates");
+        let mut crate_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&crates_dir)
+            .expect("crates/ must be readable")
+            .map(|entry| entry.expect("readable crates/ entry").path())
+            .filter(|path| path.is_dir())
+            .collect();
+        crate_dirs.sort();
+        for crate_dir in crate_dirs {
+            let crate_name =
+                crate_dir.file_name().expect("crate dir has a name").to_string_lossy().into_owned();
+            let crate_src = crate_dir.join("src");
+            if crate_src.is_dir() {
+                modules.extend(walk_test_modules(&crate_src, Some(&crate_name)));
+            }
+        }
+        modules
+    }
+
     /// Guards the `just test` allowlist against silent coverage loss.
     ///
     /// `just test` runs a *curated* filter list, so a new `#[cfg(test)] mod` that
@@ -2033,80 +2169,23 @@ mod tests {
             "common::log",
         ];
 
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let recipe = include_str!("../../justfile")
-            .lines()
-            .find(|line| line.contains("cargo test --lib --") && line.contains("--skip"))
-            .expect("justfile must still have a `test:` recipe running `cargo test --lib`");
-
-        // Filters sit between `--lib --` and the first `--skip`.
-        let filters: Vec<&str> = recipe
-            .split_once("--lib --")
-            .expect("recipe shape changed")
-            .1
-            .split("--skip")
-            .next()
-            .unwrap()
-            .split_whitespace()
-            .collect();
+        let filters = recipe_filters(test_recipe());
         assert!(!filters.is_empty(), "the `test:` recipe names no filters");
 
-        // `a::b` covers `a::b::tests` but must not let `ui::menu` cover `ui::menu_bar`.
-        let covers = |prefix: &str, module: &str| {
-            module == prefix
-                || module.strip_prefix(prefix).is_some_and(|rest| rest.starts_with("::"))
-        };
+        // `crates/*/src` modules run unfiltered via `test-crates`'s `-p` list, not
+        // via `test:`'s filters, so a crate's package name classifies its whole
+        // crate the same way a `test:` filter classifies a `src/` module.
+        let crate_packages = test_crates_recipe_packages();
 
         let mut unclassified = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).expect("src/ must be readable") {
-                let path = entry.expect("readable dir entry").path();
-                if path.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if path.extension().is_none_or(|ext| ext != "rs") {
-                    continue;
-                }
-                let body = std::fs::read_to_string(&path).expect("source must be readable");
-
-                // `src/a/b.rs` -> `a::b`; `src/a/mod.rs` -> `a`; `src/lib.rs` -> ``.
-                let rel = path.strip_prefix(&root).expect("under src/").with_extension("");
-                let mut owner: Vec<String> = rel
-                    .components()
-                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                    .collect();
-                if owner.last().is_some_and(|last| last == "mod" || last == "lib") {
-                    owner.pop();
-                }
-
-                // Each `#[cfg(test)]` guarding a `mod NAME` is one test module.
-                for (idx, line) in body.lines().enumerate() {
-                    if line.trim_start() != "#[cfg(test)]" {
-                        continue;
-                    }
-                    let Some(name) = body
-                        .lines()
-                        .skip(idx + 1)
-                        .find(|next| !next.trim_start().starts_with("#["))
-                        .and_then(|decl| decl.trim_start().strip_prefix("mod "))
-                        .and_then(|rest| rest.split([' ', ';', '{']).next())
-                    else {
-                        continue; // `#[cfg(test)] use ...` and friends
-                    };
-                    let module = owner
-                        .iter()
-                        .map(String::as_str)
-                        .chain(std::iter::once(name))
-                        .collect::<Vec<_>>()
-                        .join("::");
-                    let classified =
-                        filters.iter().chain(GUI_OR_DEFERRED).any(|prefix| covers(prefix, &module));
-                    if !classified {
-                        unclassified.push(module);
-                    }
-                }
+        for module in discover_test_modules() {
+            let classified = filters
+                .iter()
+                .chain(GUI_OR_DEFERRED)
+                .chain(crate_packages.iter())
+                .any(|prefix| covers(prefix, &module));
+            if !classified {
+                unclassified.push(module);
             }
         }
 
@@ -2115,6 +2194,46 @@ mod tests {
             unclassified.is_empty(),
             "these test modules are in neither the `just test` allowlist nor \
              GUI_OR_DEFERRED, so they silently never run: {unclassified:#?}",
+        );
+    }
+
+    /// Mirror image of the guard above: that one asserts every test module is
+    /// classified by a `test:` filter, `GUI_OR_DEFERRED`, or a `test-crates`
+    /// package; this one asserts every `test:` filter still classifies a real
+    /// module. A filter matching nothing is not an error to libtest — it
+    /// silently selects zero tests, the same failure shape
+    /// `just_test_skips_all_name_a_real_test` guards against for `--skip`, just
+    /// in the opposite direction.
+    ///
+    /// This is about to matter for real: the upstream sync deletes
+    /// `src/actor/event_tap.rs` and `src/actor/gesture_tap.rs`, both named
+    /// directly in the `test:` recipe. Once those modules are gone, the filters
+    /// would keep matching nothing forever, silently and without complaint,
+    /// exactly like the dead `--skip` the other guard was written for.
+    ///
+    /// Shares `discover_test_modules`/`covers`/`recipe_filters`/`test_recipe`
+    /// with the guard above rather than re-walking `src/` and `crates/*/src` a
+    /// second time.
+    #[test]
+    fn just_test_filters_all_name_a_real_module() {
+        let filters = recipe_filters(test_recipe());
+        assert!(!filters.is_empty(), "the `test:` recipe names no filters");
+
+        let modules = discover_test_modules();
+
+        let mut dead: Vec<&str> = filters
+            .iter()
+            .copied()
+            .filter(|filter| !modules.iter().any(|module| covers(filter, module)))
+            .collect();
+        dead.sort();
+
+        assert!(
+            dead.is_empty(),
+            "these `just test` filters match no test module under src/ or \
+             crates/*/src, so they silently select nothing: {dead:#?}\n\
+             Either the module was renamed or moved (re-point the filter at its new \
+             path) or it is gone (delete the filter).",
         );
     }
 

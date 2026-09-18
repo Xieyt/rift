@@ -93,6 +93,17 @@ test:
 test-all:
     nix develop -c cargo test --lib
 
+# Workspace-member crate tests that neither `test` nor `test-all` ever runs:
+# both use `cargo test --lib`, which builds only the root package's lib target,
+# so `crates/rift-protocol` and `crates/rift-client` never execute their own
+# `#[cfg(test)]` suites (e.g. `crates/rift-protocol/src/transport.rs`'s wire-
+# format tests, `crates/rift-client/src/lib.rs`'s Mach message framing tests).
+# Guarded against silent coverage loss the same way `test:`'s filters are:
+# `common::config`'s `just_test_allowlist_classifies_every_test_module` walks
+# `crates/*/src` too and classifies via these `-p` package names.
+test-crates:
+    nix develop -c cargo test -p rift-protocol -p rift-client --lib
+
 # ---------------------------------------------------------------------------
 # real builds — through Nix, so the linker/SDK are correct
 # ---------------------------------------------------------------------------
