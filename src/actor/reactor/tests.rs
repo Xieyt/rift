@@ -109,6 +109,55 @@ fn it_ignores_stale_resize_events() {
 }
 
 #[test]
+fn inventory_from_an_older_space_topology_is_discarded_and_retried() {
+    let mut reactor = test_reactor();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let old_space = SpaceId::new(1);
+    let new_space = SpaceId::new(59);
+    let pid = 91;
+    let wid = WindowId::new(pid, 1);
+    let (app_tx, mut app_rx) = actor::channel();
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(old_space)]));
+    reactor.app_manager.apps.insert(pid, AppState {
+        info: AppInfo {
+            bundle_id: Some("com.test.stale-inventory".into()),
+            localized_name: Some("Stale Inventory".into()),
+        },
+        handle: AppThreadHandle::new_for_test(app_tx),
+    });
+
+    reactor.request_window_inventory(pid);
+    let (_, Request::RefreshWindowInventory(stale_token)) =
+        app_rx.try_recv().expect("the initial inventory should be requested")
+    else {
+        panic!("expected a window inventory request");
+    };
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(new_space)]));
+    reactor.handle_event(Event::WindowsDiscovered {
+        pid,
+        token: stale_token,
+        successful: true,
+        new: vec![(wid, make_window_info(screen, None, "Late Window", None))],
+        known_visible: vec![wid],
+    });
+
+    assert!(
+        !reactor.state.windows.contains_window(wid),
+        "a reply requested for the old Space topology must not mutate window state"
+    );
+    let (_, Request::RefreshWindowInventory(fresh_token)) = app_rx
+        .try_recv()
+        .expect("discarding a stale reply should immediately request a fresh inventory")
+    else {
+        panic!("expected a replacement window inventory request");
+    };
+    assert_ne!(fresh_token.request_id, stale_token.request_id);
+    assert_ne!(fresh_token.topology_revision, stale_token.topology_revision);
+}
+
+#[test]
 fn it_sends_writes_when_stale_read_state_looks_same_as_written_state() {
     let (mut apps, mut reactor) = test_context();
     reactor.handle_event(space_state_event(
@@ -1234,6 +1283,37 @@ fn crossing_native_spaces_reconciles_membership_with_one_arrange_pass() {
 }
 
 #[test]
+fn unmanageable_window_crossing_spaces_is_not_reinserted_into_layout() {
+    let mut reactor = test_reactor();
+    let screen1 = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 800.));
+    let screen2 = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 800.));
+    let space1 = SpaceId::new(1);
+    let space2 = SpaceId::new(2);
+    let wid = WindowId::new(1, 1);
+    let wsid = WindowServerId::new(101);
+    let initial_frame = CGRect::new(CGPoint::new(100., 100.), CGSize::new(500., 400.));
+    let moved_frame = CGRect::new(CGPoint::new(1100., 100.), CGSize::new(500., 400.));
+
+    reactor.handle_event(space_state_event(vec![screen1, screen2], vec![
+        Some(space1),
+        Some(space2),
+    ]));
+    reactor.add_test_window_with_manageability(wid, wsid, Some(space1), initial_frame, false);
+
+    reactor.handle_event(Event::WindowFrameChanged(
+        wid,
+        moved_frame,
+        None,
+        Requested(false),
+        Some(crate::sys::event::MouseState::Up),
+    ));
+
+    assert_eq!(reactor.state.windows.window_server_space(wsid), Some(space2));
+    assert_eq!(reactor.assigned_space_for_window_id(wid), None);
+    assert!(!has_window_in_layout(&mut reactor, space2, screen2, wid));
+}
+
+#[test]
 fn duplicate_minimize_deminimize_and_unknown_window_events_do_not_arrange() {
     let (mut reactor, wid, _wsid, _space1, _space2, _frame) = reactor_with_window_on_space1();
 
@@ -1641,15 +1721,15 @@ fn fullscreen_tracking_survives_until_ax_window_id_arrives() {
         "fullscreen lifecycle should be retained by wsid until AX tracking binds the window"
     );
     assert!(
-        matches!(app_rx.try_recv(), Ok((_, Request::GetVisibleWindows))),
+        matches!(app_rx.try_recv(), Ok((_, Request::RefreshWindowInventory(_)))),
         "fullscreen appearance without AX tracking should still request a visible-window refresh"
     );
 
     window_server_appeared(&mut reactor, wsid, user_space, SpaceEventKind::User);
 
     assert!(
-        matches!(app_rx.try_recv(), Ok((_, Request::GetVisibleWindows))),
-        "fullscreen exit without AX tracking should request a visible-window refresh"
+        app_rx.try_recv().is_err(),
+        "fullscreen exit should coalesce behind the in-flight inventory"
     );
 
     reactor.discover_test_windows(
@@ -1659,6 +1739,10 @@ fn fullscreen_tracking_survives_until_ax_window_id_arrives() {
             make_window_info(frame, Some(wsid), "Recovered Window", None),
         )],
         vec![wid],
+    );
+    assert!(
+        matches!(app_rx.try_recv(), Ok((_, Request::RefreshWindowInventory(_)))),
+        "completing the in-flight inventory should issue the queued refresh"
     );
 
     assert!(
@@ -1866,8 +1950,6 @@ fn discovery_preserves_hidden_windows_on_their_original_same_display_space() {
     reactor.handle_event(space_state_event(vec![frame], vec![Some(space2)]));
     reactor.state.windows.clear_visible_windows();
     reactor.state.windows.mark_window_visible(WindowServerId::new(103));
-    reactor.mission_control_manager.pending_mission_control_refresh.insert(pid);
-
     reactor.on_windows_discovered_with_app_info(pid, vec![], vec![WindowId::new(pid, 3)], None);
 
     let space1_workspaces = reactor.query_workspaces(Some(space1));
@@ -2411,7 +2493,7 @@ fn auto_workspace_switch_follows_activated_window_when_same_app_is_visible_elsew
     assert!(
         activation_requests
             .iter()
-            .all(|request| !matches!(request, Request::GetVisibleWindows)),
+            .all(|request| !matches!(request, Request::RefreshWindowInventory(_))),
         "Carbon activation should not enumerate every AX window: {activation_requests:?}"
     );
     assert!(
@@ -3049,7 +3131,7 @@ fn it_retains_windows_without_server_ids_after_login_visibility_failure() {
         let mut other_requests = Vec::new();
         for request in requests {
             match request {
-                Request::GetVisibleWindows => {
+                Request::RefreshWindowInventory(_) => {
                     reactor.discover_test_windows(1, vec![], vec![]);
                 }
                 other => other_requests.push(other),
@@ -3864,7 +3946,9 @@ fn make_active_app_with_count(
 fn simulate_login_screen_refresh(apps: &mut Apps, reactor: &mut Reactor, pid: pid_t) {
     for request in apps.requests() {
         match request {
-            Request::GetVisibleWindows => reactor.discover_test_windows(pid, vec![], vec![]),
+            Request::RefreshWindowInventory(_) => {
+                reactor.discover_test_windows(pid, vec![], vec![])
+            }
             request => {
                 for event in apps.simulate_events_for_requests(vec![request]) {
                     reactor.handle_event(event);
@@ -3996,16 +4080,16 @@ fn unfullscreen_restores_window_tracking() {
     // Exit fullscreen (return to user space).
     reactor.handle_event(space_state_event(vec![full_screen], vec![Some(user_space)]));
 
-    // The reactor should trigger a GetVisibleWindows request.
+    // The reactor should trigger a window inventory request.
     let mut saw_get_visible_windows = false;
     for request in apps.requests() {
-        if matches!(request, Request::GetVisibleWindows) {
+        if matches!(request, Request::RefreshWindowInventory(_)) {
             saw_get_visible_windows = true;
         }
     }
     assert!(
         saw_get_visible_windows,
-        "Should send GetVisibleWindows to app on unfullscreen"
+        "Should send window inventory to app on unfullscreen"
     );
 
     // The fullscreen track should be removed.
@@ -4074,7 +4158,7 @@ fn display_churn_snapshot_ack_triggers_visible_window_refresh() {
     assert!(
         apps.requests()
             .into_iter()
-            .any(|request| matches!(request, Request::GetVisibleWindows)),
+            .any(|request| matches!(request, Request::RefreshWindowInventory(_))),
         "the snapshot acknowledgement should release churn and request visible windows"
     );
 }
@@ -4169,7 +4253,9 @@ fn session_gate_ignores_discovery_and_replays_one_refresh_after_unlock() {
 
     let requests = apps.requests();
     assert!(
-        requests.iter().all(|request| !matches!(request, Request::GetVisibleWindows)),
+        requests
+            .iter()
+            .all(|request| !matches!(request, Request::RefreshWindowInventory(_))),
         "locked-session discovery should defer visible-window enumeration: {requests:?}"
     );
     assert!(
@@ -4205,7 +4291,7 @@ fn session_gate_ignores_discovery_and_replays_one_refresh_after_unlock() {
     assert_eq!(
         requests
             .into_iter()
-            .filter(|request| matches!(request, Request::GetVisibleWindows))
+            .filter(|request| matches!(request, Request::RefreshWindowInventory(_)))
             .count(),
         1,
         "the first fresh post-unlock snapshot should flush exactly one deferred visibility refresh"
@@ -4227,7 +4313,9 @@ fn wake_gate_waits_for_fresh_space_snapshot_before_refresh() {
 
     let requests = apps.requests();
     assert!(
-        requests.iter().all(|request| !matches!(request, Request::GetVisibleWindows)),
+        requests
+            .iter()
+            .all(|request| !matches!(request, Request::RefreshWindowInventory(_))),
         "wake should quarantine visible-window enumeration until a fresh space snapshot: {requests:?}"
     );
     assert!(
@@ -4253,7 +4341,7 @@ fn wake_gate_waits_for_fresh_space_snapshot_before_refresh() {
     assert_eq!(
         requests
             .into_iter()
-            .filter(|request| matches!(request, Request::GetVisibleWindows))
+            .filter(|request| matches!(request, Request::RefreshWindowInventory(_)))
             .count(),
         1,
         "the first fresh post-wake snapshot should flush exactly one deferred visibility refresh"
@@ -4419,7 +4507,7 @@ fn ax_destruction_removes_ordered_in_window_outside_churn() {
     assert!(
         apps.requests()
             .iter()
-            .all(|request| !matches!(request, Request::GetVisibleWindows)),
+            .all(|request| !matches!(request, Request::RefreshWindowInventory(_))),
         "AX destruction outside churn should not trigger replacement-element polling",
     );
 }
@@ -4441,7 +4529,6 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
     assert!(reactor.state.windows.is_window_visible(wsid));
 
     let snapshot = |suitable, ordered_in| window_discovery::StaleCleanupSnapshot {
-        pending_refresh: false,
         suppressed: false,
         mission_control_active: false,
         drag_active: false,
@@ -4455,7 +4542,7 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
         .collect(),
     };
 
-    let (ordered_stale, _) = window_discovery::identify_stale_windows(
+    let ordered_stale = window_discovery::identify_stale_windows(
         &reactor.state,
         wid.pid,
         &[],
@@ -4466,7 +4553,7 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
         "temporary AX omission must preserve an ordered-in window"
     );
 
-    let (closed_stale, _) = window_discovery::identify_stale_windows(
+    let closed_stale = window_discovery::identify_stale_windows(
         &reactor.state,
         wid.pid,
         &[],
@@ -4478,7 +4565,7 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
         "an ordered-out window must be retired even when cached visibility is stale",
     );
 
-    let (unknown_stale, _) = window_discovery::identify_stale_windows(
+    let unknown_stale = window_discovery::identify_stale_windows(
         &reactor.state,
         wid.pid,
         &[],
@@ -4489,7 +4576,7 @@ fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
         "an unavailable ordered-state query must not remove a valid layout node",
     );
 
-    let (unknown_suitability_stale, _) = window_discovery::identify_stale_windows(
+    let unknown_suitability_stale = window_discovery::identify_stale_windows(
         &reactor.state,
         wid.pid,
         &[],

@@ -970,6 +970,65 @@ fn duplicate_visible_window_keeps_previous_active_space_when_lookup_races() {
 }
 
 #[test]
+fn duplicate_visible_window_keeps_previous_active_space_when_lookup_conflicts() {
+    let wsid = WindowServerId::new(93);
+    let old_space = SpaceId::new(521);
+    let other_space = SpaceId::new(522);
+    let mut visible = HashMap::default();
+    let previous_visible = HashMap::from_iter([(wsid, old_space)]);
+    let active_spaces = HashSet::from_iter([old_space, other_space]);
+
+    SpacesActor::record_visible_window_space(
+        &mut visible,
+        &previous_visible,
+        &active_spaces,
+        wsid,
+        old_space,
+        Some(other_space),
+    );
+    SpacesActor::record_visible_window_space(
+        &mut visible,
+        &previous_visible,
+        &active_spaces,
+        wsid,
+        other_space,
+        Some(other_space),
+    );
+
+    assert_eq!(visible.get(&wsid).copied(), Some(old_space));
+}
+
+#[test]
+fn duplicate_visible_window_does_not_keep_previous_inactive_space() {
+    let wsid = WindowServerId::new(94);
+    let old_space = SpaceId::new(531);
+    let left_space = SpaceId::new(532);
+    let right_space = SpaceId::new(533);
+    let mut visible = HashMap::default();
+    let previous_visible = HashMap::from_iter([(wsid, old_space)]);
+    let active_spaces = HashSet::from_iter([left_space, right_space]);
+
+    SpacesActor::record_visible_window_space(
+        &mut visible,
+        &previous_visible,
+        &active_spaces,
+        wsid,
+        left_space,
+        Some(right_space),
+    );
+    SpacesActor::record_visible_window_space(
+        &mut visible,
+        &previous_visible,
+        &active_spaces,
+        wsid,
+        right_space,
+        Some(right_space),
+    );
+
+    assert_eq!(visible.get(&wsid).copied(), Some(right_space));
+}
+
+#[test]
 fn duplicate_visible_window_uses_authoritative_space_when_available() {
     let wsid = WindowServerId::new(92);
     let left_space = SpaceId::new(511);
@@ -1211,10 +1270,7 @@ fn display_churn_stabilization_rejects_duplicate_space_snapshot_until_valid() {
     ));
 
     let epoch = actor.state.display_churn_epoch;
-    actor.state.screens = vec![
-        make_screen_with(1, "display-left", 0.0, 1000.0, Some(left)),
-        make_screen_with(2, "display-right", 1000.0, 1000.0, Some(left)),
-    ];
+    actor.state.screens = vec![make_screen_with(3, "wake-placeholder", 0.0, 1000.0, None)];
 
     actor.attempt_finish_display_churn(epoch, 0);
     actor.attempt_finish_display_churn(epoch, 1);
@@ -1222,11 +1278,20 @@ fn display_churn_stabilization_rejects_duplicate_space_snapshot_until_valid() {
 
     actor.state.screens = vec![
         make_screen_with(1, "display-left", 0.0, 1000.0, Some(left)),
-        make_screen_with(2, "display-right", 1000.0, 1000.0, Some(right)),
+        make_screen_with(2, "display-right", 1000.0, 1000.0, Some(left)),
     ];
 
     actor.attempt_finish_display_churn(epoch, 2);
     actor.attempt_finish_display_churn(epoch, 3);
+    assert_no_wm_event(&mut wm_rx);
+
+    actor.state.screens = vec![
+        make_screen_with(1, "display-left", 0.0, 1000.0, Some(left)),
+        make_screen_with(2, "display-right", 1000.0, 1000.0, Some(right)),
+    ];
+
+    actor.attempt_finish_display_churn(epoch, 4);
+    actor.attempt_finish_display_churn(epoch, 5);
 
     match recv_wm(&mut wm_rx) {
         wm_controller::WmEvent::SpaceStateUpdated(state, _) => {
