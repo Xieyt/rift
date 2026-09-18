@@ -465,7 +465,9 @@ pub fn handle_mouse_moved_over_window(
                 raise_windows: vec![vec![window]],
                 focus_window: Some((window, None)),
                 app_handles,
-                focus_quiet: Quiet::No,
+                // Upstream #485: a self-initiated raise must be quiet, or a stale
+                // main window can switch workspace under focus-follows-mouse.
+                focus_quiet: Quiet::Yes,
                 activate: false,
             },
         ));

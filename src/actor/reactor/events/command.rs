@@ -325,7 +325,8 @@ fn focus_window_raise_request(apps: &AppManager, window: WindowId) -> raise_mana
         raise_windows: Vec::new(),
         focus_window: Some((window, None)),
         app_handles,
-        focus_quiet: Quiet::No,
+        // Upstream #485: self-initiated raises stay quiet.
+        focus_quiet: Quiet::Yes,
         // §2.B: foregrounding is driven by `activate_on_focus` / `MoveFocusArgs`,
         // never by a bare focus grant, so every caller of this helper (focus_window,
         // focus_display, move_mouse_to_display) stays non-activating.

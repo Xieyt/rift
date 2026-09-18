@@ -2873,25 +2873,7 @@ impl Reactor {
                 (wid.pid == pid && self.is_window_on_known_inactive_space(wid)).then_some(wid)
             })
             .collect();
-        let server_observations = self
-            .state
-            .windows
-            .iter_windows()
-            .filter_map(|(wid, window)| (wid.pid == pid).then_some(window.info.sys_id).flatten())
-            .map(|wsid| {
-                let info = self
-                    .state
-                    .windows
-                    .get_window_server_info(wsid)
-                    .or_else(|| window_server::get_window(wsid));
-                (wsid, window_discovery::StaleWindowObservation {
-                    info,
-                    suitable: window_server::app_window_suitability(wsid),
-                    ordered_in: window_server::window_ordered_in(wsid),
-                })
-            })
-            .collect();
-        let stale_snapshot = window_discovery::StaleCleanupSnapshot {
+        let mut stale_snapshot = window_discovery::StaleCleanupSnapshot {
             suppressed: matches!(
                 self.refocus_manager.stale_cleanup_state,
                 StaleCleanupState::Suppressed
@@ -2899,7 +2881,7 @@ impl Reactor {
             mission_control_active: self.is_mission_control_active(),
             drag_active: self.is_in_drag(),
             inactive_windows,
-            server_observations,
+            server_observations: Default::default(),
         };
         // AX can replace a window's process-local identity while preserving its
         // WindowServer id. Treat the currently tracked identity as visible for
@@ -2908,6 +2890,21 @@ impl Reactor {
         cleanup_visible.extend(new.iter().filter_map(|(_, info)| {
             info.sys_id.and_then(|wsid| self.state.windows.tracked_window_id(wsid))
         }));
+        window_discovery::observe_stale_windows(
+            &self.state,
+            pid,
+            &cleanup_visible,
+            &mut stale_snapshot,
+            |wsid| window_discovery::StaleWindowObservation {
+                info: self
+                    .state
+                    .windows
+                    .get_window_server_info(wsid)
+                    .or_else(|| window_server::get_window(wsid)),
+                suitable: window_server::app_window_suitability(wsid),
+                ordered_in: window_server::window_ordered_in(wsid),
+            },
+        );
         let stale_windows = window_discovery::identify_stale_windows(
             &self.state,
             pid,
@@ -3397,20 +3394,45 @@ impl Reactor {
         observation: Option<SpaceId>,
     ) -> Option<SpaceId> {
         let pending = self.pending_target_space_for_window_server_id(wsid);
-        let live = window_server::window_space(wsid);
         let prior = self.state.windows.window_server_space(wsid);
 
-        match (observation, pending) {
+        let (resolved, live) = match (observation, pending) {
             (Some(observed), Some(target)) if observed != target => {
-                if live == Some(observed) {
+                let live = window_server::window_space(wsid);
+                let resolved = if live == Some(observed) {
                     Some(observed)
                 } else {
                     Some(target)
-                }
+                };
+                (resolved, Some(live))
             }
-            (Some(observed), _) => Some(observed),
-            (None, _) => live.or(pending).or(prior),
+            (Some(observed), _) => (Some(observed), None),
+            (None, _) => {
+                let live = window_server::window_space(wsid);
+                (live.or(pending).or(prior), Some(live))
+            }
+        };
+        match live {
+            Some(live) => trace!(
+                ?wsid,
+                ?observation,
+                ?pending,
+                ?prior,
+                ?live,
+                ?resolved,
+                "Resolved native space"
+            ),
+            None => trace!(
+                ?wsid,
+                ?observation,
+                ?pending,
+                ?prior,
+                live = "not queried",
+                ?resolved,
+                "Resolved native space"
+            ),
         }
+        resolved
     }
 
     fn best_space_for_window_id(&self, wid: WindowId) -> Option<SpaceId> {

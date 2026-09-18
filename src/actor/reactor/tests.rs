@@ -2818,6 +2818,79 @@ fn focus_follows_mouse_emits_focus_without_explicit_arrange() {
 }
 
 #[test]
+fn focus_follows_mouse_raise_is_quiet_so_stale_main_window_cannot_switch_workspace() {
+    let reactor = test_reactor();
+    let space = SpaceId::new(1);
+    let window = WindowId::new(7, 1);
+
+    let outcome = window_workflow::handle_mouse_moved_over_window(
+        &reactor.app_manager,
+        window_workflow::MouseMovedPayload {
+            window: Some(window),
+            should_sync: true,
+            is_main: false,
+            needs_layout_sync: true,
+            active_space: Some(space),
+        },
+    )
+    .expect("mouse focus workflow");
+
+    match outcome.raise_requests.as_slice() {
+        [raise_manager::Event::RaiseRequest(RaiseRequest { focus_window, focus_quiet, .. })] => {
+            assert_eq!(focus_window.map(|(wid, _)| wid), Some(window));
+            assert_eq!(*focus_quiet, Quiet::Yes);
+        }
+        other => panic!("Unexpected raise requests: {other:?}"),
+    }
+    assert!(matches!(
+        outcome.layout_events.as_slice(),
+        [LayoutEvent::WindowFocused(event_space, event_window)]
+            if *event_space == space && *event_window == window
+    ));
+}
+
+/// The command-site half of upstream's #485 (`0121cf2`), which its own test does
+/// not reach: `focus_follows_mouse_raise_is_quiet_…` covers only the mouse path,
+/// while `focus-window` over IPC goes through `focus_window_raise_request`.
+///
+/// That helper is shared by three callers and carries our §2.B `activate` field,
+/// so every sync re-resolves the same two-line hunk — and resolving it `@ours`
+/// compiles, passes, and silently restores `Quiet::No`, letting a stale main
+/// window switch workspace behind a plain focus grant. Hazard H2 in
+/// `UPSTREAM-SYNC.md` §11.4.
+#[test]
+fn focus_window_command_raise_is_quiet_and_does_not_activate() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let window = WindowId::new(3, 1);
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    apps.make_app_and_settle(&mut reactor, window.pid, make_windows(2));
+
+    let outcome = command_workflow::handle_command_reactor_focus_window(
+        &reactor.state,
+        &reactor.app_manager,
+        command_workflow::FocusWindowPayload {
+            window_id: window,
+            window_server_id: None,
+            resolved_space: Some(space),
+            space_is_active: true,
+        },
+    )
+    .expect("focus window command");
+
+    match outcome.raise_requests.as_slice() {
+        [raise_manager::Event::RaiseRequest(request)] => {
+            assert_eq!(request.focus_window.map(|(wid, _)| wid), Some(window));
+            assert_eq!(request.focus_quiet, Quiet::Yes, "self-initiated raise must stay quiet");
+            assert!(!request.activate, "a bare focus grant must not foreground the app");
+        }
+        other => panic!("Unexpected raise requests: {other:?}"),
+    }
+}
+
+#[test]
 fn resolved_activation_without_main_window_does_not_choose_arbitrary_app_window() {
     let (mut apps, mut reactor) = test_context();
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
@@ -4939,6 +5012,117 @@ fn ax_destruction_removes_ordered_in_window_outside_churn() {
 }
 
 #[test]
+fn stale_cleanup_observes_only_eligible_omitted_windows() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let returned = WindowId::new(1, 1);
+    let omitted = WindowId::new(1, 2);
+    let minimized = WindowId::new(1, 3);
+    let inactive = WindowId::new(1, 4);
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(4));
+    reactor.state.windows.window_mut(minimized).unwrap().info.is_minimized = true;
+    let wsid = reactor.test_window_server_id(omitted);
+    let info = reactor.state.windows.get_window_server_info(wsid);
+    assert!(reactor.state.windows.is_window_visible(wsid));
+    let mut snapshot = window_discovery::StaleCleanupSnapshot {
+        suppressed: false,
+        mission_control_active: false,
+        drag_active: false,
+        inactive_windows: [inactive].into_iter().collect(),
+        server_observations: Default::default(),
+    };
+    let mut suitability_calls = Vec::new();
+    let mut ordered_in_calls = Vec::new();
+    window_discovery::observe_stale_windows(
+        &reactor.state,
+        returned.pid,
+        &[returned],
+        &mut snapshot,
+        |candidate| {
+            suitability_calls.push(candidate);
+            ordered_in_calls.push(candidate);
+            window_discovery::StaleWindowObservation {
+                info,
+                suitable: Some(true),
+                ordered_in: Some(false),
+            }
+        },
+    );
+    assert_eq!(suitability_calls, vec![wsid]);
+    assert_eq!(ordered_in_calls, vec![wsid]);
+    assert_eq!(
+        window_discovery::identify_stale_windows(
+            &reactor.state,
+            returned.pid,
+            &[returned],
+            &snapshot
+        ),
+        vec![omitted],
+        "fresh ordered-out state must override cached visibility for an omitted window",
+    );
+}
+
+#[test]
+fn stale_cleanup_skips_observations_for_returned_windows_and_suppressed_cleanup() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let wid = WindowId::new(1, 1);
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(1));
+    for (visible, suppressed, mission_control_active, drag_active) in [
+        (vec![wid], false, false, false),
+        (vec![], true, false, false),
+        (vec![], false, true, false),
+        (vec![], false, false, true),
+    ] {
+        let mut snapshot = window_discovery::StaleCleanupSnapshot {
+            suppressed,
+            mission_control_active,
+            drag_active,
+            inactive_windows: Default::default(),
+            server_observations: Default::default(),
+        };
+        window_discovery::observe_stale_windows(
+            &reactor.state,
+            wid.pid,
+            &visible,
+            &mut snapshot,
+            |_| panic!("ineligible windows must not obtain native observations"),
+        );
+        assert!(snapshot.server_observations.is_empty());
+    }
+}
+
+#[test]
+fn stale_cleanup_preserves_returned_server_identity_before_ax_rekey() {
+    let (mut apps, mut reactor) = test_context_with_workspace_count(2);
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let old_wid = WindowId::new(1, 1);
+    let new_wid = WindowId::new(1, 99);
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(1));
+    let workspace = reactor.test_workspace_ids(space)[1];
+    assert!(reactor.assign_test_window_to_workspace(space, old_wid, workspace));
+    assert!(reactor.set_test_active_workspace(space, workspace));
+    let wsid = reactor.test_window_server_id(old_wid);
+
+    // Even an explicit negative native observation must not retire an identity
+    // returned by this inventory under a replacement AX id.
+    crate::sys::window_server::set_window_ordered_in_override(wsid, Some(false));
+    rekey_window(&mut reactor, old_wid, new_wid);
+    crate::sys::window_server::set_window_ordered_in_override(wsid, None);
+
+    assert!(reactor.state.windows.window(old_wid).is_none());
+    assert!(reactor.state.windows.window(new_wid).is_some());
+    assert_eq!(reactor.state.windows.tracked_window_id(wsid), Some(new_wid));
+    assert_eq!(
+        reactor.test_workspace_for_window(space, new_wid),
+        Some(workspace)
+    );
+}
+
+#[test]
 fn stale_cleanup_uses_ordered_state_instead_of_cached_visibility() {
     let (mut apps, mut reactor) = test_context();
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
@@ -5482,6 +5666,54 @@ fn wsid_rekey_preserves_floating_membership_and_position() {
         ),
         Some(stored_position)
     );
+}
+
+#[test]
+fn native_space_resolution_queries_only_when_needed() {
+    use crate::sys::window_server::{set_window_spaces_override, window_space_query_count};
+
+    // Exercise all live outcomes, including unavailable and a third space.
+    for pending_move in [false, true] {
+        for live_id in [None, Some(1), Some(2), Some(3)] {
+            let (reactor, _wid, wsid, origin, target, _) = if pending_move {
+                reactor_with_window_moved_to_space2()
+            } else {
+                reactor_with_window_on_space1()
+            };
+            let live = live_id.map(SpaceId::new);
+            set_window_spaces_override(wsid, Some(live_id.into_iter().collect()));
+            for observation in [Some(origin), Some(target), None] {
+                let before = window_space_query_count();
+                let resolved = reactor.resolve_native_space(wsid, observation);
+                let queries = window_space_query_count() - before;
+                let needs_live =
+                    observation.is_none() || (pending_move && observation != Some(target));
+                let expected = match observation {
+                    Some(observed) if pending_move && observed != target => {
+                        Some(if live == Some(observed) {
+                            observed
+                        } else {
+                            target
+                        })
+                    }
+                    Some(observed) => Some(observed),
+                    None => {
+                        live.or(if pending_move { Some(target) } else { None }).or(Some(origin))
+                    }
+                };
+                assert_eq!(
+                    resolved, expected,
+                    "pending={pending_move}, observation={observation:?}, live={live:?}"
+                );
+                assert_eq!(
+                    queries,
+                    usize::from(needs_live),
+                    "pending={pending_move}, observation={observation:?}, live={live:?}"
+                );
+            }
+            set_window_spaces_override(wsid, None);
+        }
+    }
 }
 
 #[test]
