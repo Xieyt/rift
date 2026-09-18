@@ -1,0 +1,26 @@
+name: Update latest documentation
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    # Upstream-only. This dispatches into `acsandmann/rift-docs` with a secret
+    # (`HOMEBREW_TAP_TOKEN`) that no fork has, so on a fork every push to `main`
+    # would produce a permanently red run for a docs site the fork does not own.
+    # UPSTREAM-SYNC.md §11.2 (#31, verdict SKIP) and hazard H7: the file arrives
+    # with zero conflicts, so nothing but this guard stops it.
+    if: github.repository == 'acsandmann/rift'
+    steps:
+      - name: Trigger latest documentation build
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          repository: acsandmann/rift-docs
+          event-type: rift-main-updated
+          client-payload: '{"rift_ref":"${{ github.sha }}"}'

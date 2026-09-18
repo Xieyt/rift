@@ -55,7 +55,12 @@ pub fn handle_window_created(
     let outcome = EventOutcome::window_membership_changed(false, true);
     Ok(
         if state.windows.window(wid).is_some_and(WindowState::can_reconcile_admission) {
-            outcome.with_created_window_finalization(wid)
+            // Finalization emits WindowAdded, and send_layout_event immediately
+            // arranges the affected space when that changes the layout. Keeping
+            // the generic membership arrange here as well starts a second layout
+            // application while the first one is still being written, which is
+            // especially visible in scrolling layouts as a brief resize/shift.
+            outcome.with_created_window_finalization(wid).with_arrange_passes(0)
         } else {
             outcome
         },
@@ -334,7 +339,13 @@ pub fn handle_window_frame_changed(
                 },
             };
         }
-        if let DragState::Active { session } = &mut drag.drag_state {
+        // A pending swap is still a live drag: `last_frame` and `settled_space` are
+        // what mouse-up uses to place the window and choose its final space, so
+        // freezing them here strands the window at the position where the swap
+        // candidate was first scored instead of where the user released it.
+        if let DragState::Active { session } | DragState::PendingSwap { session, .. } =
+            &mut drag.drag_state
+        {
             session.last_frame = new_frame;
             session.layout_dirty = true;
             if session.settled_space != new_space {

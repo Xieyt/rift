@@ -1450,6 +1450,72 @@ fn cross_display_drag_clears_source_floating_position() {
 }
 
 #[test]
+fn floating_drag_with_latched_swap_stores_the_release_frame() {
+    let (mut reactor, floating_wid, space1, _screen, floating_frame) =
+        reactor_with_floating_window();
+    let workspace = reactor
+        .layout_manager
+        .layout_engine
+        .active_workspace(space1)
+        .expect("workspace");
+
+    // A tiled neighbour under the floating window. Overlapping it fully makes the
+    // drag-swap scorer latch a swap candidate on the first drag frame.
+    let tiled_wid = WindowId::new(1, 2);
+    reactor.add_test_window(tiled_wid, WindowServerId::new(102), Some(space1), floating_frame);
+    assert!(reactor.assign_test_window_to_workspace(space1, tiled_wid, workspace));
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space1, tiled_wid));
+    assert!(!reactor.layout_manager.layout_engine.is_window_floating(tiled_wid));
+
+    let latched_frame = CGRect::new(
+        CGPoint::new(floating_frame.origin.x + 10., floating_frame.origin.y + 10.),
+        floating_frame.size,
+    );
+    reactor.handle_event(Event::WindowFrameChanged(
+        floating_wid,
+        latched_frame,
+        None,
+        Requested(false),
+        Some(MouseState::Down),
+    ));
+    assert!(
+        matches!(reactor.drag_manager.drag_state, DragState::PendingSwap { .. }),
+        "expected the overlap to latch a pending swap; got {:?}",
+        reactor.drag_manager.drag_state
+    );
+
+    // Keep dragging with the swap still latched, then release.
+    let released_frame = CGRect::new(
+        CGPoint::new(floating_frame.origin.x + 40., floating_frame.origin.y + 60.),
+        floating_frame.size,
+    );
+    reactor.handle_event(Event::WindowFrameChanged(
+        floating_wid,
+        released_frame,
+        None,
+        Requested(false),
+        Some(MouseState::Down),
+    ));
+    assert!(matches!(
+        reactor.drag_manager.drag_state,
+        DragState::PendingSwap { .. }
+    ));
+    reactor.handle_event(Event::MouseUp);
+
+    assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
+    assert!(reactor.layout_manager.layout_engine.is_window_floating(floating_wid));
+    let stored = reactor
+        .layout_manager
+        .layout_engine
+        .get_floating_position(space1, workspace, floating_wid)
+        .expect("floating position");
+    assert!(
+        stored.same_as(released_frame),
+        "mouse-up must store where the window was released, not where the swap latched: {stored:?}"
+    );
+}
+
+#[test]
 fn stale_user_space_disappearance_does_not_restore_old_display_assignment() {
     let (mut reactor, wid, wsid, space1, space2, _) = reactor_with_window_moved_to_space2();
 
@@ -3029,6 +3095,59 @@ fn title_change_rule_moves_window_to_matching_workspace() {
 }
 
 #[test]
+fn title_change_non_title_fallback_preserves_manually_moved_workspace() {
+    let settings = crate::common::config::VirtualWorkspaceSettings {
+        default_workspace_count: 3,
+        reapply_app_rules_on_title_change: true,
+        app_rules: vec![
+            crate::common::config::AppWorkspaceRule {
+                app_id: Some("com.testapp1".into()),
+                workspace: Some(WorkspaceSelector::Index(1)),
+                ..Default::default()
+            },
+            crate::common::config::AppWorkspaceRule {
+                app_id: Some("com.testapp1".into()),
+                workspace: Some(WorkspaceSelector::Index(1)),
+                title_substring: Some("btop".into()),
+                size: Some(crate::common::config::AppRuleSize { w: Some(80.0), h: None }),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let (mut apps, mut reactor) = (Apps::new(), test_reactor_with_workspace_settings(&settings));
+    reactor.config.virtual_workspaces = settings;
+    let space = SpaceId::new(1);
+    let window = WindowId::new(1, 1);
+    reactor.handle_event(space_state_event(
+        vec![CGRect::new(CGPoint::ZERO, CGSize::new(1000., 1000.))],
+        vec![Some(space)],
+    ));
+    make_active_app(&mut apps, &mut reactor, 1, make_windows(1), Some(window));
+
+    let manually_selected = reactor.test_workspace(space, 2);
+    assert!(
+        reactor
+            .layout_manager
+            .layout_engine
+            .virtual_workspace_manager_mut()
+            .assign_window_to_workspace(
+                &mut reactor.state.windows,
+                space,
+                window,
+                manually_selected,
+            )
+    );
+
+    reactor.handle_event(Event::WindowTitleChanged(window, "ordinary shell".into()));
+
+    assert_eq!(
+        reactor.test_workspace_for_window(space, window),
+        Some(manually_selected)
+    );
+}
+
+#[test]
 fn menu_open_state_is_cleared_when_owner_deactivates() {
     let mut reactor = test_reactor();
     let (event_tap_tx, mut event_tap_rx) = actor::channel();
@@ -4522,6 +4641,76 @@ fn partial_post_wake_snapshot_preserves_manual_workspace_assignment() {
         Some(secondary_workspace),
         "post-wake discovery without an app rule must retain the manual workspace"
     );
+}
+
+#[test]
+fn dock_disconnect_between_two_sleeps_preserves_workspace_assignments() {
+    let (mut apps, mut reactor) = test_context_with_workspace_count(3);
+    let external = CGRect::new(CGPoint::new(0., 0.), CGSize::new(3008., 1692.));
+    let internal = CGRect::new(CGPoint::new(3008., 32.), CGSize::new(1728., 1085.));
+    let undocked = CGRect::new(CGPoint::new(0., 38.), CGSize::new(2056., 1291.));
+    let space = SpaceId::new(1);
+    let windows = make_windows(3);
+    let ids: Vec<_> = (1..=3).map(|idx| WindowId::new(1, idx)).collect();
+    let rediscovered = ids.iter().copied().zip(windows.iter().cloned()).collect::<Vec<_>>();
+    reactor.handle_event(space_state_event(vec![external, internal], vec![
+        Some(space),
+        Some(SpaceId::new(6)),
+    ]));
+    apps.make_app_and_settle(&mut reactor, 1, windows);
+    let workspaces = reactor.test_workspace_ids(space);
+    for (&wid, &workspace) in ids.iter().zip(&workspaces) {
+        assert!(reactor.assign_test_window_to_workspace(space, wid, workspace));
+    }
+    assert!(reactor.set_test_active_workspace(space, workspaces[1]));
+    apps.requests();
+
+    // The capture wakes briefly after undocking, then sleeps again before unlock.
+    reactor.handle_event(Event::SessionDidResignActive);
+    reactor.handle_event(Event::SystemWillSleep);
+    reactor.handle_event(Event::SystemWoke);
+    reactor.handle_event(Event::DisplayChurnBegin);
+    let mut screens = make_screen_snapshots(vec![undocked], vec![Some(space)]);
+    screens[0].display_uuid = "internal-display".into();
+    let mut recovered = forwarded_space_state(screens);
+    recovered.display_set_changed = true;
+    recovered.topology_changed = true;
+    recovered.should_force_refresh_layout = true;
+    recovered.releases_lifecycle_refresh_quarantine = true;
+    recovered.releases_display_churn_refresh_quarantine = true;
+    recovered.resized_spaces.push((space, undocked.size));
+    for &wid in &ids {
+        recovered.active_window_spaces.insert(reactor.test_window_server_id(wid), space);
+    }
+    reactor.handle_event(Event::SpaceStateChanged(recovered.clone()));
+    assert!(
+        reactor.refreshes_blocked(),
+        "wake must not release the locked-session gate"
+    );
+    for &wid in &ids {
+        reactor.handle_event(Event::WindowInvalidated(
+            wid,
+            super::WindowInvalidationSource::InvalidUiElement,
+        ));
+    }
+    reactor.discover_test_windows(1, vec![], vec![]);
+    reactor.handle_event(Event::SystemWillSleep);
+    reactor.handle_event(Event::SystemWoke);
+    reactor.handle_event(Event::SpaceStateChanged(recovered.clone()));
+    assert!(reactor.refreshes_blocked());
+    reactor.handle_event(Event::SessionDidBecomeActive);
+    recovered.display_set_changed = false;
+    recovered.topology_changed = false;
+    recovered.resized_spaces.clear();
+    reactor.handle_event(Event::SpaceStateChanged(recovered));
+    assert!(!reactor.refreshes_blocked());
+    reactor.discover_test_windows(1, rediscovered, ids.clone());
+
+    for (&wid, &workspace) in ids.iter().zip(&workspaces) {
+        assert_eq!(reactor.test_workspace_for_window(space, wid), Some(workspace));
+        assert_eq!(reactor.test_workspace_windows(space, workspace), vec![wid]);
+    }
+    assert_eq!(reactor.test_active_workspace_windows(space), vec![ids[1]]);
 }
 
 #[test]
