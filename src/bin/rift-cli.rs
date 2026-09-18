@@ -214,7 +214,10 @@ enum WindowCommands {
     /// Examples:
     ///   rift-cli execute window resize-by --amount 0.05    # grow by 5%
     ///   rift-cli execute window resize-by --amount -0.10   # shrink by 10%
-    ResizeBy { amount: f64 },
+    ResizeBy {
+        #[arg(long)]
+        amount: f64,
+    },
     /// Close a window as if Command-W was pressed
     Close {
         /// Optional window server ID; defaults to the focused window
@@ -346,54 +349,47 @@ enum LayoutCommands {
 #[derive(Subcommand)]
 enum ConfigCommands {
     /// Update animation settings
-    SetAnimate {
-        value: String,
-    },
-    SetAnimationDuration {
-        value: f64,
-    },
-    SetAnimationFps {
-        value: f64,
-    },
-    SetAnimationEasing {
-        value: String,
-    },
+    SetAnimate { value: String },
+    /// Set the animation duration in seconds
+    SetAnimationDuration { value: f64 },
+    /// Set the animation frame rate
+    SetAnimationFps { value: f64 },
+    /// Set the animation easing curve
+    SetAnimationEasing { value: String },
 
     /// Update mouse settings
     SetMouseFollowsFocus {
+        #[arg(action = clap::ArgAction::Set)]
         value: bool,
     },
+    /// Show or hide the pointer after focus changes
     SetMouseHidesOnFocus {
+        #[arg(action = clap::ArgAction::Set)]
         value: bool,
     },
+    /// Enable or disable focusing windows under the pointer
     SetFocusFollowsMouse {
+        #[arg(action = clap::ArgAction::Set)]
         value: bool,
     },
 
     /// Update layout settings
-    SetStackOffset {
-        value: f64,
-    },
+    SetStackOffset { value: f64 },
     /// Set the default stack orientation behavior. Value should be one of:
     /// "perpendicular", "same", "horizontal", or "vertical"
-    SetStackDefaultOrientation {
-        value: String,
-    },
+    SetStackDefaultOrientation { value: String },
+    /// Set the outer gap on each screen edge
     SetOuterGaps {
         top: f64,
         left: f64,
         bottom: f64,
         right: f64,
     },
-    SetInnerGaps {
-        horizontal: f64,
-        vertical: f64,
-    },
+    /// Set the horizontal and vertical gaps between windows
+    SetInnerGaps { horizontal: f64, vertical: f64 },
 
     /// Update workspace settings
-    SetWorkspaceNames {
-        names: Vec<String>,
-    },
+    SetWorkspaceNames { names: Vec<String> },
 
     /// Generic set: set an arbitrary config key (dot-separated path) to a JSON value.
     /// Example: rift-cli execute config set --key settings.animate --value true

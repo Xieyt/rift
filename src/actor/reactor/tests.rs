@@ -13,6 +13,21 @@ use crate::sys::geometry::SameAs;
 use crate::sys::window_server::WindowServerId;
 
 #[test]
+fn event_outcome_execution_keeps_phase_order() {
+    let mut reactor = test_reactor();
+    reactor.apply_event_outcome(EventOutcome::default());
+    assert_eq!(reactor.event_outcome_phase_trace, [
+        "model",
+        "frame-writes",
+        "layout",
+        "raising",
+        "focus",
+        "ui",
+        "broadcasts"
+    ]);
+}
+
+#[test]
 fn layout_query_exposes_active_and_inactive_workspace_container_trees() {
     let mut reactor = test_reactor();
     let space = SpaceId::new(1);
@@ -491,12 +506,12 @@ fn no_op_workspace_switch_does_not_request_arrangement() {
     reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
 
     let already_active = reactor.dispatch_test_layout_command(LayoutCommand::SwitchToWorkspace(0));
-    assert!(!already_active.arrange.requested);
+    assert!(already_active.arrange.passes == 0);
     assert!(already_active.layout_responses.is_empty());
 
     let missing =
         reactor.dispatch_test_layout_command(LayoutCommand::SwitchToWorkspace(usize::MAX));
-    assert!(!missing.arrange.requested);
+    assert!(missing.arrange.passes == 0);
     assert!(missing.layout_responses.is_empty());
 }
 
@@ -1111,7 +1126,7 @@ fn matching_rift_frame_clears_pending_target() {
         reactor.transaction_manager.get_target_frame(wsid),
         Some(adjusted_target)
     );
-    assert!(!outcome.arrange.requested && !outcome.refresh_layout_mode);
+    assert!(outcome.arrange.passes == 0 && !outcome.refresh_layout_mode);
 
     // A user drag beginning during the transaction clears it instead of accepting it blindly.
     reactor.handle_event(Event::WindowFrameChanged(
@@ -1143,7 +1158,7 @@ fn frame_acknowledgements_and_unchanged_frames_do_not_invalidate_layout() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!acknowledgement.arrange.requested);
+    assert!(acknowledgement.arrange.passes == 0);
     assert!(!acknowledgement.refresh_layout_mode);
 
     let unchanged = reactor
@@ -1155,7 +1170,7 @@ fn frame_acknowledgements_and_unchanged_frames_do_not_invalidate_layout() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!unchanged.arrange.requested);
+    assert!(unchanged.arrange.passes == 0);
     assert!(!unchanged.refresh_layout_mode);
 
     let explicitly_requested_frame = CGRect::new(
@@ -1171,7 +1186,7 @@ fn frame_acknowledgements_and_unchanged_frames_do_not_invalidate_layout() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!requested.arrange.requested);
+    assert!(requested.arrange.passes == 0);
     assert!(!requested.refresh_layout_mode);
 }
 
@@ -1193,7 +1208,7 @@ fn genuine_external_frame_changes_invalidate_layout() {
         ))
         .unwrap();
 
-    assert!(outcome.arrange.requested);
+    assert!(outcome.arrange.passes > 0);
     assert_eq!(outcome.arrange.passes, 1);
     assert!(outcome.refresh_layout_mode);
 }
@@ -1216,7 +1231,7 @@ fn stale_and_inactive_frame_events_request_no_arrange_passes() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!acknowledgement.arrange.requested);
+    assert!(acknowledgement.arrange.passes == 0);
 
     let duplicate = reactor
         .dispatch_workflow(Event::WindowFrameChanged(
@@ -1227,7 +1242,7 @@ fn stale_and_inactive_frame_events_request_no_arrange_passes() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!duplicate.arrange.requested);
+    assert!(duplicate.arrange.passes == 0);
 
     // Stale transaction notification while a newer target is pending.
     let current_txid = reactor.transaction_manager.generate_next_txid(wsid);
@@ -1244,7 +1259,7 @@ fn stale_and_inactive_frame_events_request_no_arrange_passes() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!stale.arrange.requested);
+    assert!(stale.arrange.passes == 0);
 
     // Geometry on an inactive native space.
     reactor.transaction_manager.clear_target_for_window(wsid);
@@ -1261,7 +1276,7 @@ fn stale_and_inactive_frame_events_request_no_arrange_passes() {
             Some(MouseState::Up),
         ))
         .unwrap();
-    assert!(!inactive.arrange.requested);
+    assert!(inactive.arrange.passes == 0);
 }
 
 #[test]
@@ -1282,7 +1297,7 @@ fn external_resize_requests_one_arrange_pass() {
         ))
         .unwrap();
 
-    assert!(outcome.arrange.requested);
+    assert!(outcome.arrange.passes > 0);
     assert_eq!(outcome.arrange.passes, 1);
     assert!(outcome.arrange.is_resize);
 }
@@ -1308,7 +1323,7 @@ fn crossing_native_spaces_reconciles_membership_with_one_arrange_pass() {
 
     assert_eq!(reactor.assigned_space_for_window_id(wid), Some(space2));
     assert_eq!(reactor.state.windows.window_server_space(wsid), Some(space2));
-    assert!(outcome.arrange.requested);
+    assert!(outcome.arrange.passes > 0);
     assert_eq!(outcome.arrange.passes, 1);
 }
 
@@ -1349,11 +1364,11 @@ fn duplicate_minimize_deminimize_and_unknown_window_events_do_not_arrange() {
 
     reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
     let duplicate_minimize = reactor.dispatch_workflow(Event::WindowMinimized(wid)).unwrap();
-    assert!(!duplicate_minimize.arrange.requested);
+    assert!(duplicate_minimize.arrange.passes == 0);
 
     reactor.dispatch_workflow(Event::WindowDeminiaturized(wid)).unwrap();
     let duplicate_deminimize = reactor.dispatch_workflow(Event::WindowDeminiaturized(wid)).unwrap();
-    assert!(!duplicate_deminimize.arrange.requested);
+    assert!(duplicate_deminimize.arrange.passes == 0);
 
     let unknown = WindowId::new(wid.pid + 100, wid.idx.get());
     let unknown_minimize = reactor.dispatch_workflow(Event::WindowMinimized(unknown)).unwrap();
@@ -1369,9 +1384,9 @@ fn duplicate_minimize_deminimize_and_unknown_window_events_do_not_arrange() {
         ))
         .unwrap();
 
-    assert!(!unknown_minimize.arrange.requested);
-    assert!(!unknown_deminimize.arrange.requested);
-    assert!(!unknown_frame.arrange.requested);
+    assert!(unknown_minimize.arrange.passes == 0);
+    assert!(unknown_deminimize.arrange.passes == 0);
+    assert!(unknown_frame.arrange.passes == 0);
 }
 
 #[test]
@@ -1428,7 +1443,7 @@ fn cross_display_drag_clears_source_floating_position() {
         },
     )
     .unwrap();
-    assert!(outcome.arrange.requested);
+    assert!(outcome.arrange.passes > 0);
     assert!(matches!(reactor.drag_manager.drag_state, DragState::Inactive));
 
     assert_eq!(reactor.assigned_space_for_window_id(wid), Some(space2));
@@ -2698,7 +2713,7 @@ fn dock_activation_reveals_window_in_active_scrolling_workspace() {
     let outcome = reactor
         .dispatch_workflow(Event::ApplicationActivated(pid, Quiet::No))
         .expect("resolved Dock activation");
-    assert!(!outcome.arrange.requested);
+    assert!(outcome.arrange.passes == 0);
     assert!(outcome.layout_events.is_empty());
     assert_eq!(outcome.focused_window, Some(activated));
 
@@ -2794,7 +2809,7 @@ fn focus_follows_mouse_emits_focus_without_explicit_arrange() {
     )
     .expect("mouse focus workflow");
 
-    assert!(!outcome.arrange.requested);
+    assert!(outcome.arrange.passes == 0);
     assert!(matches!(
         outcome.layout_events.as_slice(),
         [LayoutEvent::WindowFocused(event_space, event_window)]
