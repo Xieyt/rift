@@ -37,6 +37,17 @@
       craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
       root = ../.;
 
+      # The ONE source of truth for "which macOS does this build require". rustc
+      # stamps LC_BUILD_VERSION from MACOSX_DEPLOYMENT_TARGET, and in the crane
+      # build nixpkgs' stdenv sets that from the platform default — currently
+      # "14.0" (lib/systems/default.nix). Reading it back here, instead of
+      # hardcoding a number, keeps three things that MUST agree in lockstep: the
+      # packaged binary's minos, the bundle plist's LSMinimumSystemVersion, and
+      # the devShell's MACOSX_DEPLOYMENT_TARGET (which rustc would otherwise
+      # default to 11.0, since no cc-wrapper flag reaches it). A nixpkgs bump that
+      # moves the platform default now moves all three at once.
+      minOsVersion = pkgs.stdenv.hostPlatform.darwinMinVersion;
+
       args = {
         src = lib.fileset.toSource {
           inherit root;
@@ -60,19 +71,36 @@
         nativeBuildInputs = [ ];
         # Mission Control previews go through ScreenCaptureKit, which only exists in
         # the 12.3+ SDK; pin it explicitly instead of inheriting whatever stdenv's
-        # default apple-sdk happens to be (11.x historically, 14.4 in the currently
-        # pinned nixpkgs) so a nixpkgs bump can't silently break the objc2
-        # framework link. darwinMinVersionHook is a FLOOR: it raises
-        # MACOSX_DEPLOYMENT_TARGET to 12.3 if it is lower (a no-op while stdenv
-        # already defaults to 14.0) so the weak-linked SCK symbols resolve instead
-        # of aborting at load. No explicit `-framework` flags: the objc2-* crates
-        # emit `#[link(kind = "framework")]` themselves, so SDK availability is
-        # sufficient. Both are target dependencies, i.e. `buildInputs`, which keeps
-        # `strictDeps = true` valid.
-        buildInputs = [
-          pkgs.apple-sdk_15
-          (pkgs.darwinMinVersionHook "12.3")
-        ];
+        # default apple-sdk happens to be (11.x historically) so a nixpkgs bump
+        # can't silently break the objc2 framework link.
+        #
+        # The pin is apple-sdk_14, NOT _15, because 14.4 is also what the currently
+        # pinned nixpkgs' stdenv defaults to: the clang/bintools wrappers already
+        # reference that exact store path, so pinning it costs ZERO extra download
+        # while pinning _15 added a second SDK (31 MiB fetch, 459 MiB unpacked) to
+        # every build and every dev shell. 14.4 covers every SCK symbol this tree
+        # uses (SCShareableContent, SCContentFilter, SCStreamConfiguration,
+        # SCScreenshotManager, SCCaptureResolutionType — all <= 14.0). If a future
+        # nixpkgs moves stdenv's default off 14.x, bump this pin to match the new
+        # default rather than leaving two SDKs in the closure.
+        #
+        # NO darwinMinVersionHook. It used to be `(pkgs.darwinMinVersionHook "12.3")`
+        # here, on the theory that the weak-linked SCK symbols need a 12.3 floor.
+        # The hook only RAISES MACOSX_DEPLOYMENT_TARGET, and nixpkgs hands
+        # aarch64-darwin 14.0 by default (lib/systems/default.nix), so it never
+        # fired: the binary this flake ships has always been stamped
+        # `LC_BUILD_VERSION minos 14.0`, verified with `otool -l`. It was a no-op
+        # asserting a floor the build does not honour, so it is gone and 14.0 is
+        # documented as the real requirement instead (see minOsVersion below and
+        # LSMinimumSystemVersion in the bundle plist). If a future nixpkgs lowers
+        # its default below what ScreenCaptureKit needs, reintroduce the hook —
+        # but then also fix the plist, because the two must agree.
+        #
+        # No explicit `-framework` flags: the objc2-* crates emit
+        # `#[link(kind = "framework")]` themselves, so SDK availability is
+        # sufficient. The SDK is a target dependency, i.e. `buildInputs`, which
+        # keeps `strictDeps = true` valid.
+        buildInputs = [ pkgs.apple-sdk_14 ];
       };
 
       build = craneLib.buildPackage (
@@ -121,6 +149,8 @@
   <string>0.1.0</string>
   <key>CFBundleVersion</key>
   <string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>${minOsVersion}</string>
   <key>LSUIElement</key>
   <true/>
   <key>NSScreenCaptureUsageDescription</key>
@@ -172,8 +202,10 @@ EOF
       devshells.default = {
         packages = [
           toolchain
-          # Same 12.3+ SDK the crane build pins (ScreenCaptureKit); see `args`.
-          pkgs.apple-sdk_15
+          # Same SDK the crane build pins (ScreenCaptureKit); see `args`. This is
+          # also stdenv's default SDK, so it is already in the shell's closure via
+          # the clang wrapper — the entry only makes the dependency explicit.
+          pkgs.apple-sdk_14
         ];
         # nixpkgs' apple-sdk doesn't ship libiconv, and unlike the crane build
         # (clangStdenv injects it via NIX_LDFLAGS) the devshell has to add it
@@ -185,18 +217,28 @@ EOF
             prefix = "${pkgs.libiconv}/lib";
           }
           # devshell builds on a NAKED stdenv, so no nixpkgs setup hook ever runs
-          # here — neither apple-sdk's DEVELOPER_DIR hook nor darwinMinVersionHook.
-          # The cc/bintools wrappers read DEVELOPER_DIR at runtime (falling back to
-          # the stdenv default SDK when it is unset) and derive SDKROOT from it, so
-          # point it at the same SDK the crane build pins or an ambient
-          # `cargo build` can't find ScreenCaptureKit. No MACOSX_DEPLOYMENT_TARGET
-          # here on purpose: the wrappers' baked-in default (14.0) already clears
-          # the 12.3 floor darwinMinVersionHook enforces for the crane build, and
-          # hard-setting a LOWER target would only earn "built for newer macOS
-          # version than being linked" warnings against nixpkgs' own dylibs.
+          # here — neither apple-sdk's DEVELOPER_DIR hook nor any deployment-target
+          # default. The cc/bintools wrappers read DEVELOPER_DIR at runtime (falling
+          # back to the stdenv default SDK when it is unset) and derive SDKROOT from
+          # it, so point it at the same SDK the crane build pins or an ambient
+          # `cargo build` can't find ScreenCaptureKit.
           {
             name = "DEVELOPER_DIR";
-            value = "${pkgs.apple-sdk_15}";
+            value = "${pkgs.apple-sdk_14}";
+          }
+          # MACOSX_DEPLOYMENT_TARGET is set to exactly what the crane build gets
+          # from stdenv, so a devShell `cargo build` and `nix build` stamp the SAME
+          # LC_BUILD_VERSION. It is NOT redundant: rustc does not read the cc
+          # wrapper's -mmacosx-version-min, it stamps its own built-in default for
+          # aarch64-apple-darwin (11.0 — `rustc --print deployment-target` proves
+          # it) whenever this variable is unset, so dev-local binaries used to
+          # claim macOS 11 while the packaged one claimed 14. Setting it to the
+          # platform default rather than a lower floor also keeps the linker quiet:
+          # a lower target against nixpkgs' 14.0 dylibs earns "built for newer
+          # macOS version than being linked" on every build.
+          {
+            name = "MACOSX_DEPLOYMENT_TARGET";
+            value = minOsVersion;
           }
         ];
         commands = [

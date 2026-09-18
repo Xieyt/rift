@@ -11,5 +11,8 @@ let
 in
 {
   rift = packageModule.packages.rift;
-  rift-bin = packageModule.packages.rift-bin;
+  # `rift-bin` was a dangling reference: nix/package.nix names the raw-binary
+  # output `rift-unwrapped`, so any consumer that touched `pkgs.rift-bin` hit an
+  # "attribute missing" eval error.
+  rift-unwrapped = packageModule.packages.rift-unwrapped;
 }
