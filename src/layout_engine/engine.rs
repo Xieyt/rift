@@ -244,6 +244,31 @@ impl LayoutEngine {
             .collect()
     }
 
+    pub(crate) fn calculate_workspace_layout(
+        &self,
+        space: SpaceId,
+        workspace_id: VirtualWorkspaceId,
+        screen: CGRect,
+        gaps: &crate::common::config::GapSettings,
+        stack_line_thickness: f64,
+        stack_line_horiz: crate::common::config::HorizontalPlacement,
+        stack_line_vert: crate::common::config::VerticalPlacement,
+    ) -> Vec<(WindowId, CGRect)> {
+        let Some(layout) = self.workspace_layouts.active(space, workspace_id) else {
+            return Vec::new();
+        };
+        self.workspace_tree(workspace_id).calculate_layout(
+            layout,
+            screen,
+            self.layout_settings.stack.stack_offset,
+            &self.window_layout_constraints,
+            gaps,
+            stack_line_thickness,
+            stack_line_horiz,
+            stack_line_vert,
+        )
+    }
+
     /// Get the active workspace ID for a space, ensuring initialization.
     fn active_workspace_id(&self, space: SpaceId) -> Option<VirtualWorkspaceId> {
         self.virtual_workspace_manager.active_workspace(space)
@@ -1634,6 +1659,10 @@ impl LayoutEngine {
                 self.forget_persisted_app(pid);
 
                 self.virtual_workspace_manager.remove_windows_for_app(window_store, pid);
+                // Process termination is authoritative. Unlike an invalid AX handle,
+                // nothing owned by this pid can be rediscovered and rebound, so remove
+                // the complete window records after detaching their workspace state.
+                window_store.remove_windows_for_app(pid);
                 self.floating_positions.remove_app(pid);
             }
             LayoutEvent::WindowAdded(space, wid) => {
@@ -2002,12 +2031,12 @@ impl LayoutEngine {
                 if is_floating {
                     return EventResponse::default();
                 }
-                self.workspace_tree_mut(workspace_id).ascend_selection(layout);
-                EventResponse::default()
+                let changed = self.workspace_tree_mut(workspace_id).ascend_selection(layout);
+                EventResponse { changed, ..Default::default() }
             }
             LayoutCommand::Descend => {
-                self.workspace_tree_mut(workspace_id).descend_selection(layout);
-                EventResponse::default()
+                let changed = self.workspace_tree_mut(workspace_id).descend_selection(layout);
+                EventResponse { changed, ..Default::default() }
             }
             LayoutCommand::MoveNode(direction) => {
                 self.workspace_layouts.mark_last_saved(space, workspace_id, layout);
@@ -2244,14 +2273,13 @@ impl LayoutEngine {
         stack_line_horiz: crate::common::config::HorizontalPlacement,
         stack_line_vert: crate::common::config::VerticalPlacement,
     ) -> Vec<(WindowId, CGRect)> {
-        let Some((ws_id, layout)) = self.workspace_and_layout(space) else {
+        let Some((workspace_id, _)) = self.workspace_and_layout(space) else {
             return Vec::new();
         };
-        self.workspace_tree(ws_id).calculate_layout(
-            layout,
+        self.calculate_workspace_layout(
+            space,
+            workspace_id,
             screen,
-            self.layout_settings.stack.stack_offset,
-            &self.window_layout_constraints,
             gaps,
             stack_line_thickness,
             stack_line_horiz,
@@ -4045,6 +4073,107 @@ mod tests {
         assert!(locked_frame.origin.y >= screen.origin.y - epsilon);
         assert!(locked_frame.origin.x + locked_frame.size.width <= max_x);
         assert!(locked_frame.origin.y + locked_frame.size.height <= max_y);
+    }
+
+    #[test]
+    fn display_size_round_trip_restores_its_saved_layout() {
+        let mut window_store = WindowStore::default();
+        let mut engine = test_engine();
+        let space = SpaceId::new(98);
+        let external = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(3440.0, 1409.0));
+        let internal = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1728.0, 1083.0));
+        let pid: pid_t = 5157;
+        let w1 = WindowId::new(pid, 1);
+        let w2 = WindowId::new(pid, 2);
+        let info = |wid| {
+            (
+                wid,
+                None,
+                None,
+                None,
+                true,
+                CGSize::new(500.0, 500.0),
+                None,
+                None,
+            )
+        };
+
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::SpaceExposed(space, external.size),
+        );
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::windows_observed(space, pid, vec![info(w1), info(w2)], None),
+        );
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowFocused(space, w1));
+        let _ = engine.handle_command(
+            &mut window_store,
+            Some(space),
+            &[space],
+            &HashMap::default(),
+            LayoutCommand::ResizeWindowBy { amount: 0.2 },
+        );
+
+        let gaps = engine.layout_settings.gaps.clone();
+        let external_layout = engine.calculate_layout(
+            space,
+            external,
+            &gaps,
+            0.0,
+            Default::default(),
+            Default::default(),
+        );
+
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::SpaceExposed(space, internal.size),
+        );
+        let internal_layout = engine.calculate_layout(
+            space,
+            internal,
+            &gaps,
+            0.0,
+            Default::default(),
+            Default::default(),
+        );
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::WindowFocused(space, w2));
+        let _ = engine.handle_command(
+            &mut window_store,
+            Some(space),
+            &[space],
+            &HashMap::default(),
+            LayoutCommand::ResizeWindowBy { amount: 0.2 },
+        );
+        assert_ne!(
+            engine.calculate_layout(
+                space,
+                internal,
+                &gaps,
+                0.0,
+                Default::default(),
+                Default::default(),
+            ),
+            internal_layout,
+            "test setup must modify the built-in-display layout"
+        );
+
+        let _ = engine.handle_event(
+            &mut window_store,
+            LayoutEvent::SpaceExposed(space, external.size),
+        );
+        assert_eq!(
+            engine.calculate_layout(
+                space,
+                external,
+                &gaps,
+                0.0,
+                Default::default(),
+                Default::default(),
+            ),
+            external_layout,
+            "returning to a display size must restore its own layout configuration"
+        );
     }
 
     #[test]

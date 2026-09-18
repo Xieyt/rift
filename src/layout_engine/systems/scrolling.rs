@@ -18,6 +18,9 @@ use crate::layout_engine::{Direction, LayoutId, LayoutKind, ResizeOrientation};
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 struct Column {
+    /// Identity belongs to the column, not its current position in the scrolling list.
+    #[serde(default)]
+    node_id: u64,
     windows: Vec<WindowId>,
     width_offset: f64,
     #[serde(default)]
@@ -34,6 +37,14 @@ struct Column {
 }
 
 impl Column {
+    fn stable_node_id(&self) -> u64 {
+        if self.node_id != 0 {
+            self.node_id
+        } else {
+            self.windows.first().copied().map(column_node_id).unwrap_or(1)
+        }
+    }
+
     fn ensure_height_weights(&mut self) {
         if self.height_weights.len() != self.windows.len() {
             self.height_weights.resize(self.windows.len(), 1.0);
@@ -50,6 +61,14 @@ struct CachedTabGroup {
     windows: Vec<WindowId>,
     selected: usize,
 }
+
+fn packed_window_id(window: WindowId) -> u64 {
+    ((window.pid as u32 as u64) << 32) | u64::from(window.idx.get())
+}
+
+fn window_node_id(window: WindowId) -> u64 { packed_window_id(window).rotate_left(1) | 1 }
+
+fn column_node_id(window: WindowId) -> u64 { packed_window_id(window).rotate_left(1) }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct LayoutState {
@@ -233,6 +252,7 @@ impl LayoutState {
 
     fn insert_column_after(&mut self, index: usize, wid: WindowId) {
         let column = Column {
+            node_id: column_node_id(wid),
             windows: vec![wid],
             width_offset: 0.0,
             width_overridden: false,
@@ -248,6 +268,7 @@ impl LayoutState {
 
     fn insert_column_at_end(&mut self, wid: WindowId) {
         self.columns.push(Column {
+            node_id: column_node_id(wid),
             windows: vec![wid],
             width_offset: 0.0,
             width_overridden: false,
@@ -278,6 +299,7 @@ impl LayoutState {
             target = target.min(self.columns.len());
             if target >= self.columns.len() {
                 self.columns.push(Column {
+                    node_id: column_node_id(window),
                     windows: vec![window],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -660,6 +682,7 @@ impl ScrollingLayoutSystem {
                 _ => return false,
             };
             state.columns.insert(insert_at, Column {
+                node_id: column_node_id(wid),
                 windows: vec![wid],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -814,7 +837,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
                     .iter()
                     .enumerate()
                     .map(|(index, &window)| rift_protocol::ContainerTreeNode {
+                        node_id: window_node_id(window),
                         node_type: rift_protocol::ContainerNodeType::Window,
+                        frame: Default::default(),
                         layout_kind: None,
                         weight: Some(column.height_weights.get(index).copied().unwrap_or(1.0)),
                         window_id: Some(window.into()),
@@ -827,7 +852,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
                     })
                     .collect();
                 rift_protocol::ContainerTreeNode {
+                    node_id: column.stable_node_id(),
                     node_type: rift_protocol::ContainerNodeType::Container,
+                    frame: Default::default(),
                     layout_kind: Some(rift_protocol::LayoutKind::Vertical),
                     weight: Some((state.column_width_ratio + column.width_offset).max(0.0)),
                     window_id: None,
@@ -842,7 +869,9 @@ impl LayoutSystem for ScrollingLayoutSystem {
             .collect();
 
         rift_protocol::ContainerTreeNode {
+            node_id: 0,
             node_type: rift_protocol::ContainerNodeType::Container,
+            frame: Default::default(),
             layout_kind: Some(rift_protocol::LayoutKind::Horizontal),
             weight: None,
             window_id: None,
@@ -1805,6 +1834,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
             Direction::Up | Direction::Down => unreachable!(),
         };
         state.columns.insert(insert_at, Column {
+            node_id: column_node_id(wid),
             windows: vec![wid],
             width_offset: 0.0,
             width_overridden: false,
@@ -1887,6 +1917,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         let mut insert_at = col_idx + 1;
         for (idx, wid) in moved.iter().copied().enumerate() {
             state.columns.insert(insert_at, Column {
+                node_id: column_node_id(wid),
                 windows: vec![wid],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -1929,6 +1960,7 @@ impl LayoutSystem for ScrollingLayoutSystem {
         let weight = state.columns[col_idx].height_weights.remove(row_idx);
         let insert_at = (col_idx + 1).min(state.columns.len());
         state.columns.insert(insert_at, Column {
+            node_id: column_node_id(wid),
             windows: vec![wid],
             width_offset: 0.0,
             width_overridden: false,
@@ -2120,6 +2152,7 @@ mod tests {
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
+                node_id: 0,
                 windows: vec![w1, w2],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -2162,6 +2195,7 @@ mod tests {
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
+                node_id: 0,
                 windows: vec![w1, w2, w3],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -2189,6 +2223,7 @@ mod tests {
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
+                node_id: 0,
                 windows: vec![w1, w2],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -2216,6 +2251,7 @@ mod tests {
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
+                node_id: 0,
                 windows: vec![w1, w2],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -2281,6 +2317,7 @@ mod tests {
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
+                node_id: 0,
                 windows: vec![w1, w2, w3],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -2309,6 +2346,7 @@ mod tests {
         {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![Column {
+                node_id: 0,
                 windows: vec![w1, w2],
                 width_offset: 0.0,
                 width_overridden: false,
@@ -2337,6 +2375,7 @@ mod tests {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![
                 Column {
+                    node_id: 0,
                     windows: vec![a1, a2],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -2345,6 +2384,7 @@ mod tests {
                     active: None,
                 },
                 Column {
+                    node_id: 0,
                     windows: vec![b],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -2383,6 +2423,7 @@ mod tests {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![
                 Column {
+                    node_id: 0,
                     windows: vec![a],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -2391,6 +2432,7 @@ mod tests {
                     active: None,
                 },
                 Column {
+                    node_id: 0,
                     windows: vec![b1, b2],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -2443,6 +2485,7 @@ mod tests {
             let state = system.layouts.get_mut(layout).expect("layout state missing");
             state.columns = vec![
                 Column {
+                    node_id: 0,
                     windows: vec![a],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -2451,6 +2494,7 @@ mod tests {
                     active: None,
                 },
                 Column {
+                    node_id: 0,
                     windows: vec![b1, b2],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -2528,6 +2572,7 @@ mod tests {
 
         let state = system.layouts.get_mut(layout).expect("layout state missing");
         state.columns = vec![Column {
+            node_id: 0,
             windows: vec![w1, w2],
             width_offset: 0.0,
             width_overridden: false,
@@ -2614,6 +2659,7 @@ mod tests {
 
         let state = system.layouts.get_mut(layout).expect("layout state missing");
         state.columns = vec![Column {
+            node_id: 0,
             windows: vec![locked, capped],
             width_offset: 0.0,
             width_overridden: false,
@@ -3515,6 +3561,7 @@ mod tests {
             let state = system.layouts.get_mut(layout).expect("layout state");
             state.columns = vec![
                 Column {
+                    node_id: 0,
                     windows: vec![a1, a2],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -3523,6 +3570,7 @@ mod tests {
                     active: None,
                 },
                 Column {
+                    node_id: 0,
                     windows: vec![b],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -3565,6 +3613,7 @@ mod tests {
             let state = system.layouts.get_mut(layout).expect("layout state");
             state.columns = vec![
                 Column {
+                    node_id: 0,
                     windows: vec![a1, a2],
                     width_offset: 0.0,
                     width_overridden: false,
@@ -3573,6 +3622,7 @@ mod tests {
                     active: Some(a1),
                 },
                 Column {
+                    node_id: 0,
                     windows: vec![b],
                     width_offset: 0.0,
                     width_overridden: false,

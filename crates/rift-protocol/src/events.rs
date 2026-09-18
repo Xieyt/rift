@@ -14,6 +14,7 @@ pub enum EventKind {
     FocusedWindowChanged,
     StacksChanged,
     LayoutChanged,
+    SelectionChanged,
     #[serde(rename = "*")]
     All,
 }
@@ -27,6 +28,7 @@ impl EventKind {
             Self::FocusedWindowChanged => "focused_window_changed",
             Self::StacksChanged => "stacks_changed",
             Self::LayoutChanged => "layout_changed",
+            Self::SelectionChanged => "selection_changed",
             Self::All => "*",
         }
     }
@@ -91,6 +93,14 @@ pub enum RiftEvent {
         display_uuid: Option<String>,
         layout: LayoutStateData,
     },
+    SelectionChanged {
+        workspace_id: WorkspaceId,
+        workspace_index: Option<u64>,
+        workspace_name: String,
+        space_id: u64,
+        display_uuid: Option<String>,
+        layout: LayoutStateData,
+    },
 }
 
 impl RiftEvent {
@@ -102,6 +112,7 @@ impl RiftEvent {
             Self::FocusedWindowChanged { .. } => EventKind::FocusedWindowChanged,
             Self::StacksChanged { .. } => EventKind::StacksChanged,
             Self::LayoutChanged { .. } => EventKind::LayoutChanged,
+            Self::SelectionChanged { .. } => EventKind::SelectionChanged,
         }
     }
 
@@ -112,7 +123,8 @@ impl RiftEvent {
             | Self::WindowTitleChanged { space_id, .. }
             | Self::FocusedWindowChanged { space_id, .. }
             | Self::StacksChanged { space_id, .. }
-            | Self::LayoutChanged { space_id, .. } => *space_id,
+            | Self::LayoutChanged { space_id, .. }
+            | Self::SelectionChanged { space_id, .. } => *space_id,
         }
     }
 
@@ -123,7 +135,8 @@ impl RiftEvent {
             | Self::WindowTitleChanged { display_uuid, .. }
             | Self::FocusedWindowChanged { display_uuid, .. }
             | Self::StacksChanged { display_uuid, .. }
-            | Self::LayoutChanged { display_uuid, .. } => display_uuid.as_deref(),
+            | Self::LayoutChanged { display_uuid, .. }
+            | Self::SelectionChanged { display_uuid, .. } => display_uuid.as_deref(),
         }
     }
 }
@@ -176,6 +189,15 @@ mod tests {
     }
 
     #[test]
+    fn selection_changed_is_a_typed_subscription_kind() {
+        assert_eq!(EventKind::SelectionChanged.as_str(), "selection_changed");
+        assert_eq!(
+            serde_json::to_string(&EventKind::SelectionChanged).unwrap(),
+            "\"selection_changed\""
+        );
+    }
+
+    #[test]
     fn layout_changed_has_a_typed_subscription_and_workspace_context() {
         let event = RiftEvent::LayoutChanged {
             workspace_id: WorkspaceId { idx: 3, version: 1 },
@@ -193,7 +215,9 @@ mod tests {
                 focused_window: None,
                 selected_window: None,
                 container_tree: crate::ContainerTreeNode {
+                    node_id: 1,
                     node_type: crate::ContainerNodeType::Placeholder,
+                    frame: Default::default(),
                     layout_kind: None,
                     weight: None,
                     window_id: None,
@@ -229,7 +253,12 @@ mod tests {
                     "focused_window": null,
                     "selected_window": null,
                     "container_tree": {
+                        "node_id": 1,
                         "node_type": "placeholder",
+                        "frame": {
+                            "origin": { "x": 0.0, "y": 0.0 },
+                            "size": { "width": 0.0, "height": 0.0 }
+                        },
                         "layout_kind": null,
                         "weight": null,
                         "window_id": null,
