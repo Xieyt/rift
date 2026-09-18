@@ -535,9 +535,11 @@ fn only_move_node_requests_post_arrange_mouse_warp() {
     let move_node = reactor.dispatch_test_layout_command(LayoutCommand::MoveNode(Direction::Left));
     assert_eq!(move_node.post_arrange_mouse_warp, Some(focused));
 
-    let move_focus = reactor.dispatch_test_layout_command(LayoutCommand::MoveFocus(
-        MoveFocusArgs { direction: Direction::Left, activate: false },
-    ));
+    let move_focus =
+        reactor.dispatch_test_layout_command(LayoutCommand::MoveFocus(MoveFocusArgs {
+            direction: Direction::Left,
+            activate: false,
+        }));
     assert_eq!(move_focus.post_arrange_mouse_warp, None);
 }
 
@@ -2991,8 +2993,15 @@ fn focus_window_command_raise_is_quiet_and_does_not_activate() {
     match outcome.raise_requests.as_slice() {
         [raise_manager::Event::RaiseRequest(request)] => {
             assert_eq!(request.focus_window.map(|(wid, _)| wid), Some(window));
-            assert_eq!(request.focus_quiet, Quiet::Yes, "self-initiated raise must stay quiet");
-            assert!(!request.activate, "a bare focus grant must not foreground the app");
+            assert_eq!(
+                request.focus_quiet,
+                Quiet::Yes,
+                "self-initiated raise must stay quiet"
+            );
+            assert!(
+                !request.activate,
+                "a bare focus grant must not foreground the app"
+            );
         }
         other => panic!("Unexpected raise requests: {other:?}"),
     }

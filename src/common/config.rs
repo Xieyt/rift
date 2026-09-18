@@ -2111,8 +2111,11 @@ mod tests {
             .collect();
         crate_dirs.sort();
         for crate_dir in crate_dirs {
-            let crate_name =
-                crate_dir.file_name().expect("crate dir has a name").to_string_lossy().into_owned();
+            let crate_name = crate_dir
+                .file_name()
+                .expect("crate dir has a name")
+                .to_string_lossy()
+                .into_owned();
             let crate_src = crate_dir.join("src");
             if crate_src.is_dir() {
                 modules.extend(walk_test_modules(&crate_src, Some(&crate_name)));
