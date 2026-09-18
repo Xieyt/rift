@@ -37,6 +37,12 @@
       craneLib = (crane.mkLib pkgs).overrideToolchain toolchain;
       root = ../.;
 
+      # Read from Cargo.toml rather than restated here. This was `version = "0.1.0"`
+      # hardcoded on the bundle derivation while Cargo.toml said 0.5.9 — a skew that
+      # nothing checked, because only the release workflow's update-nix job ever
+      # rewrote it. One source of truth: bump Cargo.toml, everything follows.
+      riftVersion = (lib.importTOML ../Cargo.toml).package.version;
+
       # The ONE source of truth for "which macOS does this build require". rustc
       # stamps LC_BUILD_VERSION from MACOSX_DEPLOYMENT_TARGET, and in the crane
       # build nixpkgs' stdenv sets that from the platform default — currently
@@ -67,6 +73,14 @@
         # root package's two binaries (rift, rift-cli) and keeps the rift-client
         # examples' ctrlc/nix/dispatch2 dev-dependency subtree out of the build.
         cargoExtraArgs = "--locked --package rift-wm --bins";
+
+        # `build.rs` stamps RIFT_VERSION from git, which the store copy above does
+        # not contain (`commonCargoSources` excludes `.git`), so an unset override
+        # produces "0.5.9+unknown.dirty" — a lie in both halves. Pass the version
+        # the derivation was actually built from instead. Keep in step with
+        # Cargo.toml's `[package] version`; the release workflow's update-nix job
+        # rewrites `version = "…"` below on a published release.
+        RIFT_VERSION_OVERRIDE = riftVersion;
 
         nativeBuildInputs = [ ];
         # Mission Control previews go through ScreenCaptureKit, which only exists in
@@ -113,7 +127,7 @@
       # Wrap built binaries in proper macOS app bundle for TCC permissions
       rift-app = pkgs.clangStdenv.mkDerivation {
         pname = "rift";
-        version = "0.1.0";
+        version = riftVersion;
         
         buildInputs = [ build ];
         

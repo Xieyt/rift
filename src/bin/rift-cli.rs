@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 #[derive(Parser)]
+#[command(version = env!("RIFT_VERSION"))]
 #[command(name = "rift-cli")]
 #[command(about = "Command-line interface for rift window manager")]
 struct Cli {
@@ -69,13 +70,19 @@ enum ServiceCommands {
 enum QueryCommands {
     /// List virtual workspaces (optionally for a specific MacOS space)
     Workspaces {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "display")]
         space_id: Option<u64>,
+        /// Display UUID; queries the display's current macOS space
+        #[arg(long, value_name = "UUID", conflicts_with = "space_id")]
+        display: Option<String>,
     },
     /// List windows (optionally filtered by space)
     Windows {
-        #[arg(long)]
+        #[arg(long, conflicts_with = "display")]
         space_id: Option<u64>,
+        /// Display UUID; queries the display's current macOS space
+        #[arg(long, value_name = "UUID", conflicts_with = "space_id")]
+        display: Option<String>,
     },
     /// List connected displays
     Displays,
@@ -460,6 +467,21 @@ enum DisplayCommands {
         #[arg(long)]
         window_id: Option<u32>,
     },
+    /// Move the active workspace to a display by direction, index, or UUID.
+    MoveWorkspace {
+        /// Direction relative to the workspace's current display (left, right, up, down).
+        #[arg(long)]
+        direction: Option<String>,
+        /// Display index (0-based).
+        #[arg(long)]
+        index: Option<usize>,
+        /// Display UUID.
+        #[arg(long)]
+        uuid: Option<String>,
+        /// Continue from the opposite edge for directional selectors.
+        #[arg(long)]
+        wrap_around: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -579,8 +601,14 @@ fn build_request(command: Commands) -> Result<RiftRequest, String> {
 
 fn build_query_request(query: QueryCommands) -> Result<RiftRequest, String> {
     match query {
-        QueryCommands::Workspaces { space_id } => Ok(RiftRequest::GetWorkspaces { space_id }),
-        QueryCommands::Windows { space_id } => Ok(RiftRequest::GetWindows { space_id }),
+        QueryCommands::Workspaces { space_id, display } => match display {
+            Some(display_uuid) => Ok(RiftRequest::GetWorkspacesForDisplay { display_uuid }),
+            None => Ok(RiftRequest::GetWorkspaces { space_id }),
+        },
+        QueryCommands::Windows { space_id, display } => match display {
+            Some(display_uuid) => Ok(RiftRequest::GetWindowsForDisplay { display_uuid }),
+            None => Ok(RiftRequest::GetWindows { space_id }),
+        },
         QueryCommands::Displays => Ok(RiftRequest::GetDisplays),
         QueryCommands::Window { window_id } => {
             let window_id = protocol_window_id(&parse_window_id(&window_id)?)?;
@@ -1093,6 +1121,17 @@ fn map_display_command(cmd: DisplayCommands) -> Result<CliCommand, String> {
             reactor::ReactorCommand::MoveWindowToDisplay {
                 selector: build_display_selector(direction, index, uuid)?,
                 window_id,
+            },
+        ))),
+        DisplayCommands::MoveWorkspace {
+            direction,
+            index,
+            uuid,
+            wrap_around,
+        } => Ok(CliCommand::Reactor(reactor::Command::Reactor(
+            reactor::ReactorCommand::MoveWorkspaceToDisplay {
+                selector: build_display_selector(direction, index, uuid)?,
+                wrap_around,
             },
         ))),
     }
