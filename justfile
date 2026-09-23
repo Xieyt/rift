@@ -287,10 +287,6 @@ dev-install profile="release-fast" config="dev-config.toml":
       echo "✓ rift swapped ({{profile}}) and restarted."
     fi
 
-    # Reload hyperkey launch agent (workaround for it not restarting cleanly)
-    launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
-    launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
-
 # Like `dev-install` but discards the saved layout snapshot for a clean slate.
 dev-install-fresh profile="release-fast" config="dev-config.toml":
     @FRESH=1 just dev-install {{profile}} {{config}}
@@ -324,12 +320,21 @@ setup-signing-cert:
 # restart the running WM (picks up a freshly-installed binary)
 restart:
     launchctl kickstart -k {{agent}}
+    # Reload hyperkey launch agent afterward: both it and rift install
+    # HeadInsertEventTap taps at kCGHIDEventTap, so whichever tap was
+    # (re)created most recently wins the front of the chain. Rift's tap
+    # just moved to the front; put Hyperkey's back in front so it keeps
+    # transforming CapsLock into hyper modifiers before rift sees the key.
+    launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
 
 # stop / start the WM agent
 stop:
     launchctl bootout {{agent}} || true
 start:
     launchctl bootstrap gui/{{uid}} ~/Library/LaunchAgents/git.acsandmann.rift.plist || launchctl kickstart {{agent}}
+    launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
+    launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
 
 # is it running, and which binary?
 status:
