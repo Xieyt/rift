@@ -136,7 +136,7 @@ Everything we carry lives in a **handful of single-purpose commits** on top of
   entitlement for screen capture — it is purely TCC-gated
   (`kTCCServiceScreenCapture`), so no `.entitlements` file and App Sandbox stays
   off. Screen Recording is a **separate consent record** from Accessibility, keyed
-  on the same identity + bundle-id: with the stable `rift-codesign` identity the
+  on the same identity + bundle-id: with the stable signing identity the
   grant survives `darwin-rebuild` exactly like Accessibility, but **every existing
   user gets one new prompt at the next login**, raised by a launchd agent, which is
   easy to miss. Ad-hoc (`signingIdentity = "-"`) installs get re-prompted on
@@ -251,13 +251,17 @@ scoping must be re-checked whenever upstream adopts a new framework or crate.
 **Effect:** a focus move / workspace switch brings the target *app* to the
 foreground, not just shifting keyboard focus.
 **Why:** upstream only moves keyboard focus; it never foregrounds the app, and is
-not moving that way. Re-verified against the merged upstream tip (`6c64d8b`): zero
-occurrences of `NSRunningApplication::activate` / `activateWithOptions` in
-upstream's `src/actor/app.rs` or `src/sys/app.rs`, and upstream's `RaiseRequest` is
-still the 4-tuple `(wids, token, sequence_id, quiet)` against our 5-tuple. The one
-`activate()` upstream added is `NSApplication::sharedApplication(mtm)` in the
-Mission Control overlay — Rift activating *itself* to take key focus, not per-app
-foregrounding. **This stays fork-only and is not even partially duplicated.**
+not moving that way. Re-verified against upstream tip `250d992` (2026-10-15):
+**zero** occurrences of `NSRunningApplication::activate` / `activateWithOptions` in
+upstream's `src/sys/app.rs`, and `actor/app.rs`'s private `RaiseRequest` is still
+the 4-tuple `(wids, token, sequence_id, quiet)` against our 5-tuple.
+**Careful — the grep is no longer a clean zero.** Upstream's new
+`src/actor/menu_bar.rs:201` calls `activateWithOptions(ActivateAllWindows)` to
+foreground the settings child process, and `ui/mission_control.rs` activates
+Rift itself. Neither is in the focus pipeline. Judge this claim by *where* the
+call sits, not by the match count: **nothing upstream foregrounds a target app on
+a focus move or workspace switch.** This stays fork-only and is not even partially
+duplicated.
 **Note:** `sys/app.rs` intentionally uses the deprecated
 `activateWithOptions(ActivateIgnoringOtherApps)` under `#[allow(deprecated)]` — it
 gives the forceful foregrounding a WM wants, and we target current macOS, so the
@@ -553,13 +557,17 @@ file upstream owns but away from its SCK plumbing.
 
 ## 3. Syncing with upstream (rebase vs merge)
 
-> **Currently 0 commits behind `upstream/main` (merged through `83f3b66`,
-> 2026-09-18).** That sync is recorded in `UPSTREAM-SYNC.md` §11 — read §11.10
-> first: it scores the plan against what actually happened, and it is the shortest
-> worked example of the failure mode this fork keeps hitting (upstream deleting a
-> file we had edited — `event_tap.rs` + `gesture_tap.rs` → `input.rs`), plus the
-> twelve-entry hazard register in §11.4 for merges that go clean and lose a feature
-> anyway. The **§11.8 live desktop checklist is still unrun.**
+> **Currently 132 commits behind `upstream/main`** (merged through `83f3b66`,
+> 2026-09-18; upstream tip `250d992`, v0.7.0). **Do not start this merge without
+> reading `UPSTREAM-SYNC.md` §12** — it is the measured plan: 68 conflict hunks
+> across 18 files, four upstream subsystem rewrites landing on four of our six
+> features, a nine-stage checkpoint table, and a twelve-entry hazard register
+> whose first two entries lose *user data* if merged carelessly (persisted tab
+> groups, and every existing fork user's config failing to parse).
+> §12.3 is the per-feature "do we still need ours?" verdict — **features C and F
+> are superseded and get deleted this sync**. §12.10 is why this backlog grew to
+> 132 commits and the rule changes that prevent the next one.
+> The **§11.8 live desktop checklist is still unrun**; it is folded into §12.9.
 
 **Use `merge`, not `rebase`, for routine syncs.** We carry a large feature set (see
 §2) and sync periodically, so upstream deltas are non-trivial. A merge resolves the
@@ -888,7 +896,9 @@ Control does nothing or comes up blank, check the **`enabled` flag first** (it i
 §2.F for the full triage order; §2.F also logs a `warn!` naming the permission.
 
 **Installing via the flake** (`darwin-rebuild switch` with `services.rift.enable`)
-needs *no* manual cert setup: the module auto-creates the `rift-codesign` identity
+needs *no* manual cert setup: the module auto-creates the identity named by
+`services.rift.signingIdentity` (this host sets it to `fern-codesign` in
+xnix-config's `fern.nix`; upstream's default is `rift-codesign`)
 on first activation (`services.rift.manageSigningIdentity`, default `true`) and
 signs with it, so Accessibility persists across rebuilds out of the box. The
 `just setup-signing-cert` step above is only for the local `just install` dev loop.
@@ -1082,8 +1092,10 @@ git log --oneline upstream/main..xieyt/5
 git diff --stat upstream/main..xieyt/5
 
 # structural tripwires — any hit means sync now, not later (UPSTREAM-SYNC.md §7)
-git diff --stat HEAD..upstream/main -- Cargo.toml Cargo.lock crates/
-git log --oneline HEAD..upstream/main -- src/layout_engine/systems/scrolling.rs
+just upstream-status                   # drift + tripwires, for a human
+just upstream-tripwire                 # tripwires only, markdown, exit 1 on a hit
+# ...and it now runs itself: .github/workflows/upstream-tripwire.yml, weekly,
+# opening/updating one `upstream-sync` issue. UPSTREAM-SYNC.md §12.10 item 1.
 
 # what is enforced automatically (§6 "Enforced guards")
 omp ttsr list                          # TTSR rules + their parsed conditions

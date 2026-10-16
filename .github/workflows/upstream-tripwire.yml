@@ -1,0 +1,112 @@
+# UPSTREAM-SYNC.md §12.10 item 1. The cadence rule in §7 ("sync on structural
+# change, not on a calendar") was correct and unenforced: between 2026-09-18 and
+# 2026-10-15 the fork fell 132 commits behind and absorbed four upstream subsystem
+# rewrites at once, because the rule lived only as prose nobody was reminded of.
+# This fires the same checks weekly and opens an issue.
+name: upstream tripwire
+
+on:
+  schedule:
+    # Mondays 06:00 UTC. Weekly is the right grain: the 2026-10 backlog's first
+    # tripwire-worthy commit landed 4 days after the previous sync finished.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  tripwire:
+    # Inverse of the guard in docs.yml / tag.yml: this is fork maintenance and
+    # must never run on upstream, which has nothing to sync from.
+    if: github.repository != 'acsandmann/rift'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tripwires diff against a merge base and read tags on both sides.
+          fetch-depth: 0
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/acsandmann/rift.git
+          git fetch upstream --tags --quiet
+
+      - uses: extractions/setup-just@v2
+
+      - name: Run tripwires
+        id: tripwire
+        run: |
+          # `set +e`: GitHub's default shell is `bash -eo pipefail`, and a tripwire
+          # HIT is a non-zero exit by design — without this the step dies before
+          # the report is ever read.
+          set +e
+          set -uo pipefail
+          {
+            echo "behind=$(git rev-list --count HEAD..upstream/main)"
+            echo "tip=$(git rev-parse --short upstream/main)"
+          } >> "$GITHUB_OUTPUT"
+
+          just upstream-tripwire > tripwire.md
+          status=$?
+          echo "hit=$status" >> "$GITHUB_OUTPUT"
+          cat tripwire.md
+          # A tripwire hit is the signal, not a build failure.
+          exit 0
+
+      - name: Open or update the sync issue
+        if: steps.tripwire.outputs.hit == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.tripwire.outputs.behind }}
+          TIP: ${{ steps.tripwire.outputs.tip }}
+        run: |
+          set -euo pipefail
+          TITLE="upstream sync due — $BEHIND commits behind ($TIP)"
+
+          {
+            echo "\`HEAD\` is **$BEHIND commits** behind \`upstream/main\` (\`$TIP\`)."
+            echo
+            echo "## Tripwires"
+            cat tripwire.md
+            echo
+            echo "## Next"
+            echo '```'
+            echo "just upstream-status   # full drift report"
+            echo "just sync              # checkpointed merge, NOT a rebase"
+            echo '```'
+            echo
+            echo "Read \`UPSTREAM-SYNC.md\` §12 before merging a backlog this size,"
+            echo "and §3/§4 of \`FORK.md\` for the resolution playbook."
+            echo
+            echo "<sub>Opened by \`.github/workflows/upstream-tripwire.yml\`; updated in place each run.</sub>"
+          } > body.md
+
+          # One rolling issue, updated in place. A new issue per week would train
+          # everyone to ignore the label, which is the failure this automates away.
+          existing=$(gh issue list --state open --label upstream-sync \
+            --json number --jq '.[0].number // empty')
+
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$TITLE" --body-file body.md
+            echo "updated issue #$existing"
+          else
+            gh label create upstream-sync \
+              --description "Automated upstream drift tripwire" \
+              --color B60205 2>/dev/null || true
+            gh issue create --title "$TITLE" --body-file body.md --label upstream-sync
+          fi
+
+      - name: Close the sync issue when clear
+        if: steps.tripwire.outputs.hit == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          existing=$(gh issue list --state open --label upstream-sync \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue close "$existing" \
+              --comment "No structural tripwire at this run; a batched merge is fine. Reopened automatically if one fires."
+          fi

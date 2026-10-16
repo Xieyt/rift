@@ -12,7 +12,10 @@
 uid := `id -u`
 agent := "gui/" + uid + "/git.acsandmann.rift"
 app := "/Applications/Rift.app"
-signing_cert := "rift-codesign"
+# This machine's local code-signing identity — signs every locally-built app
+# that needs TCC grants to survive rebuilds (rift, hyperkey), not just rift.
+# Must match `services.rift.signingIdentity` in xnix-config's fern.nix.
+signing_cert := "fern-codesign"
 sys_keychain := "/Library/Keychains/System.keychain"
 
 # list recipes
@@ -370,10 +373,30 @@ upstream-status:
     git log --oneline --no-merges HEAD..upstream/main
     echo
     echo "=== structural tripwires — ANY hit means sync now, not later ==="
+    # 2>/dev/null: a tripwire HIT exits 1 by design, and `just` would print its own
+    # "recipe failed" line over the report. The report itself is on stdout.
+    just upstream-tripwire 2>/dev/null || true
+    echo
+    echo "next: just sync   (checkpointed merges, NOT a rebase — see UPSTREAM-SYNC.md §3)"
+
+# `upstream-status` wraps this for humans; .github/workflows/upstream-tripwire.yml
+# consumes it and opens an issue. One implementation, two callers — UPSTREAM-SYNC.md
+# §12.10 item 1: the 2026-10 backlog grew to 132 commits because this rule existed
+# only as prose nobody was reminded of.
+# structural tripwires only, as markdown; exits 1 when any fires
+upstream-tripwire:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    git rev-parse --verify --quiet upstream/main >/dev/null || {
+      echo "no upstream/main ref — run: git fetch upstream"; exit 1; }
+    behind=$(git rev-list --count HEAD..upstream/main)
+    if [ "$behind" -eq 0 ]; then echo "- up to date with \`upstream/main\`."; exit 0; fi
     hit=0
     if ! git diff --quiet HEAD..upstream/main -- Cargo.toml Cargo.lock crates/; then
-      echo "  [!] crate/workspace change:"
-      git diff --stat HEAD..upstream/main -- Cargo.toml Cargo.lock crates/ | sed 's/^/      /'
+      echo "- **[!] crate/workspace change** — a new or moved crate re-homes our command variants:"
+      echo '```'
+      git diff --stat HEAD..upstream/main -- Cargo.toml Cargo.lock crates/
+      echo '```'
       hit=1
     fi
     # Field added to a struct our fork extends (EventResponse.activate,
@@ -382,21 +405,40 @@ upstream-status:
       src/actor/reactor/events/outcome.rs src/layout_engine/systems/scrolling.rs 2>/dev/null \
       | grep -cE '^\+ +pub (changed|activate|tabbed|active|width_overridden|boundary_hit|raise_windows|focus_window)\b')
     if [ "${fields:-0}" -gt 0 ]; then
-      echo "  [!] $fields added field(s) on EventResponse/EventOutcome/Column — expect a literal sweep"
+      echo "- **[!] $fields added field(s)** on \`EventResponse\`/\`EventOutcome\`/\`Column\` — expect a literal sweep (FORK.md §4 items 2 and 3)."
       hit=1
+    fi
+    # `grep -c`, never `grep -q`: with `pipefail`, a short-circuiting `grep -q`
+    # SIGPIPEs the upstream `git log -p` and the pipeline returns 141, so a real
+    # match reported "no hit". This check silently never fired until 2026-10-16.
+    sigs=$(git log -p HEAD..upstream/main -- src/layout_engine/ 2>/dev/null \
+      | grep -cE '^[-+].*fn (calculate_layout|update_layout|create_layout)\(')
+    if [ "${sigs:-0}" -gt 0 ]; then
+      echo "- **[!] \`calculate_layout\`/\`update_layout\`/\`create_layout\` signature changed** ($sigs hunk line(s)) — our hint-bar reserve recursion threads these (FORK.md §2.E)."
+      hit=1
+    fi
+    # UPSTREAM-SYNC.md §12.10 item 2: never skip a second upstream minor. Tags are
+    # upstream's own statement that something landed; two minors behind means a
+    # rewrite has probably happened. Objective, and needs no diff reading.
+    ours=$(git describe --tags --abbrev=0 HEAD 2>/dev/null | sed 's/^v//')
+    theirs=$(git describe --tags --abbrev=0 upstream/main 2>/dev/null | sed 's/^v//')
+    if [ -n "$ours" ] && [ -n "$theirs" ]; then
+      om=$(echo "$ours" | cut -d. -f2); tm=$(echo "$theirs" | cut -d. -f2)
+      oM=$(echo "$ours" | cut -d. -f1); tM=$(echo "$theirs" | cut -d. -f1)
+      if [ "$tM" -gt "$oM" ] || { [ "$tM" -eq "$oM" ] && [ $((tm - om)) -ge 2 ]; }; then
+        echo "- **[!] release ceiling breached** — we are on \`$ours\`, upstream is on \`$theirs\` (two or more minors)."
+        hit=1
+      fi
     fi
     for f in src/layout_engine/systems/scrolling.rs src/actor/reactor.rs src/actor/app.rs; do
       n=$(git log --oneline HEAD..upstream/main -- "$f" | wc -l | tr -d ' ')
-      [ "$n" -gt 0 ] && echo "  [.] $n commit(s) touch $f (our churniest shared files)"
+      [ "$n" -gt 0 ] && echo "- [.] $n commit(s) touch \`$f\` (our churniest shared files)"
     done
-    if git log -p HEAD..upstream/main -- src/layout_engine/ 2>/dev/null \
-      | grep -qE '^[-+].*fn (calculate_layout|update_layout|create_layout)\('; then
-      echo "  [!] calculate_layout/update_layout/create_layout signature changed"
-      hit=1
+    if [ "$hit" -eq 0 ]; then
+      echo "- no structural tripwire — a batched merge is fine (still checkpoint it)."
+      exit 0
     fi
-    [ "$hit" -eq 0 ] && echo "  none — a batched merge is fine (still checkpoint it)"
-    echo
-    echo "next: just sync   (checkpointed merges, NOT a rebase — see UPSTREAM-SYNC.md §3)"
+    exit 1
 
 # Deliberately a merge, not a rebase: §3 rejected rebasing because it replays our
 # commits against every upstream step and re-resolves the same conflicts; merge

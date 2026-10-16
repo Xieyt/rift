@@ -21,30 +21,38 @@ its own sake:
   to sync: it is the shortest complete worked example, and §8.3 covers what to do
   when upstream ships a failing test.
 
-## 0. Status — five syncs complete; §11 is the newest
+## 0. Status — five syncs complete, a sixth planned; §12 is the newest
 
 ```
 branch                    xieyt/5
-behind upstream           0        (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     78
+behind upstream           132      (git rev-list --left-right --count HEAD...upstream/main)
+ahead                     80
 upstream tip merged       83f3b66  (2026-09-17; backlog ended 6c64d8b, then 1de4d09,
                                    then 7829780, then 3a52122, then 74ce00d, now this)
+upstream tip available    250d992  (2026-10-15, v0.7.0) — NOT merged; see §12
 curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
                               -> 363 (§8) -> 370 (§9) -> 520 (guard widened)
                               -> 549 (§10) -> 605 (§11), plus 14 crate tests
                               that had never run at all before §11
-cargo check               --workspace --all-targets clean
+cargo check               --workspace --all-targets clean (at 686f4a6, pre-merge)
 just fmt-check            clean
 nix build .#rift          succeeds; `nix eval .#rift.version` reads 0.5.9
 ```
 
+**§12 is the sixth-sync PLAN** (132 commits, 68 hunks across 18 files, four
+upstream subsystem rewrites, two fork features retired as superseded) and is the
+one to read if you are about to sync. **§12.10 is the most important section in
+this file**: it is why a 77-commit backlog became a 132-commit one, and the three
+rule changes that stop the next one. §12.3 answers "do we still need ours?" per
+fork feature; §12.6 is the twelve-entry hazard register.
+
 **§11 records the 2026-09-18 sync** (77 commits, 13 hunks, 2 deleted files we had
-edited, 2 SKIPs) and is the one to read if you are about to sync. It is the first
-of these where the cost was a **migration, not conflict resolution**: upstream
-folded `event_tap.rs` + `gesture_tap.rs` — both carrying fork hunks — into a single
-`input.rs`. §11.4 is the hazard register (twelve clean merges that lose a fork
-behaviour); **§11.10 scores the plan's predictions, including the one that was
-wrong by a whole workday in the cheap direction.**
+edited, 2 SKIPs). It is the first of these where the cost was a **migration, not
+conflict resolution**: upstream folded `event_tap.rs` + `gesture_tap.rs` — both
+carrying fork hunks — into a single `input.rs`. §11.4 is its hazard register;
+**§11.10 scores the plan's predictions, including the one that was wrong by a whole
+workday in the cheap direction.** Its §11.8 live checklist is **still unrun** and
+is folded into §12.9.
 
 **Upstream `main` currently has ONE failing test of its own**, reproduced on a
 pristine worktree and skipped in `just test` with attribution: see §8.3.
@@ -1888,3 +1896,365 @@ scroll-speed knob, FFM non-activation, post-wake raise self-heal, and the floati
 layout's inset bug (`FORK.md` §8 feature item 6, created by this sync). Nothing in
 the checklist is testable headless, which is exactly why §11.4 lists "no test
 covers this" against six of the twelve hazards.
+
+---
+
+## 12. Sixth sync — PLAN, 2026-10-16, `83f3b66` → `250d992` (132 commits)
+
+> **Status: planned, not executed.** Everything below is measured on a scratch
+> worktree (`git worktree add /tmp/rift-sync-probe xieyt/5 --detach`, then
+> `git -c rerere.enabled=false merge --no-commit --no-ff upstream/main`), not
+> estimated. §12.10 is the part to read if you only read one section: it is why
+> this backlog exists and the rule change that prevents the next one.
+
+### 12.0 Situation (measured)
+
+```
+merge-base          83f3b66   (2026-09-17, §11's tip)
+upstream tip        250d992   (2026-10-15, v0.7.0)
+behind              132       ahead 80
+upstream churn      141 files, +41921 / -17049
+conflict surface    18 files, 68 hunks   (full-jump probe, rerere off)
+releases skipped    0.6.2 → 0.7.0  (seven tags)
+```
+
+**The delta is big but the overlap is not.** 32 of upstream's 141 changed files are
+files the fork also touches. **27,128 of the 41,921 inserted lines (65%) land in
+files the fork has never edited** — `bsp.rs` (+863), `reactor/animation.rs` (+2017),
+`window_store.rs` (+485), `menu_bar.rs` (+833/+209), `spaces.rs`, `sys/gesture.rs`,
+`actor/config.rs`, `actor/mission_control.rs` all have **zero** fork delta
+(`git diff --numstat 83f3b66..xieyt/5 -- <path>` is empty for each). Those merge for
+free. The cost is concentrated in four subsystem rewrites that landed *on top of*
+fork features.
+
+### 12.1 Tripwire verdict — all three fired, and §7's rule was not applied
+
+§7 says sync immediately when upstream adds or moves a crate, touches
+`[workspace]`, changes a `calculate_layout` signature, or rewrites the reactor's
+outcome fan-out. Re-run now:
+
+| Tripwire | Result |
+|---|---|
+| `git diff --stat 83f3b66..upstream/main -- Cargo.toml Cargo.lock crates/` | **HIT** — new crate `crates/rift-config-derive`, `Cargo.toml` −75 lines |
+| `git log --oneline … -- src/layout_engine/systems/scrolling.rs` | **HIT** — 13 commits, one a full rewrite |
+| `calculate_layout` signature | **HIT** — now takes `StackLineReserve` instead of three loose stack-line params |
+
+> The third row is a hit *as re-checked by hand*. The scripted version of that
+> check in `just upstream-status` was incapable of reporting it — a
+> `grep -q` / `pipefail` SIGPIPE bug meant a real match returned 141 and read as
+> "no hit". Found and fixed on 2026-10-16; see §12.10 item 1.
+
+The first tripwire-worthy commit is `dd4f3d9` (#6, 2026-09-22, new drag subsystem),
+**four days** after §11 landed. The rule was right; nothing enforced it, and one
+third of it could not have fired anyway. §12.10.
+
+### 12.2 The headline: upstream rebuilt four of the six subsystems we live in
+
+| Rewrite | Commit | `#` | What it replaced |
+|---|---|---|---|
+| Scrolling layout + gestures | `95cd9ba` (#544) | 48 | selected-window model → `active_column`/`active_window`, `Viewport`+`CameraSpring`, cached `Geometry` built in `prepare_geometry`, `ColumnId`/`ColumnWidth`, one `new_column` constructor |
+| Settings UI + config split | `b391d56` (#552) | 87 | `src/common/config.rs` → `config/{mod,types,parse,document,schema,tests}.rs`, plus the `rift-config-derive` proc-macro crate and ~10k lines of `src/ui/settings/**` |
+| Mission Control | `dcaaaa8` (#538) | 44 | niri-aligned overview; CGS layer extracted to the external **`cgs` 0.3.9** crate |
+| Stack line | `952fc17` (#576) | 103 | custom-drawn indicator → native `cgs::TabBar`; **deletes `src/ui/stack_line.rs`** |
+
+Two of these delete or replace a file the fork had edited. **The config split and
+the derive crate are not separable from the settings UI** — all three arrive inside
+`b391d56`, and every commit after #87 builds on them. There is no "take the fixes,
+skip the settings UI" option.
+
+### 12.3 Fork feature disposition — "do we still need ours?"
+
+This is the question the sync turns on. Answered per feature, against upstream tip:
+
+| | Feature | Verdict | Evidence |
+|---|---|---|---|
+| **A** | nix packaging | **KEEP** — 4 small patches | No new `[[bin]]`: the settings UI is `rift --settings`, a child of the *same* executable (`actor/menu_bar.rs:208`, `bin/rift.rs:75-117`). `--package rift-wm --bins` still covers everything; `rift-config-derive` is a path dep, built automatically |
+| **B** | app activation on focus | **KEEP** — still 100% fork-only | Upstream tip has zero `activate` in `sys/app.rs`; `actor/app.rs`'s private `RaiseRequest` is still a 4-tuple vs our 5. `9646c99` does **not** touch `Quiet` attribution — it composes with both mandatory fixes |
+| **C** | tabbed column display (titles on stack line) | **RETIRE — superseded** | `cgs::TabBar` renders window titles **and** app icons **and** native Select/Close, with system styling (`actor/stack_line.rs:418-440`, `TabInfo{window_id,title,bundle_id}`). Strictly more than our `CATextLayer` labels. No color/font API exists on the native bar, so our 6 theming keys die with it |
+| **D** | niri tabbed columns (scrolling) | **RE-PORT — and it shrinks** | Upstream has **no** tabbed concept anywhere (`git grep -c tabbed upstream/main -- …/scrolling.rs` = 0). But `Column.active_window` + `Column::selected()` + `window_in_direction` natively implement our *tab-memory* half, better (survives drops/removals, serialized) → our `active` field retires |
+| **E** | scrolling-strip hint bar | **KEEP** — needs re-homing | Zero `hints_bar` upstream. Breaks at **compile time**: imports `CgsWindow`/`CgsWindowError` from the deleted `sys::cgs_window`, `render_layer_to_cgs_window`/`with_disabled_actions` from `ui::common`, `Color`/`point_hits_indicator_frame` from the deleted `ui/stack_line.rs`, and uses `arc-swap`, which `952fc17` dropped from `Cargo.toml` |
+| **F** | Mission Control SCK degradation | **RETIRE — superseded** | Upstream now calls `CGPreflightScreenCaptureAccess()` itself inside `PreviewSession::open` (`ui/mission_control.rs:1850`) and ships a test for the disabled path |
+
+**Net: six features become four, and two of the four get smaller.** That is the
+right outcome — §5's rule is "drop anything upstream has absorbed", and this is the
+first sync where it applies to two whole features at once.
+
+Also retired, none of them fork-authored (so no defence owed):
+
+- `src/actor/drag_swap.rs` — inherited merge-base code, superseded by `dd4f3d9`'s
+  `actor/drag.rs` + reactor `DragManager`. Delete with its call sites.
+- The ~450 lines of gesture handling in our `input.rs` (probe conflicts #15/#16) —
+  dead merge-base code; `95cd9ba` replaced it with `actor/gesture.rs` + a rewritten
+  `sys/gesture.rs` (`Owner`/`Ownership`/`Filter` arbitration).
+- `RIFT_VERSION_OVERRIDE` in `build.rs` and `nix/package.nix` — upstream's new
+  `build.rs` stamps a clean version when there is no git tree. Superseded.
+- `width_presets` — upstream independently shipped `preset_column_widths` with its
+  own `switch_preset_column_width`. Retarget `LayoutCommand::CycleColumnWidth` at
+  theirs and drop ours.
+- The `update-nix` job in `.github/workflows/release.yml` — its `sed`s target
+  `url`/`sha256`/quoted-version attrs that the current source-build `package.nix`
+  no longer has. Dead code; take upstream's tail.
+
+**UI change, stated before it is coded (C retirement).** Today a stacked group draws
+our bar: a flat segmented strip, hex colors from `[settings.ui.stack_line]`, window
+titles as centered `CATextLayer`s, click-to-focus only. After: macOS's own tab bar —
+rounded native tabs, per-tab app icon left of the title, a close button per tab,
+system light/dark styling, click-to-focus **and** click-to-close. Our six theming
+keys (`active_color`, `inactive_color`, `active_title_color`,
+`inactive_title_color`, `font_size`, `border_width`) and `show_titles` stop existing;
+`thickness` survives with a 20 px floor and a new default of 28
+(`cgs::TabBar::HEIGHT`). Users who slimmed the bar below 20 get silently raised.
+
+### 12.4 Verdicts — all 132 commits
+
+Grouped; every commit is in exactly one row.
+
+| Group | `#` | Count | Verdict |
+|---|---|---|---|
+| bsp/traditional fixes (`b5f198c`, `1833b98`, `8d32603`, `3a99afa`, `dec4f3e`, `002fcae`, `fdb1179`, `a09986c`) | various | 8 | **TAKE**, free — `bsp.rs` has zero fork delta |
+| Crash fixes (`9fe25c7`, `8ca97c7`, `f7c2ece`) | various | 3 | **TAKE**, free |
+| Window-lifecycle / manageability (`0ddcf73`, `6bb3b7c`, `e21dae0`, `3bf1cde`) | 20,40,43,29 | 4 | **TAKE** — `window_store.rs` has zero fork delta |
+| Focus fixes (`445f31d`, `bff0dfd`, `8c69c2c`, `3440f8b`, `5f07ecc`, `3eceac1`, `088fe44`, `8bf3f53`, `9646c99`, `49d2f6c`, `cc38c0e`, `2cc6668`) | various | 12 | **TAKE**; `2cc6668` additionally **SUPERSEDES-OURS** (feature D's `active`) |
+| Workspace persistence (`23d62fa`, `fd9ec80`, `2fc20c2`, `42f1a62`) | 79,88,76,112 | 4 | **TAKE** |
+| Drag/drop subsystem (`dd4f3d9`, `8a46600`, `e8d5811`, `8e11324`, `b9f1aec`, `7936260`, `8171b51`) | 6,27,… | 7 | **TAKE** — and delete our `drag_swap.rs` |
+| Input/modifier-drag (`d796756`, `4402c99`, `f8f80e0`, `951eef0`) | various | 4 | **TAKE+REWORK** — union with feature E's hooks |
+| FFM session tap + its revert (`901103c`, `3ee0a28`) | 105,110 | 2 | **TAKE** (net zero) — **must land in one stage**; no reason given for the revert, expect a retry |
+| Binding modes (`7117abf`, `b8fe58e`, `254925e`, `8584586`) | 21,36,54,128 | 4 | **TAKE** — `[keys]` auto-becomes mode `default` (`config/parse.rs:151`); fork bindings need no declaration |
+| Scrolling rewrite + follow-ups (`95cd9ba`, `6d3be63`, `9b87edc`, `1631fb2`, `2710c1b`, `95728f7`, `f405968`, `cfa5347`, `2a73a80`, `ab46b8b`, `84c6dbe`, `30e812a`, `9ff2230`, `113214f`, `3b47dc6`, `d5f3245`) | 48,… | 16 | **TAKE+REWORK** — feature D re-port (§12.5 item 2) |
+| Mission Control rewrite + state ownership (`dcaaaa8`, `671ab23`, `b02bb33`) | 44,45,47 | 3 | **TAKE**; retires feature F |
+| Animations (`d0bf93f`, `6f78ad3`, `83f4180`) | 53,61,77 | 3 | **TAKE** — `animation.rs` has zero fork delta |
+| Menubar (`e3a5159`, `52288f5`, `f8fc7e3`) | 33,46,91 | 3 | **TAKE** — note `52288f5` flips `menu_bar.enabled` default to **on** |
+| Native window tabs (`659eaa5` + `reactor/native_tabs.rs`) | 86 | 1 | **TAKE** — Safari-style AX tabs, unrelated to the tab-bar UI |
+| Stack line → native TabBar (`952fc17`, `c1612f6`) | 103,16 | 2 | **SUPERSEDES-OURS** — retires feature C |
+| SkyLight titles (`1453e77`) | 38 | 1 | **TAKE** — free win; feeds the same `w.info.title` features D/E read |
+| Settings UI + config split + derive crate (`b391d56`, `b2ded63`, `84d5dd1`, `8114ccc`, `3bc82e5`, `3129a48`, `1e4bcd8`, `75904e8`, `6c87b86`, `be79109`, `b7e7f45`, `aba4de8`, `f7c5845`) | 87,97,… | 13 | **TAKE+REWORK** — §12.5 item 3 |
+| Config watcher rewrite (`40c4379`, `43a06e0`, `11bf6ad`) | 121-123 | 3 | **TAKE** — fork never edited the watcher |
+| Perf (`483b20f`, `1532b70`, `1bc8750`, `398b6d1`, `77139df`, `af1eb9f`, `51dca01`, `248ebca`, `3ef20d4`) | various | 9 | **TAKE** — none supersedes the hint bar's dedup/debounce/render-gating |
+| Packaging/CI/version (`c345d6a`, `250d992`, `89c907f`, `d9fce40`, `f14a119`, `dfa145b`, `72f73ca`, + 9 tag/bump commits) | various | 16 | **TAKE+REWORK** — §12.5 item 6 |
+| Chores (`c8d3afa`, `42b05db`, `dd42801`, `fcbb19f`, `c992792`, `c0dc3f8`, `a5d50e1`, `cee0363`, `f8abc55`, `3e53d8e`, `ae900cd`, `9ff2230`-adjacent) | various | 12 | **TAKE**, inert |
+
+**No commit in the backlog is a SKIP.** Nothing upstream shipped in this window is
+unwanted; the only question anywhere was *who implements it*, and in two cases
+(C, F) the answer changed to upstream.
+
+### 12.5 The six pieces of real work
+
+1. **Re-home feature E's dead imports** (small, mechanical, unblocks compilation).
+   `sys/cgs_window.rs` became the crates.io crate `cgs` 0.3.9 with 1:1 API parity
+   (`new`/`set_shape`/`set_opacity`/`set_resolution`/`set_alpha`/`set_level`/
+   `set_tags`/`set_blur`/`order_above`/`order_below`/`order_out`/`id`), and
+   `render_layer_to_cgs_window`/`with_disabled_actions` moved there too. Swap
+   `use crate::sys::cgs_window::{…}` → `use cgs::{…}` in `ui/hints_bar.rs` (lines
+   27-28 and the `DetailWindow` at 1408). Move `Color` (+`from_hex`, `to_nscolor`)
+   and `point_hits_indicator_frame` out of the dying `ui/stack_line.rs` into
+   `ui/hints_bar.rs`; three files import them (`actor/hints_bar.rs:27`,
+   `actor/input.rs:33`, `ui/hints_bar.rs`). Keep `arc-swap` in our `Cargo.toml` —
+   `952fc17` removed it upstream and `SharedHitRects` still needs it.
+
+2. **Re-port feature D onto the new scrolling model** (the day of real work).
+   Post-port D is *smaller* than today's: `tabbed: bool` on `Column` **and on
+   `StoredColumn`**, a `tabbed: false` default in the single `new_column`
+   constructor, a tabbed branch in `Geometry::build`'s row loop (emit N identical
+   frames inset by `stack_line.total()`, push one `CachedTabGroup`), a `!tabbed`
+   guard in `move_selection`, an explicit `detach`+`new_column` bypass for expel,
+   the tabbed raise filter in `move_focus`/`select_window`/`focus_column`,
+   `toggle_selection_tabbed`, and `collect_group_containers` keyed on `column.id.0`
+   (even ids, non-colliding with odd window ids) instead of the old
+   `g.key | (1<<63)` hash. **Delete** `active: Option<WindowId>`, the snap
+   `remembered_tab` logic, `move_focus_horizontal`/`_vertical`, and the `pending_*`
+   atomics. `focus_column`'s body becomes two lines:
+   `let wid = state.columns.get(index)?.selected()?; self.select_window(layout, wid)`.
+
+3. **Adopt the settings subsystem and make our config keys legal** (structural but
+   bounded). `config/mod.rs` is 10 lines of `pub use`, so **every fork call site
+   compiles unchanged**. Six fork fields are *hard compile errors* inside
+   `#[derive(ConfigSchema)]` structs because `Option<String>`/`Option<f64>`/
+   `Vec<f64>` are unsupported field kinds: the five feature-C color/font keys and
+   `width_presets` — all six are being deleted anyway, so the fix is the deletion.
+   `LayoutSettings` now derives `ConfigSchema`, so `activate_on_focus`,
+   `external_bar_top`, `external_bar_bottom` silently join `fields()` and the
+   settings search with auto-generated labels — decide per key: give it a real
+   label on the layouts page, or `#[setting(ignore)]`. The whole
+   `[settings.ui.hints_bar]` tree needs **nothing**: `UiSettings` does not derive
+   `ConfigSchema`, so the macro never sees it.
+   **TOML write-back is safe for fork keys** — `document.rs::edited_from` serializes
+   `ConfigSource` before and after the edit and `patch` skips every key whose value
+   is unchanged, preserving comments and formatting; saves are atomic and refuse to
+   overwrite a file changed on disk. Our `MoveFocusArgs` dual form survives: `patch`
+   explicitly does not recurse into `keys`/`binding_modes.*`, so an unedited
+   `move_focus = "left"` is never rewritten.
+
+4. **Resolve `input.rs` and delete more than you keep.** Of 13 conflict hunks, only
+   ~5 are real fork hooks (hint-bar/stack-line senders, `SharedHitRects` fields,
+   the `MouseDown` chip routing, the buttons-mask gate); #8 is a competing mask
+   edit and #15/#16 are the ~450 dead gesture lines. `actor.rs` resolves to
+   `drag` + `gesture` + `hints_bar`, dropping `drag_swap`.
+
+5. **Resolve `mission_control.rs` `@theirs` wholesale.** All five hunks are feature
+   F or old-pipeline code. Keep the SCK dependency reasoning: upstream **still**
+   uses `SCShareableContent`/`SCScreenshotManager`/`SCContentFilter`/
+   `SCStreamConfiguration`, so the `apple-sdk_14` pin, the
+   `NSScreenCaptureUsageDescription` strings in both plists, and the Screen
+   Recording TCC story all stay. New wrinkle: previews are now **double** opt-in
+   (`window_previews` defaults `false`), so a default install never raises the
+   prompt — `nix/module.nix:138-141` and `:225-228` promise one and are now wrong.
+
+6. **Packaging patches** (`nix/package.nix`): drop the `RIFT_VERSION_OVERRIDE` arg;
+   fix the bundle heredoc's hardcoded `CFBundleShortVersionString`/`CFBundleVersion`
+   `0.1.0` → `${riftVersion}`; refresh the heredoc's usage-string wording for the
+   Overview rebrand (`f14a119`); delete the stale comment about `update-nix`
+   rewriting `version = "…"`. `cargoExtraArgs` scoping is unchanged. Version 0.7.0
+   flows `Cargo.toml` → `importTOML riftVersion` → bundle automatically.
+
+### 12.6 Hazard register — clean merges that silently break us
+
+The pattern §10.1 named and §11.4 formalised. Twelve this time; the first two are
+the ones that lose user data.
+
+| id | hazard | detect / fix |
+|---|---|---|
+| **H1** | **Persisted tab groups vanish.** `StoredColumn` migrates `node_id`→`id` and has no `tabbed` field; `#[serde(from="StoredLayoutState")]` means a `#[serde(default)] tabbed` on `Column` is bypassed. Every user's tabbed columns flatten to plain stacks on first restart. Compiles clean | add `#[serde(default)] tabbed` to `StoredColumn` + carry it in `From<StoredLayoutState>`; **new serde round-trip test** |
+| **H2** | **Existing fork configs stop parsing.** `ConfigSource` is `deny_unknown_fields`. Deleting feature C's keys leaves `show_titles`/`active_color`/`inactive_color`/`active_title_color`/`inactive_title_color`/`font_size`/`border_width` in every fork user's TOML → rift falls back to defaults **and** the settings UI refuses to save | extend `migrate_legacy_stack_line` (`config/parse.rs:302-323`, today strips only upstream's `selected_color`/`unselected_color`/`border_color`) with all seven fork names; **new parse test** over a fork-era block |
+| **H3** | Frankenstein `Column`/`LayoutState`: git auto-merged our `tabbed`/`active` into upstream's new struct while ~26 fork `Column{..}` literals still name deleted fields. A blanket `@theirs` resolution leaves the auto-merged fragments orphaned instead | compiler catches it — but only if you *don't* blanket-resolve. Re-check `focus_column`, `collect_group_containers`, `CachedTabGroup`, `toggle_selection_tabbed` |
+| **H4** | Upstream removed `stack_line` from the mouse-move mask term, silently killing our stack-line hover. Clean merge | re-check the mask in `input.rs`; keep fork mask terms separable (H12) |
+| **H5** | `hints_bar_tx` arm in the reactor's `service_config_update` fan-out — the standing hazard (§4 item 7). **Survived this probe** at `reactor.rs:2802` | verify by editing config live, not by reading |
+| **H6** | `Geometry::matches` is not keyed on `StackLineReserve`, so toggling `[settings.ui.stack_line]` may not re-layout tabbed columns until another invalidation | make the reserve part of the cache key; verify during the port |
+| **H7** | Expel from a tabbed column routes through `consume_or_expel_selection` → `move_selection`, which would hit the new `!tabbed` whole-move guard and move the group instead of expelling one tab | bypass with `detach`+`new_column`; `expel_from_tabbed_column_removes_only_selected` is the regression test |
+| **H8** | `move_focus` raises `visible_windows_under_selection` = the whole column → re-raises every occluded tab (flicker) | re-apply the tabbed raise filter in all three sites |
+| **H9** | A lazy `@ours` on the `rift.default.toml` stack-line hunk ships a **duplicate** `[settings.ui.mission_control]` table. The default config is `include_str!`'d and unwrapped → startup panic | `default_config_parses` catches it — if it survives H12 |
+| **H10** | Same file: a stale `width_presets` key after the field is dropped → `deny_unknown_fields` → startup panic | delete the key and its comment block with the field |
+| **H11** | `LayoutSettings` deriving `ConfigSchema` auto-exposes `external_bar_top/bottom` and `activate_on_focus` in the settings UI and its search, unlabeled | label them or `#[setting(ignore)]` — decide, don't drift |
+| **H12** | `types.rs` hunk 8 is our entire ~680-line `#[cfg(test)]` module against an **empty** upstream side (they moved tests to `config/tests.rs`). `@theirs` deletes `default_config_parses` and the `MoveFocusArgs` bare-form guards — the exact tests H9/H2 depend on | relocate into `config/tests.rs` **in the same merge commit** |
+
+### 12.7 Stage plan — nine checkpoints
+
+`git merge <sha>` in order, each gated on `cargo check --workspace --all-targets`
++ `just test` **before** its merge commit is finalized. Touched-file lists are
+measured per range against the 18 conflicted files; they are upper bounds.
+
+| Stage | Checkpoint | `#` | n | Conflict-prone files touched | The work |
+|---|---|---|---|---|---|
+| 1 | `0ddcf73` | 1–20 | 20 | scrolling, input, types, engine, managers, reactor, bin/rift, actor.rs, ui.rs, default.toml, Cargo×2, release.yml, stack_line | drag subsystem arrives (`dd4f3d9`) → delete `drag_swap.rs`; stackline colors (`c1612f6`) land **before** the native bar, so resolve them `@theirs` knowing they die in stage 8 |
+| 2 | `e21dae0` | 21–43 | 23 | scrolling, input, types, engine, reactor, bin/rift, default.toml, Cargo×2 | binding modes, per-display overrides, SkyLight titles, mouse warp; mostly free |
+| 3 | `b02bb33` | 44–47 | 4 | **mission_control**, scrolling, input, types, engine, managers, Info.plist | Mission Control rewrite → **retire feature F** (§12.5 item 5); state-ownership cleanups |
+| 4 | `6f78ad3` | 48–61 | 14 | **scrolling**, input, types, mission_control, engine, managers, build.rs | **the scrolling rewrite.** Heaviest stage. Feature D re-port (§12.5 item 2) + H1/H3/H6/H7/H8. Do not split this range |
+| 5 | `cf84836` | 62–85 | 24 | scrolling, input, types, engine, reactor, bin/rift, default.toml | scrolling follow-ups, cross-display move/focus, animations, crash fixes; D's port gets exercised |
+| 6 | `483b20f` | 86–96 | 11 | **types**, engine, managers, reactor, ui.rs, stack_line, Cargo×2 | **settings UI + config split + derive crate.** Heaviest structural stage. §12.5 item 3 + H2/H11/H12 |
+| 7 | `d5f3245` | 97–102 | 6 | bin/rift, reactor, Cargo×2 | settings-as-child-process, bsp fixes, gesture double-invert; cheap |
+| 8 | `51dca01` | 103–113 | 11 | **stack_line**, scrolling, input, types, engine, managers, ui.rs, default.toml | **native TabBar** → **retire feature C** + feature E re-homing (§12.5 item 1). Contains the `901103c`/`3ee0a28` revert pair — **must not be split** |
+| 9 | `250d992` | 114–132 | 19 | input, types, engine, managers, reactor, default.toml, release.yml | settings redesign, config-watcher rewrite, perf tail, 0.7.0, release workflow (§12.5 item 6) |
+
+Must-land-together: `901103c`+`3ee0a28` (stage 8); `b391d56`+`b2ded63` conceptually
+(stages 6/7 — the split is safe only because `b2ded63` just moves the UI into a
+child process and touches no fork file).
+
+### 12.8 Tooling this sync must fix
+
+1. **`just test`'s filters go stale at stage 8.** The recipe names `ui::stack_line`;
+   upstream deletes that module. A filter matching nothing is not an error to
+   libtest — the same silent failure §10.3 and §11.7 both found. Repoint or drop.
+2. **New test modules to classify** (the allowlist guard requires it, and it fires
+   on unknown modules): `common::config::tests` (stage 6),
+   `layout_engine::drop_preview_tests` (stage 4), `actor::gesture`, `actor::drag`,
+   `model::drag` (stages 1/4), `ui::settings::*` + `ui::settings::native_tests`
+   (stage 6).
+3. **`tests/settings_native.rs` is a `harness = false` AppKit `[[test]]`**, not a
+   bin. It self-skips without `--ignored`, and upstream's CI excludes it
+   (`89c907f`, `d9fce40`). Decide explicitly whether `just test-all` runs it;
+   `cargo test --lib` never compiles it.
+4. **`crates/rift-config-derive` has no test coverage in our recipes** — the same
+   `crates/` gap §11.7 item 3 opened. Extend `just test-crates`.
+5. **Automate the tripwire.** §12.10.
+
+### 12.9 Live verification checklist (after stage 9)
+
+Gates prove it compiles and the logic tests pass; only a desktop pass finds the
+rest. **§11.8's checklist was never run** — fold it into this one and run both.
+
+- **Tabbed columns after the port** — toggle, focus within the group (no flicker,
+  H8), expel one tab (H7), move the group horizontally vs extract from a plain
+  stack, then **restart rift** and confirm the group is still tabbed (H1).
+- **Tab bar during a camera animation** — new territory: `CameraSpring` moves
+  frames every presenter tick, and our bar previously tracked static
+  `calculate_layout` output. The native bar must track `presented_frames`.
+- **A fork-era config file** — start rift with a config carrying the old
+  `[settings.ui.stack_line]` color keys and confirm it parses (H2), then open the
+  settings UI, change one unrelated key, save, and diff the file: fork keys and
+  comments must survive byte-identical except the edited line.
+- **Settings window from inside the nix `.app`** — Cmd+, and the menu item; confirm
+  `current_exe()` resolves in the bundle, the child inherits TCC, and the Dock
+  presentation is acceptable (it sets `ActivationPolicy::Regular`).
+- **Feature B's activation attribution** — re-run §2.B's twelve-activation
+  procedure verbatim. Still no test covers it, and stage 5 moves the focus code
+  underneath it.
+- **Hint bar with `stack_line.enabled = false`** — chip click and workspace pill
+  (§11.8's H6, still unrun), plus `focus-column N` lighting the Nth key.
+- **Stack-line hover** (H4) and **mouse-button delivery** with the hint bar alone.
+- **Mission Control** with `enabled = true` **and** `window_previews = true` — the
+  only path that now raises the Screen Recording prompt.
+
+### 12.10 Why this backlog happened, and the rule that stops the next one
+
+§7's cadence rule — *sync on structural change, not on a calendar* — was correct and
+**unenforced**. The evidence is unambiguous:
+
+| | §11 (previous) | §12 (this) |
+|---|---|---|
+| commits behind | 77 | **132** |
+| conflict hunks | 13 | **68** |
+| upstream rewrites absorbed at once | 1 (input fold) | **4** |
+| fork features retired under pressure | 0 | 2 |
+| releases skipped | 1 | **7** |
+
+The first tripwire-worthy commit landed **four days** after §11 finished. Had we
+synced at stage 2's boundary (`e21dae0`, 2026-09-28, 43 commits), **three of the
+four rewrites did not yet exist** — the scrolling rewrite, the settings UI, and the
+native tab bar all land after it. The cost of this sync is not the 132 commits; it
+is that four independent rewrites must be absorbed in one pass, each one landing on
+a different fork feature.
+
+Three changes, in priority order. **Items 1 and 2 are LANDED** (2026-10-16, before
+the merge — they are what tells you when to run it); item 3 is still a habit.
+
+1. **Make the tripwire fire by itself — DONE.**
+   `.github/workflows/upstream-tripwire.yml` runs weekly (Mondays 06:00 UTC, plus
+   `workflow_dispatch`), adds the `upstream` remote, and runs the new
+   `just upstream-tripwire` recipe. On a hit it opens — or **edits in place** — a
+   single `upstream-sync`-labelled issue carrying the drift count and the tripwire
+   report; on a clear run it closes it. One rolling issue, never one per week: a
+   weekly duplicate trains everyone to ignore the label, which is the exact failure
+   being automated away. The job is guarded `github.repository != 'acsandmann/rift'`
+   — the inverse of the guards in `docs.yml`/`tag.yml` — because this is fork
+   maintenance and upstream has nothing to sync from.
+   The checks now live in **one** place: `upstream-tripwire` emits markdown and
+   exits 1 on a hit; `upstream-status` wraps it for humans. Do not fork the logic.
+
+   **Found while landing it: one of the three tripwires had never fired.** The
+   `calculate_layout`/`update_layout`/`create_layout` signature check was written as
+   `git log -p … | grep -qE …` under `set -o pipefail`. `grep -q` exits on first
+   match, `git log -p` takes SIGPIPE, and the pipeline returns **141** — so a real
+   match reported *no hit*. Against this backlog it should have flagged 6 hunk lines
+   (upstream's `StackLineReserve` parameter) and reported nothing instead. Fixed to
+   `grep -c` + a numeric test, which reads all input and cannot SIGPIPE. §12.1's
+   "all three fired" is true of the *code as fixed*; under the old recipe this sync
+   would have shown two. **Any tripwire that can only report "no" is worse than no
+   tripwire** — it launders silence into a clean bill of health.
+2. **Hard ceiling: never skip a second upstream minor release — DONE.** We went
+   0.6.2 → 0.7.0. Tags are upstream's own statement that something landed; two
+   minors behind means a rewrite has probably happened. Implemented in
+   `upstream-tripwire` as a `git describe --tags --abbrev=0` comparison on both
+   sides; it fires today (`0.5.9` vs `0.7.0`). Cheap, objective, needs no diff
+   reading.
+3. **Sync the probe, not just the branch.** The full-jump probe in a scratch
+   worktree (§12.0) cost one command and produced every number in this plan. Run it
+   **at tripwire time**, not at sync time: 18 files / 68 hunks measured early is a
+   decision input; measured late it is a post-mortem. Not automated — a mid-merge
+   worktree is a trap to leave lying around (someone will `git commit` in it), so
+   this stays a deliberate human step.
+
+One durable correction for `FORK.md`, independent of the merge: §2.B's claim of
+"zero occurrences of `activateWithOptions` upstream" is now textually **false** —
+`actor/menu_bar.rs:201` calls `activateWithOptions(ActivateAllWindows)` to foreground
+the settings child. Feature B is still fork-only *in substance* (nothing upstream
+foregrounds an app on a focus move), but the claim needs rewording to say so, or the
+next person re-verifying it will conclude we were superseded and delete the feature.
