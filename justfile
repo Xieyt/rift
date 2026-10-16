@@ -13,7 +13,7 @@ uid := `id -u`
 agent := "gui/" + uid + "/git.acsandmann.rift"
 app := "/Applications/Rift.app"
 # This machine's local code-signing identity — signs every locally-built app
-# that needs TCC grants to survive rebuilds (rift, hyperkey), not just rift.
+# that needs TCC grants to survive rebuilds (rift, xkeys), not just rift.
 # Must match `services.rift.signingIdentity` in xnix-config's fern.nix.
 signing_cert := "fern-codesign"
 sys_keychain := "/Library/Keychains/System.keychain"
@@ -342,23 +342,22 @@ setup-signing-cert:
     echo "  the Accessibility grant persists across future rebuilds."
 
 # restart the running WM (picks up a freshly-installed binary)
+#
+# Nothing else to restart. This used to reload the hyperkey agent too, because
+# both apps put an event tap at the same stage and the most recently created
+# one sat in front — so rift restarting pushed hyperkey's modifier injection
+# behind it and every `hyper + X` binding stopped matching. That is gone:
+# Left Command is swapped to F20 by the HID driver, below every tap, so rift
+# sees it no matter who started when. Reloading that agent now does nothing
+# but relaunch a retired app, which overwrites the whole hidutil swap list.
 restart:
     launchctl kickstart -k {{agent}}
-    # Reload hyperkey launch agent afterward: both it and rift install
-    # HeadInsertEventTap taps at kCGHIDEventTap, so whichever tap was
-    # (re)created most recently wins the front of the chain. Rift's tap
-    # just moved to the front; put Hyperkey's back in front so it keeps
-    # transforming CapsLock into hyper modifiers before rift sees the key.
-    launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
-    launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
 
 # stop / start the WM agent
 stop:
     launchctl bootout {{agent}} || true
 start:
     launchctl bootstrap gui/{{uid}} ~/Library/LaunchAgents/git.acsandmann.rift.plist || launchctl kickstart {{agent}}
-    launchctl unload ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
-    launchctl load ~/Library/LaunchAgents/com.user.hyperkey-restart.plist 2>/dev/null || true
 
 # is it running, and which binary?
 status:

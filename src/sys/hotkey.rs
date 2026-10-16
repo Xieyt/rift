@@ -13,7 +13,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
-pub struct Modifiers(u8);
+pub struct Modifiers(u16);
 
 impl Modifiers {
     pub const ALT: Modifiers = Modifiers(0b0011_0000);
@@ -30,6 +30,10 @@ impl Modifiers {
     // Specific left/right modifier bits
     pub const SHIFT_LEFT: Modifiers = Modifiers(0b0000_0001);
     pub const SHIFT_RIGHT: Modifiers = Modifiers(0b0000_0010);
+    // Hyper has no device-dependent left/right distinction: it is a single
+    // software modifier synthesised from a remapped physical key (F20), not
+    // a member of any ModFamily/MOD_FAMILIES pair.
+    pub const HYPER: Modifiers = Modifiers(0b1_0000_0000);
 
     pub fn empty() -> Self { Modifiers(0) }
 
@@ -46,7 +50,11 @@ impl Modifiers {
     }
 
     pub fn expand_to_specific(&self) -> Vec<Modifiers> {
-        let mut variants = vec![Modifiers::empty()];
+        // Bits that belong to no ModFamily (currently just HYPER) are never
+        // OR'd in by the loop below; seed the base variant with them so they
+        // are not silently dropped from every expanded variant.
+        let family_bits: u16 = MOD_FAMILIES.iter().fold(0u16, |acc, m| acc | m.left.0 | m.right.0);
+        let mut variants = vec![Modifiers(self.0 & !family_bits)];
 
         for m in MOD_FAMILIES {
             let has_generic = self.contains(m.generic);
@@ -99,6 +107,10 @@ impl Modifiers {
 impl fmt::Display for Modifiers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts: Vec<&str> = Vec::new();
+
+        if self.contains(Modifiers::HYPER) {
+            parts.push("Hyper");
+        }
 
         for m in MOD_FAMILIES {
             let l = self.contains(m.left);
@@ -238,6 +250,11 @@ fn split_side(token: &str) -> (Option<Side>, &str) {
 
 fn modifier_from_token(token: &str) -> Option<Modifiers> {
     let t = normalize_token(token);
+    if t == "hyper" {
+        // No left/right distinction: Hyper is a single software modifier,
+        // never a MOD_FAMILIES pair, so it bypasses split_side entirely.
+        return Some(Modifiers::HYPER);
+    }
     let (side, base) = split_side(&t);
     let family = match base {
         "alt" | "option" => &MOD_FAMILIES[1],
@@ -1397,12 +1414,25 @@ mod tests {
             "Alt + P",
             "Alt + Shift + J",
             "Ctrl + Alt + Backspace",
+            "Hyper + H",
+            "Hyper + Shift + L",
         ] {
             let hotkey = Hotkey::from_str(spec).expect("config spec should parse");
             let reparsed =
                 Hotkey::from_str(&hotkey.to_string()).expect("spec string should parse back");
             assert_eq!(hotkey, reparsed, "{spec} did not survive the round trip");
         }
+    }
+
+    #[test]
+    fn hyper_bit_survives_expansion() {
+        // expand_to_specific starts from Modifiers::empty() and only OR's in
+        // bits recognised by MOD_FAMILIES; HYPER belongs to no family and
+        // was previously dropped here, silently disabling every Hyper binding.
+        let hotkey = Hotkey::from_str("Hyper + H").unwrap();
+        let variants = hotkey.modifiers.expand_to_specific();
+        assert_eq!(variants.len(), 1, "Hyper has no left/right split: {variants:?}");
+        assert!(variants[0].contains(Modifiers::HYPER));
     }
 
     #[test]

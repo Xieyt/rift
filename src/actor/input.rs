@@ -80,6 +80,7 @@ pub struct Input {
     mode_indices: RefCell<HashMap<String, usize>>,
     active_mode: Cell<usize>,
     hotkeys_active: Cell<bool>,
+    hyper_held: Cell<bool>,
     wm_sender: wm_controller::Sender,
     mission_control_tx: RefCell<Option<super::mission_control::Sender>>,
     hints_bar_tx: hints_bar::Sender,
@@ -185,7 +186,9 @@ impl Input {
             // start/stop is frequent enough that rebuilding the WindowServer
             // tap costs more than filtering these releases in the callback.
             state.event_processing_enabled,
-            keyed_disable,
+            // Hyper (F20) release must always reach the tap, or the
+            // synthesised modifier jams on after the first press.
+            keyed_disable || hotkeys_enabled,
         );
         if self.mission_control_active.get() {
             mask |= (1u64 << CGEventType::LeftMouseDown.0)
@@ -262,6 +265,7 @@ impl Input {
         }
 
         self.reset_gestures();
+        self.hyper_held.set(false);
         self.tap.borrow_mut().take();
         if next_mask == 0 {
             self.event_mask.set(0);
@@ -343,6 +347,7 @@ impl Input {
             mode_indices: RefCell::new(HashMap::default()),
             active_mode: Cell::new(0),
             hotkeys_active: Cell::new(false),
+            hyper_held: Cell::new(false),
             wm_sender,
             mission_control_tx: RefCell::new(mission_control_tx),
             hints_bar_tx,
@@ -658,6 +663,7 @@ impl Input {
     fn reconcile_after_tap_reenabled(&self) {
         let mut state = self.state.borrow_mut();
         self.reset_gestures();
+        self.hyper_held.set(false);
         if state.captured_button.take().is_some() {
             self.events_tx.send(Event::DragCancel);
         }
@@ -953,6 +959,29 @@ impl Input {
         event: &CGEvent,
         state: &mut State,
     ) -> bool {
+        // F20 is Left Command remapped by a driver-level hidutil rule, so it
+        // arrives here as an ordinary KeyDown/KeyUp rather than FlagsChanged.
+        // Track it as a held software modifier (Hyper) and never let a real
+        // F20 press/release reach an app, before any normal hotkey matching.
+        if matches!(event_type, CGEventType::KeyDown | CGEventType::KeyUp)
+            && key_code_from_event(event) == Some(KeyCode::F20)
+        {
+            if event_type == CGEventType::KeyUp {
+                self.hyper_held.set(false);
+            } else {
+                // A held key emits repeated KeyDowns; reuse the hotkey
+                // repeat-suppression signal below so the flag is set once.
+                let is_repeat = CGEvent::integer_value_field(
+                    Some(event),
+                    CGEventField::KeyboardEventAutorepeat,
+                ) != 0;
+                if !is_repeat {
+                    self.hyper_held.set(true);
+                }
+            }
+            return false;
+        }
+
         let key_code_opt = key_code_from_event(event);
 
         // FlagsChanged must be interpreted using the flags from this event,
@@ -981,12 +1010,23 @@ impl Input {
 
         if event_type == CGEventType::KeyDown {
             if let Some(key_code) = key_code_opt {
-                let hotkey = Hotkey::new(
-                    modifiers_from_flags_with_keys(state.current_flags, &state.pressed_keys),
-                    key_code,
-                );
+                let mut modifiers =
+                    modifiers_from_flags_with_keys(state.current_flags, &state.pressed_keys);
+                if self.hyper_held.get() {
+                    modifiers.insert(Modifiers::HYPER);
+                }
+                let hotkey = Hotkey::new(modifiers, key_code);
                 let active_mode = self.active_mode.get();
                 let bindings = self.hotkeys.borrow();
+                // TEMPORARY sync-debug probe — remove before committing.
+                tracing::trace!(
+                    ?hotkey,
+                    mode = active_mode,
+                    modes = bindings.len(),
+                    binds_in_mode = bindings.get(active_mode).map(|m| m.len()).unwrap_or(0),
+                    matched = bindings.get(active_mode).is_some_and(|m| m.contains_key(&hotkey)),
+                    "KEYPROBE"
+                );
                 if let Some(commands) = bindings.get(active_mode).and_then(|map| map.get(&hotkey)) {
                     // A held key generates repeated KeyDown events. Hotkeys
                     // are press-triggered, so dispatching those repeats can
