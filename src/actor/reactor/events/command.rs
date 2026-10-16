@@ -92,9 +92,7 @@ pub fn handle_command_layout(
     } else {
         None
     };
-    if is_workspace_switch {
-        workspace_switch.start_workspace_switch(WorkspaceSwitchOrigin::Manual);
-    } else {
+    if !is_workspace_switch {
         workspace_switch.mark_workspace_switch_inactive();
     }
 
@@ -142,14 +140,28 @@ pub fn handle_command_layout(
     };
 
     if is_virtual_workspace_command && !response.changed {
+        if is_workspace_switch {
+            workspace_switch.mark_workspace_switch_inactive();
+            workspace_switch.active_workspace_switch = None;
+        }
         return Ok(EventOutcome::no_change());
     }
 
-    let selection_changed = is_selection_command && response.changed;
+    // Only begin the switch lifecycle once a real transition has been produced.
+    if is_workspace_switch {
+        workspace_switch.start_workspace_switch(WorkspaceSwitchOrigin::Manual);
+    }
+
+    let response_changed = response.changed;
+    let selection_changed = is_selection_command && response_changed;
     let arrange_space_scope = is_workspace_switch.then_some(workspace_space).flatten();
-    let mut outcome = EventOutcome::layout_changed(false)
-        .with_layout_response(response, workspace_space)
-        .with_arrange_space_scope(arrange_space_scope);
+    let mut outcome = if response_changed {
+        EventOutcome::layout_changed(false)
+    } else {
+        EventOutcome::no_change()
+    }
+    .with_layout_response(response, workspace_space)
+    .with_arrange_space_scope(arrange_space_scope);
     outcome.broadcast_selection_changed = selection_changed;
     if is_move_node && let Some(window) = post_arrange_mouse_warp {
         outcome.post_arrange_mouse_warp = Some(window);

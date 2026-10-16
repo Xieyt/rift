@@ -118,6 +118,8 @@ enum QueryCommands {
 
 #[derive(Subcommand)]
 enum ExecuteCommands {
+    /// Switch to a configured binding mode (use default to reset)
+    BindingMode { mode: String },
     /// Window management commands
     Window {
         #[command(subcommand)]
@@ -352,6 +354,11 @@ enum LayoutCommands {
     ScrollStrip { delta: f64 },
     /// Snap the strip to the nearest column boundary (scrolling layout only)
     SnapStrip,
+    /// Switch to the next preset column width (scrolling layout only).
+    SwitchPresetColumnWidth {
+        #[arg(long)]
+        backwards: bool,
+    },
     /// Toggle centering of the selected column in scrolling layout.
     /// If invoked again on the same selection, centering is removed.
     CenterSelection,
@@ -686,6 +693,9 @@ fn build_subscribe_request(sub: SubscribeCommands) -> Result<RiftRequest, String
 
 fn build_execute_request(execute: ExecuteCommands) -> Result<RiftRequest, String> {
     let rift_command = match execute {
+        ExecuteCommands::BindingMode { mode } => CliCommand::Reactor(reactor::Command::Reactor(
+            reactor::ReactorCommand::BindingMode(mode),
+        )),
         ExecuteCommands::Window { window_cmd } => map_window_command(window_cmd)?,
         ExecuteCommands::Workspace { workspace_cmd } => map_workspace_command(workspace_cmd)?,
         ExecuteCommands::Layout { layout_cmd } => map_layout_command(layout_cmd)?,
@@ -1016,6 +1026,9 @@ fn map_layout_command(cmd: LayoutCommands) -> Result<CliCommand, String> {
         LayoutCommands::SnapStrip => {
             Ok(CliCommand::Reactor(reactor::Command::Layout(LC::SnapStrip)))
         }
+        LayoutCommands::SwitchPresetColumnWidth { backwards } => Ok(CliCommand::Reactor(
+            reactor::Command::Layout(LC::SwitchPresetColumnWidth { backwards }),
+        )),
         LayoutCommands::CenterSelection => Ok(CliCommand::Reactor(reactor::Command::Layout(
             LC::CenterSelection,
         ))),

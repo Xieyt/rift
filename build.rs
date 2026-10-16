@@ -23,33 +23,32 @@ fn main() {
     println!("cargo:rerun-if-changed=assets");
     println!("cargo:rerun-if-changed=crates");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
-    // A hermetic build has no git: nix/crane copies the source into the store
-    // without `.git`, so every `git()` below fails and the stamp degrades to
-    // `<version>+unknown.dirty` — which reads as a dirty working tree when it is
-    // the opposite. `RIFT_VERSION_OVERRIDE` lets the packaging pass the real
-    // identity in (see nix/package.nix).
-    println!("cargo:rerun-if-env-changed=RIFT_VERSION_OVERRIDE");
-    let display_version = if let Ok(override_version) = std::env::var("RIFT_VERSION_OVERRIDE") {
-        override_version
-    } else {
-        let release_tag = format!("v{version}");
-        let tagged = git(&["tag", "--points-at", "HEAD"])
-            .is_some_and(|tags| tags.lines().any(|tag| tag == release_tag || tag == version));
-        let dirty = git(&["diff", "HEAD", "--quiet"]).is_none();
-        if tagged && !dirty {
+
+    let release_tag = format!("v{version}");
+    let tagged = git(&["tag", "--points-at", "HEAD"])
+        .is_some_and(|tags| tags.lines().any(|tag| tag == release_tag || tag == version));
+    let dirty = git(&["diff", "HEAD", "--quiet"]).is_none();
+    let display_version =
+        if (tagged && !dirty) || git(&["rev-parse", "--is-inside-work-tree"]).is_none() {
             version
         } else {
-            let commit =
-                git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
-            format!("{version}+{commit}{}", if dirty { ".dirty" } else { "" })
-        }
-    };
+            let release_tag = format!("v{version}");
+            let tagged = git(&["tag", "--points-at", "HEAD"])
+                .is_some_and(|tags| tags.lines().any(|tag| tag == release_tag || tag == version));
+            let dirty = git(&["diff", "HEAD", "--quiet"]).is_none();
+            if tagged && !dirty {
+                version
+            } else {
+                let commit =
+                    git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".into());
+                format!("{version}+{commit}{}", if dirty { ".dirty" } else { "" })
+            }
+        };
     println!("cargo:rustc-env=RIFT_VERSION={display_version}");
     println!("cargo:rustc-link-search=framework=/System/Library/PrivateFrameworks");
 
     println!("cargo:rustc-link-lib=framework=SkyLight");
     println!("cargo:rustc-link-lib=framework=CoreFoundation");
-    println!("cargo:rustc-link-lib=framework=CoreVideo");
     println!("cargo:rustc-link-lib=framework=IOKit");
     println!("cargo:rustc-link-lib=framework=MultitouchSupport");
     println!("cargo:rustc-link-lib=framework=Carbon");

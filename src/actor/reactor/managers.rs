@@ -49,6 +49,7 @@ pub struct DragManager {
     pub(super) preview: Option<crate::ui::drag_preview::DragPreview>,
     pub(super) preview_enabled: bool,
     pub(super) preview_suppressed: bool,
+    pub(super) haptics_enabled: bool,
 }
 
 impl DragManager {
@@ -72,6 +73,7 @@ impl DragManager {
     }
 
     pub fn update_config(&mut self, config: DragDropSettings) {
+        self.haptics_enabled = config.haptics_enabled;
         self.actor.update_config(config);
         self.preview_enabled = config.enabled && config.preview;
         if !config.enabled || !config.preview {
@@ -218,7 +220,7 @@ pub struct LayoutManager {
 
 pub type LayoutResult = Vec<(SpaceId, Vec<(WindowId, CGRect)>)>;
 
-fn bound_frame_to_screen(frame: CGRect, screen: CGRect) -> CGRect {
+pub(super) fn bound_frame_to_screen(frame: CGRect, screen: CGRect) -> CGRect {
     const WINDOW_HIDDEN_THRESHOLD: f64 = 10.0;
 
     let screen_left = screen.origin.x;

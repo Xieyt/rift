@@ -6,6 +6,7 @@ use crate::actor::{reactor, wm_controller};
 
 fn make_screen(space: Option<SpaceId>) -> ScreenInfo {
     ScreenInfo {
+        backing_scale: 1.0,
         id: crate::sys::screen::ScreenId::new(1),
         frame: CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(1000.0, 800.0)),
         display_uuid: "display-1".to_string(),
@@ -22,6 +23,7 @@ fn make_screen_with(
     space: Option<SpaceId>,
 ) -> ScreenInfo {
     ScreenInfo {
+        backing_scale: 1.0,
         id: crate::sys::screen::ScreenId::new(screen_id),
         frame: CGRect::new(CGPoint::new(origin_x, 0.0), CGSize::new(width, 800.0)),
         display_uuid: display_uuid.to_string(),
@@ -1228,6 +1230,65 @@ fn fullscreen_transition_rewrites_cross_display_space_contamination_only() {
     let (state, _) = recv_snapshot(&mut wm_rx);
     let spaces: Vec<Option<SpaceId>> = state.screens.iter().map(|screen| screen.space).collect();
     assert_eq!(spaces, vec![Some(left_space), None]);
+}
+
+fn assert_display_churn_defers_until_resume(quarantine: Event, resume: Event) {
+    let (mut actor, mut wm_rx, _reactor_rx) = build_actor();
+    let space = SpaceId::new(601);
+    actor.state.screens = vec![make_screen(Some(space))];
+
+    actor.handle_event(quarantine);
+    actor.handle_event(Event::DisplayChurnBegin);
+    let epoch = actor.state.display_churn_epoch;
+    actor.attempt_finish_display_churn(epoch, 0);
+    actor.attempt_finish_display_churn(epoch, 1);
+
+    assert_no_wm_event(&mut wm_rx);
+    assert!(actor.state.display_churn_active);
+    assert_eq!(actor.state.display_churn_epoch, epoch);
+    assert!(actor.state.display_topology_state.is_none());
+
+    actor.handle_event(resume);
+    actor.attempt_finish_display_churn(epoch, 0);
+    assert_no_wm_event(&mut wm_rx);
+    assert!(actor.state.display_churn_active);
+    actor.attempt_finish_display_churn(epoch, 1);
+
+    let (state, _) = recv_snapshot(&mut wm_rx);
+    assert!(state.authoritative);
+    assert_eq!(state.screens[0].space, Some(space));
+    assert!(!actor.state.display_churn_active);
+}
+
+#[test]
+fn display_churn_stabilization_defers_while_sleeping() {
+    assert_display_churn_defers_until_resume(Event::SystemWillSleep, Event::SystemDidWake);
+}
+
+#[test]
+fn display_churn_stabilization_defers_while_session_inactive() {
+    assert_display_churn_defers_until_resume(
+        Event::SessionDidResignActive,
+        Event::SessionDidBecomeActive,
+    );
+}
+
+#[test]
+fn display_churn_stabilization_exhaustion_does_not_commit_while_sleeping() {
+    let (mut actor, mut wm_rx, _reactor_rx) = build_actor();
+    actor.state.screens = vec![make_screen(Some(SpaceId::new(601)))];
+    actor.handle_event(Event::SystemWillSleep);
+    actor.handle_event(Event::DisplayChurnBegin);
+    let epoch = actor.state.display_churn_epoch;
+
+    for attempt in 0..=DISPLAY_STABILIZE_MAX_ATTEMPTS {
+        actor.attempt_finish_display_churn(epoch, attempt);
+    }
+
+    assert_no_wm_event(&mut wm_rx);
+    assert!(actor.state.display_churn_active);
+    assert_eq!(actor.state.display_churn_epoch, epoch);
+    assert!(actor.state.display_topology_state.is_none());
 }
 
 #[test]

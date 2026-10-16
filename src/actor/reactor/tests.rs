@@ -56,6 +56,72 @@ fn event_outcome_execution_keeps_phase_order() {
 }
 
 #[test]
+fn no_op_layout_command_does_not_schedule_arrange() {
+    let mut reactor = test_reactor();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+
+    let outcome = reactor.dispatch_test_layout_command(LayoutCommand::MoveFocus(MoveFocusArgs {
+        direction: Direction::Left,
+        activate: false,
+    }));
+
+    assert_eq!(outcome.arrange.passes, 0);
+    assert_eq!(outcome.layout_responses.len(), 1);
+}
+
+#[test]
+fn inventory_does_not_replace_geometry_owned_by_pending_rift_transaction() {
+    let (mut reactor, wid, wsid, _, _, frame) = reactor_with_window_on_space1();
+    reactor.discover_test_windows(
+        wid.pid,
+        vec![(wid, make_window_info(frame, Some(wsid), "Window", None))],
+        vec![wid],
+    );
+    let layout_updates = reactor.layout_update_count;
+
+    let mut target = frame;
+    target.origin.x = 200.0;
+    let txid = reactor.transaction_manager.generate_next_txid(wsid);
+    reactor.transaction_manager.store_txid(wsid, txid, target);
+
+    let mut parked = frame;
+    parked.origin.x += frame.size.width;
+    reactor.discover_test_windows(
+        wid.pid,
+        vec![(wid, make_window_info(parked, Some(wsid), "Window", None))],
+        vec![wid],
+    );
+
+    assert!(
+        reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(frame),
+        "inventory must not feed a transient Rift-owned frame back into model geometry"
+    );
+    assert_eq!(reactor.transaction_manager.get_target_frame(wsid), Some(target));
+    assert_eq!(
+        reactor.layout_update_count, layout_updates,
+        "a passive inventory refresh must not schedule another arrange"
+    );
+
+    reactor.transaction_manager.clear_target_for_window(wsid);
+    reactor.discover_test_windows(
+        wid.pid,
+        vec![(wid, make_window_info(parked, Some(wsid), "Window", None))],
+        vec![wid],
+    );
+    assert!(
+        reactor.state.windows.window(wid).unwrap().frame_monotonic.same_as(parked),
+        "inventory geometry must become authoritative again after Rift releases the target"
+    );
+    assert_eq!(
+        reactor.layout_update_count,
+        layout_updates + 1,
+        "an authoritative inventory geometry change must still arrange once"
+    );
+}
+
+#[test]
 fn layout_query_exposes_active_and_inactive_workspace_container_trees() {
     let mut reactor = test_reactor();
     let space = SpaceId::new(1);
@@ -1647,6 +1713,29 @@ fn unmanageable_window_crossing_spaces_is_not_reinserted_into_layout() {
 }
 
 #[test]
+fn deminiaturize_refreshes_stale_snapshot_without_activation() {
+    let (mut reactor, wid, _wsid, space, _other, frame) = reactor_with_window_on_space1();
+    reactor.send_layout_event(LayoutEvent::WindowAdded(space, wid));
+    reactor.handle_event(Event::WindowMinimized(wid));
+    let mut restored_info = reactor.state.windows.window(wid).unwrap().info.clone();
+    restored_info.is_minimized = false;
+    // Some apps expose a nonstandard AX snapshot while minimized.
+    reactor.state.windows.window_mut(wid).unwrap().info.is_standard = false;
+
+    let outcome = reactor.dispatch_workflow(Event::WindowDeminiaturized(wid)).unwrap();
+    assert!(outcome.window_inventory_requests.contains(&wid.pid));
+    reactor.apply_event_outcome(outcome);
+    reactor.on_windows_discovered_with_app_info(
+        wid.pid,
+        vec![(wid, restored_info)],
+        vec![wid],
+        None,
+    );
+    assert!(has_window_in_layout(&mut reactor, space, frame, wid));
+    assert_eq!(reactor.assigned_space_for_window_id(wid), Some(space));
+}
+
+#[test]
 fn duplicate_minimize_deminimize_and_unknown_window_events_do_not_arrange() {
     let (mut reactor, wid, _wsid, _space1, _space2, _frame) = reactor_with_window_on_space1();
 
@@ -2803,7 +2892,7 @@ fn workspace_switch_batches_all_window_positions_with_eui_enabled() {
         requests.iter().any(|req| {
             matches!(
                 req,
-                Request::SetWorkspaceSwitchPositions(positions, _, true)
+                Request::SetWindowFrames(positions, _, crate::actor::app::FrameMode::Position, true)
                     if positions.iter().any(|(wid, _)| *wid == WindowId::new(1, 1))
             )
         }),
@@ -2833,15 +2922,16 @@ fn non_workspace_instant_layout_keeps_full_frame_batch() {
     assert!(
         requests.iter().any(|request| matches!(
             request,
-            Request::SetBatchWindowFrame(frames, _, true)
+            Request::SetWindowFrames(frames, _, crate::actor::app::FrameMode::Full, true)
                 if frames.as_slice() == [(wid, target)]
         )),
         "ordinary instant layouts must retain full-frame writes: {requests:?}"
     );
     assert!(
-        requests
-            .iter()
-            .all(|request| !matches!(request, Request::SetWorkspaceSwitchPositions(..))),
+        requests.iter().all(|request| !matches!(
+            request,
+            Request::SetWindowFrames(_, _, crate::actor::app::FrameMode::Position, _)
+        )),
         "the workspace-switch-only request escaped into an ordinary instant layout: {requests:?}"
     );
 }
@@ -2868,15 +2958,16 @@ fn workspace_switch_layout_falls_back_to_full_frames_for_size_changes() {
     assert!(
         requests.iter().any(|request| matches!(
             request,
-            Request::SetBatchWindowFrame(frames, _, true)
+            Request::SetWindowFrames(frames, _, crate::actor::app::FrameMode::Full, true)
                 if frames.as_slice() == [(wid, target)]
         )),
         "workspace layouts with size changes must retain full-frame writes: {requests:?}"
     );
     assert!(
-        requests
-            .iter()
-            .all(|request| !matches!(request, Request::SetWorkspaceSwitchPositions(..))),
+        requests.iter().all(|request| !matches!(
+            request,
+            Request::SetWindowFrames(_, _, crate::actor::app::FrameMode::Position, _)
+        )),
         "a size-changing workspace layout must not use position-only writes: {requests:?}"
     );
 }
@@ -2946,14 +3037,72 @@ fn topology_change_clears_stale_pending_hide_target_before_next_workspace_layout
     assert!(
         requests.iter().any(|req| {
             matches!(req,
-                Request::SetWindowFrame(req_wid, frame, _, true)
-                    if *req_wid == wid && frame.same_as(hidden_target)
-            ) || matches!(req,
-                Request::SetBatchWindowFrame(frames, _, true)
+                Request::SetWindowFrames(frames, _, crate::actor::app::FrameMode::Full, true)
                     if frames.iter().any(|(req_wid, frame)| *req_wid == wid && frame.same_as(hidden_target))
             )
         }),
         "topology invalidation must resend the hidden-window frame write instead of treating the stale target as still pending: {requests:?}"
+    );
+}
+
+#[test]
+fn pending_removal_refocus_during_auto_switch_uses_workspace_selection() {
+    let (mut apps, mut reactor) = test_context();
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(
+        vec![CGRect::new(CGPoint::ZERO, CGSize::new(1000.0, 1000.0))],
+        vec![Some(space)],
+    ));
+    apps.make_app_and_settle(&mut reactor, 1, make_windows(1));
+    let window = WindowId::new(1, 1);
+    reactor.send_layout_event(LayoutEvent::WindowFocused(space, window));
+    let (raise_tx, mut raise_rx) = actor::channel();
+    reactor.communication_manager.raise_manager_tx = raise_tx;
+    reactor.refocus_manager.refocus_state = RefocusState::Pending(space);
+    reactor
+        .workspace_switch_manager
+        .start_workspace_switch(WorkspaceSwitchOrigin::Auto);
+
+    reactor.handle_layout_response(layout::EventResponse::default(), None);
+
+    let (_, request) = raise_rx.try_recv().expect("pending removal must refocus the survivor");
+    let raise_manager::Event::RaiseRequest(request) = request else {
+        panic!("expected focus request")
+    };
+    assert_eq!(request.focus_window.map(|(wid, _)| wid), Some(window));
+    assert!(raise_rx.try_recv().is_err());
+}
+
+#[test]
+fn empty_layout_response_during_auto_switch_does_not_refocus_cursor() {
+    let mut reactor = test_reactor();
+    let space = SpaceId::new(1);
+    reactor.handle_event(space_state_event(
+        vec![CGRect::new(CGPoint::ZERO, CGSize::new(1000.0, 1000.0))],
+        vec![Some(space)],
+    ));
+    let (input_tx, mut input_rx) = actor::channel();
+    let (raise_tx, mut raise_rx) = actor::channel();
+    reactor.communication_manager.input_tx = Some(input_tx);
+    reactor.communication_manager.raise_manager_tx = raise_tx;
+    reactor.config.settings.mouse_follows_focus = true;
+    reactor
+        .workspace_switch_manager
+        .start_workspace_switch(WorkspaceSwitchOrigin::Auto);
+
+    reactor.handle_layout_response(layout::EventResponse::default(), None);
+
+    assert!(
+        input_rx.try_recv().is_err(),
+        "an observational response must not warp the cursor"
+    );
+    assert!(
+        raise_rx.try_recv().is_err(),
+        "an observational response must not steal focus"
+    );
+    assert_eq!(
+        reactor.workspace_switch_manager.workspace_switch_state,
+        WorkspaceSwitchState::Active
     );
 }
 
@@ -3038,13 +3187,8 @@ fn auto_workspace_switch_follows_activated_window_when_same_app_is_visible_elsew
     let requests = apps.requests();
     assert!(
         requests.iter().any(|request| match request {
-            Request::SetWindowFrame(wid, _, _, _) => *wid == activated,
-            Request::SetBatchWindowFrame(frames, _, _) => {
-                frames.iter().any(|(wid, _)| *wid == activated)
-            }
-            Request::SetWorkspaceSwitchPositions(positions, _, _) => {
-                positions.iter().any(|(wid, _)| *wid == activated)
-            }
+            Request::SetWindowFrames(frames, _, _, _) =>
+                frames.iter().any(|(wid, _)| *wid == activated),
             _ => false,
         }),
         "auto workspace switch should arrange the activated window immediately: {requests:?}"
@@ -3717,6 +3861,40 @@ fn workspace_query_exposes_scrolling_order_for_inactive_workspace() {
 }
 
 #[test]
+fn windows_query_exposes_scrolling_order() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let w1 = WindowId::new(1, 1);
+    let w2 = WindowId::new(1, 2);
+    let w3 = WindowId::new(1, 3);
+
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(3));
+    reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+        workspace: None,
+        mode: LayoutMode::Scrolling,
+    });
+    apps.simulate_until_quiet(&mut reactor);
+
+    // Moving the selected window left changes scroll order without changing the
+    // membership order the window store reports.
+    reactor.handle_test_layout_command(LayoutCommand::MoveNode(Direction::Left));
+    apps.simulate_until_quiet(&mut reactor);
+
+    let queried = reactor.query_windows(Some(space));
+    assert_eq!(queried.iter().map(|window| window.id).collect::<Vec<_>>(), vec![
+        w1, w3, w2
+    ]);
+    assert_eq!(
+        queried
+            .iter()
+            .map(|window| window.layout_position.map(|position| (position.column, position.row)))
+            .collect::<Vec<_>>(),
+        vec![Some((0, 0)), Some((1, 0)), Some((2, 0))]
+    );
+}
+
+#[test]
 fn it_preserves_layout_after_login_screen() {
     // TODO: This would be better tested with a more complete simulation.
     let (mut apps, mut reactor) = test_context();
@@ -4232,6 +4410,81 @@ fn it_retains_windows_without_server_ids_after_login_visibility_failure() {
 }
 
 #[test]
+fn changed_layout_retargets_window_already_at_new_position_during_animation() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1512., 982.));
+    let space = SpaceId::new(1);
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(2));
+    apps.requests();
+    let (tx, rx) = super::animation::AnimationSender::channel();
+    reactor.animation_tx = Some(tx);
+    reactor.config.settings.animate = true;
+    let mut manager = super::animation::AnimationManager::new();
+    let left = WindowId::new(1, 1);
+    let right = WindowId::new(1, 2);
+    let frame = |x| CGRect::new(CGPoint::new(x, 38.), CGSize::new(1284., 944.));
+
+    assert!(super::animation::AnimationManager::animate_layout(
+        &mut reactor,
+        space,
+        &[(left, frame(228.)), (right, frame(1284.))],
+        false,
+        None,
+    ));
+    manager.handle_message(rx.commands.try_recv().unwrap());
+    let wsid = reactor.state.windows.window(right).unwrap().info.sys_id.unwrap();
+    let txid = reactor.transaction_manager.get_last_sent_txid(wsid);
+    // An intermediate AX frame can coincide with the next layout's target.
+    reactor.handle_event(Event::WindowFrameChanged(
+        right,
+        frame(228.),
+        Some(txid),
+        Requested(true),
+        Some(MouseState::Up),
+    ));
+    assert!(
+        reactor
+            .state
+            .windows
+            .window(right)
+            .unwrap()
+            .frame_monotonic
+            .same_as(frame(228.))
+    );
+    assert!(super::animation::AnimationManager::animate_layout(
+        &mut reactor,
+        space,
+        &[(left, frame(-1056.)), (right, frame(228.))],
+        false,
+        None,
+    ));
+    manager.handle_message(rx.commands.try_recv().unwrap());
+    apps.requests();
+    manager.tick_at(std::time::Instant::now() + std::time::Duration::from_secs(1));
+    let final_frame = apps
+        .requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            Request::InteractiveFramesPending(queue) => {
+                let mut target = None;
+                queue.drain_with(|wid, frame, _, _, _, _| {
+                    if wid == right {
+                        target = Some(frame);
+                    }
+                });
+                target
+            }
+            _ => None,
+        })
+        .last()
+        .expect("right window animation must finish");
+    assert!(
+        final_frame.same_as(frame(228.)),
+        "stale animation left a gap: {final_frame:?}"
+    );
+}
+
+#[test]
 fn animated_layout_handles_windows_without_server_ids() {
     let (mut apps, mut reactor) = test_context();
     let space = SpaceId::new(1);
@@ -4264,10 +4517,7 @@ fn animated_layout_handles_windows_without_server_ids() {
 
     let requests = apps.requests();
     assert!(
-        requests.iter().any(|request| matches!(
-            request,
-            Request::SetWindowFrame(..) | Request::SetBatchWindowFrame(..)
-        )),
+        requests.iter().any(|request| matches!(request, Request::SetWindowFrames(..))),
         "expected layout to still request a frame update without a server id: {requests:?}"
     );
 }
@@ -4312,8 +4562,7 @@ fn moving_tiled_window_to_display_applies_destination_layout_after_transfer_fram
         .requests()
         .into_iter()
         .flat_map(|request| match request {
-            Request::SetWindowFrame(wid, frame, _, _) if wid == moved => vec![frame],
-            Request::SetBatchWindowFrame(frames, _, _) => frames
+            Request::SetWindowFrames(frames, _, _, _) => frames
                 .into_iter()
                 .filter_map(|(wid, frame)| (wid == moved).then_some(frame))
                 .collect(),
@@ -4713,6 +4962,7 @@ fn fullscreen_space_in_screen_params_does_not_trigger_topology_relayout() {
     let display_uuid = "11111111-1111-1111-1111-111111111111".to_string();
     let screens_for = |space: SpaceId| -> Vec<ScreenInfo> {
         vec![ScreenInfo {
+            backing_scale: 1.0,
             id: crate::sys::screen::ScreenId::new(0),
             frame,
             space: Some(space),
@@ -4834,6 +5084,7 @@ fn fullscreen_screen_params_preserves_window_layout() {
     // with the fullscreen space id.
     reactor.space_state.fullscreen_spaces.insert(fullscreen_space);
     reactor.handle_event(space_state_event_from_screens(vec![ScreenInfo {
+        backing_scale: 1.0,
         id: crate::sys::screen::ScreenId::new(0),
         frame: full_screen,
         space: None,
@@ -6181,10 +6432,10 @@ fn closing_focused_window_refocuses_survivor() {
     assert!(
         requests.iter().any(|event| matches!(
             event,
-            raise_manager::Event::RaiseRequest(RaiseRequest { focus_window: Some((wid, _)), .. })
-                if *wid == survivor
+            raise_manager::Event::RaiseRequest(RaiseRequest { focus_window: Some((wid, _)), app_handles, .. })
+                if *wid == survivor && app_handles.contains_key(&survivor.pid)
         )),
-        "closing the focused window must request focus for the survivor: {requests:?}"
+        "closing the focused window must request deliverable focus for the survivor: {requests:?}"
     );
     reactor.handle_event(Event::WindowServerFocusChanged(survivor, space));
     assert!(reactor.create_window_data(survivor).unwrap().is_focused);

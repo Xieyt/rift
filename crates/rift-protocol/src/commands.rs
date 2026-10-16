@@ -102,6 +102,10 @@ pub enum LayoutCommand {
         delta: f64,
     },
     SnapStrip,
+    SwitchPresetColumnWidth {
+        #[serde(default)]
+        backwards: bool,
+    },
     CenterSelection,
     NextWorkspace(Option<bool>),
     PrevWorkspace(Option<bool>),
@@ -133,6 +137,7 @@ pub enum LayoutCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactorCommand {
+    BindingMode(String),
     Debug,
     Serialize,
     SaveLayout {
