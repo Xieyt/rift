@@ -12,10 +12,18 @@
 uid := `id -u`
 agent := "gui/" + uid + "/git.acsandmann.rift"
 app := "/Applications/Rift.app"
-# This machine's local code-signing identity — signs every locally-built app
-# that needs TCC grants to survive rebuilds (rift, xkeys), not just rift.
-# Must match `services.rift.signingIdentity` in xnix-config's fern.nix.
-signing_cert := "fern-codesign"
+# A STABLE local code-signing identity is what lets the Accessibility and
+# Screen Recording grants survive a rebuild: TCC keys on the identity, not
+# on the per-build cdhash, so an ad-hoc signature re-prompts every time.
+#
+# Resolved in three steps, first hit wins:
+#   1. `just signing_cert=my-identity install`
+#   2. ~/.config/rift/signing-identity, written by the nix module from
+#      `services.rift.signingIdentity`. That is how a machine sharing one
+#      identity across several locally built apps names it once, instead of
+#      hardcoding a machine-specific name in this file.
+#   3. rift-codesign, created by `just setup-signing-cert`.
+signing_cert := `cat "${XDG_CONFIG_HOME:-$HOME/.config}/rift/signing-identity" 2>/dev/null || echo rift-codesign`
 sys_keychain := "/Library/Keychains/System.keychain"
 plist := env_var('HOME') + "/Library/LaunchAgents/git.acsandmann.rift.plist"
 local_config := justfile_directory() + "/local-config.toml"

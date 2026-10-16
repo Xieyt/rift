@@ -224,6 +224,24 @@
           /usr/bin/codesign --force --sign "$sign" --identifier git.acsandmann.rift "$app_target"
           got=$(/usr/bin/codesign -dv "$app_target/Contents/MacOS/rift" 2>&1 | grep "Identifier=" | cut -d= -f2)
           echo "✓ Rift.app signed: identifier=$got identity=$sign" >&2
+
+          # Record the identity where `just` can find it, so a manual build
+          # signs with the same one this activation just used. Without it the
+          # justfile has to carry a machine-specific name, and a plain
+          # `just install` on any other machine ad-hoc signs and silently
+          # drops the Accessibility grant.
+          #
+          # Activation runs as root, so the file is written into the console
+          # user's home and handed to them.
+          owner=$(/usr/bin/stat -f%Su /dev/console 2>/dev/null || true)
+          if [ -n "$owner" ] && [ "$owner" != "root" ]; then
+            home=$(/usr/bin/dscl . -read "/Users/$owner" NFSHomeDirectory 2>/dev/null | /usr/bin/awk '{print $2}')
+            if [ -n "$home" ] && [ -d "$home" ]; then
+              /usr/bin/install -d -o "$owner" "$home/.config/rift"
+              printf '%s\n' "$sign" > "$home/.config/rift/signing-identity"
+              /usr/sbin/chown "$owner" "$home/.config/rift/signing-identity"
+            fi
+          fi
         '';
 
         # First login after installing/updating to a ScreenCaptureKit build: this
