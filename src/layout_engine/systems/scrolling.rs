@@ -799,150 +799,40 @@ fn next_width_preset(current: f64, presets: &[f64], min: f64, max: f64) -> Optio
     Some(ps.iter().copied().find(|&p| p > current + EPS).unwrap_or(ps[0]))
 }
 
-impl LayoutSystem for ScrollingLayoutSystem {
-    fn create_layout(&mut self) -> LayoutId {
-        self.layouts.insert(LayoutState::new(self.settings.column_width_ratio))
-    }
-
-    fn toggle_selection_tabbed(&mut self, layout: LayoutId) -> Vec<WindowId> {
-        let Some(state) = self.layout_state_mut(layout) else {
-            return Vec::new();
-        };
-        let Some((col_idx, _)) = state.selected_location() else {
-            return Vec::new();
-        };
-        state.columns[col_idx].tabbed = !state.columns[col_idx].tabbed;
-        state.columns[col_idx].windows.clone()
-    }
-
-    fn cycle_column_width_preset(&mut self, layout: LayoutId) -> Vec<WindowId> {
-        let min = self.settings.min_column_width_ratio;
-        let max = self.settings.max_column_width_ratio;
-        let presets = self.settings.width_presets.clone();
-        let niri_navigation = matches!(
-            self.settings.focus_navigation_style,
-            ScrollingFocusNavigationStyle::Niri
-        );
-        let Some(state) = self.layout_state_mut(layout) else {
-            return Vec::new();
-        };
-        let base = state.column_width_ratio;
-        let Some((col_idx, _)) = state.selected_location() else {
-            return Vec::new();
-        };
-        let current = (base + state.columns[col_idx].width_offset).clamp(min, max);
-        let Some(next) = next_width_preset(current, &presets, min, max) else {
-            return Vec::new();
-        };
-        state.columns[col_idx].width_offset = next - base;
-        if niri_navigation {
-            state.reveal_selected_without_direction();
-        } else {
-            state.align_scroll_to_selected();
-        }
-        state.columns[col_idx].windows.clone()
-    }
-
-    fn contains_layout(&self, layout: LayoutId) -> bool { self.layouts.contains_key(layout) }
-
-    fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
-        let cloned = self
-            .layouts
-            .get(layout)
-            .cloned()
-            .unwrap_or_else(|| LayoutState::new(self.settings.column_width_ratio));
-        self.layouts.insert(cloned)
-    }
-
-    fn remove_layout(&mut self, layout: LayoutId) { self.layouts.remove(layout); }
-
-    fn draw_tree(&self, layout: LayoutId) -> String {
-        let Some(state) = self.layouts.get(layout) else {
-            return String::new();
-        };
-        let mut out = String::new();
-        for (idx, col) in state.columns.iter().enumerate() {
-            out.push_str(&format!("Column {idx}:"));
-            for wid in &col.windows {
-                if Some(*wid) == state.selected {
-                    out.push_str(&format!(" [*{:?}]", wid));
-                } else {
-                    out.push_str(&format!(" [{:?}]", wid));
-                }
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    fn container_tree(&self, layout: LayoutId) -> rift_protocol::ContainerTreeNode {
-        let state = self.layouts.get(layout).expect("unknown scrolling layout");
-        let children = state
-            .columns
-            .iter()
-            .map(|column| {
-                let windows = column
-                    .windows
-                    .iter()
-                    .enumerate()
-                    .map(|(index, &window)| rift_protocol::ContainerTreeNode {
-                        node_id: window_node_id(window),
-                        node_type: rift_protocol::ContainerNodeType::Window,
-                        frame: Default::default(),
-                        layout_kind: None,
-                        weight: Some(column.height_weights.get(index).copied().unwrap_or(1.0)),
-                        window_id: Some(window.into()),
-                        is_selected: state.selected == Some(window),
-                        is_fullscreen: state.fullscreen.contains(&window),
-                        is_fullscreen_within_gaps: state.fullscreen_within_gaps.contains(&window),
-                        role: None,
-                        pending_split: None,
-                        children: Vec::new(),
-                    })
-                    .collect();
-                rift_protocol::ContainerTreeNode {
-                    node_id: column.stable_node_id(),
-                    node_type: rift_protocol::ContainerNodeType::Container,
-                    frame: Default::default(),
-                    layout_kind: Some(rift_protocol::LayoutKind::Vertical),
-                    weight: Some((state.column_width_ratio + column.width_offset).max(0.0)),
-                    window_id: None,
-                    is_selected: false,
-                    is_fullscreen: false,
-                    is_fullscreen_within_gaps: false,
-                    role: Some("column".to_owned()),
-                    pending_split: None,
-                    children: windows,
-                }
-            })
-            .collect();
-
-        rift_protocol::ContainerTreeNode {
-            node_id: 0,
-            node_type: rift_protocol::ContainerNodeType::Container,
-            frame: Default::default(),
-            layout_kind: Some(rift_protocol::LayoutKind::Horizontal),
-            weight: None,
-            window_id: None,
-            is_selected: false,
-            is_fullscreen: false,
-            is_fullscreen_within_gaps: false,
-            role: None,
-            pending_split: None,
-            children,
-        }
-    }
-
-    fn calculate_layout(
+impl ScrollingLayoutSystem {
+    pub(crate) fn logical_frames(
         &self,
         layout: LayoutId,
         screen: CGRect,
-        _stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &crate::common::config::GapSettings,
+    ) -> Vec<(WindowId, CGRect)> {
+        // Logical frames are a geometry query, not a render: no indicator bar is
+        // drawn, so a tabbed column reserves no strip here. FORK.md §2.D.
+        self.calculate_frames(
+            layout,
+            screen,
+            constraints,
+            gaps,
+            false,
+            0.0,
+            crate::common::config::HorizontalPlacement::default(),
+        )
+    }
+
+    fn calculate_frames(
+        &self,
+        layout: LayoutId,
+        screen: CGRect,
+        constraints: &HashMap<WindowId, WindowLayoutConstraints>,
+        gaps: &crate::common::config::GapSettings,
+        park_offscreen: bool,
+        // b02bb33 moved this body out of the trait's `calculate_layout`, which is
+        // where the fork's tabbed-column strip reservation reads these from. They
+        // are threaded through rather than dropped, or a tabbed column's windows
+        // render underneath the stack-line indicator.
         stack_line_thickness: f64,
         stack_line_horiz: crate::common::config::HorizontalPlacement,
-        _stack_line_vert: crate::common::config::VerticalPlacement,
     ) -> Vec<(WindowId, CGRect)> {
         let Some(state) = self.layouts.get(layout) else {
             return Vec::new();
@@ -1176,10 +1066,10 @@ impl LayoutSystem for ScrollingLayoutSystem {
             // overlap an adjacent display.
             let visible_left = tiling.origin.x;
             let visible_right = tiling.origin.x + tiling.size.width;
-            if x + column_width <= visible_left {
+            if park_offscreen && x + column_width <= visible_left {
                 // Column is fully off-screen left.
                 x = screen.origin.x - column_width;
-            } else if x >= visible_right {
+            } else if park_offscreen && x >= visible_right {
                 // Column is fully off-screen right.
                 x = screen.max().x;
             }
@@ -1323,6 +1213,163 @@ impl LayoutSystem for ScrollingLayoutSystem {
             }
         }
         out
+    }
+}
+
+impl LayoutSystem for ScrollingLayoutSystem {
+    fn toggle_selection_tabbed(&mut self, layout: LayoutId) -> Vec<WindowId> {
+        let Some(state) = self.layout_state_mut(layout) else {
+            return Vec::new();
+        };
+        let Some((col_idx, _)) = state.selected_location() else {
+            return Vec::new();
+        };
+        state.columns[col_idx].tabbed = !state.columns[col_idx].tabbed;
+        state.columns[col_idx].windows.clone()
+    }
+
+    fn cycle_column_width_preset(&mut self, layout: LayoutId) -> Vec<WindowId> {
+        let min = self.settings.min_column_width_ratio;
+        let max = self.settings.max_column_width_ratio;
+        let presets = self.settings.width_presets.clone();
+        let niri_navigation = matches!(
+            self.settings.focus_navigation_style,
+            ScrollingFocusNavigationStyle::Niri
+        );
+        let Some(state) = self.layout_state_mut(layout) else {
+            return Vec::new();
+        };
+        let base = state.column_width_ratio;
+        let Some((col_idx, _)) = state.selected_location() else {
+            return Vec::new();
+        };
+        let current = (base + state.columns[col_idx].width_offset).clamp(min, max);
+        let Some(next) = next_width_preset(current, &presets, min, max) else {
+            return Vec::new();
+        };
+        state.columns[col_idx].width_offset = next - base;
+        if niri_navigation {
+            state.reveal_selected_without_direction();
+        } else {
+            state.align_scroll_to_selected();
+        }
+        state.columns[col_idx].windows.clone()
+    }
+
+    fn create_layout(&mut self) -> LayoutId {
+        self.layouts.insert(LayoutState::new(self.settings.column_width_ratio))
+    }
+
+    fn contains_layout(&self, layout: LayoutId) -> bool { self.layouts.contains_key(layout) }
+
+    fn clone_layout(&mut self, layout: LayoutId) -> LayoutId {
+        let cloned = self
+            .layouts
+            .get(layout)
+            .cloned()
+            .unwrap_or_else(|| LayoutState::new(self.settings.column_width_ratio));
+        self.layouts.insert(cloned)
+    }
+
+    fn remove_layout(&mut self, layout: LayoutId) { self.layouts.remove(layout); }
+
+    fn draw_tree(&self, layout: LayoutId) -> String {
+        let Some(state) = self.layouts.get(layout) else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for (idx, col) in state.columns.iter().enumerate() {
+            out.push_str(&format!("Column {idx}:"));
+            for wid in &col.windows {
+                if Some(*wid) == state.selected {
+                    out.push_str(&format!(" [*{:?}]", wid));
+                } else {
+                    out.push_str(&format!(" [{:?}]", wid));
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn container_tree(&self, layout: LayoutId) -> rift_protocol::ContainerTreeNode {
+        let state = self.layouts.get(layout).expect("unknown scrolling layout");
+        let children = state
+            .columns
+            .iter()
+            .map(|column| {
+                let windows = column
+                    .windows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, &window)| rift_protocol::ContainerTreeNode {
+                        node_id: window_node_id(window),
+                        node_type: rift_protocol::ContainerNodeType::Window,
+                        frame: Default::default(),
+                        layout_kind: None,
+                        weight: Some(column.height_weights.get(index).copied().unwrap_or(1.0)),
+                        window_id: Some(window.into()),
+                        is_selected: state.selected == Some(window),
+                        is_fullscreen: state.fullscreen.contains(&window),
+                        is_fullscreen_within_gaps: state.fullscreen_within_gaps.contains(&window),
+                        role: None,
+                        pending_split: None,
+                        children: Vec::new(),
+                    })
+                    .collect();
+                rift_protocol::ContainerTreeNode {
+                    node_id: column.stable_node_id(),
+                    node_type: rift_protocol::ContainerNodeType::Container,
+                    frame: Default::default(),
+                    layout_kind: Some(rift_protocol::LayoutKind::Vertical),
+                    weight: Some((state.column_width_ratio + column.width_offset).max(0.0)),
+                    window_id: None,
+                    is_selected: false,
+                    is_fullscreen: false,
+                    is_fullscreen_within_gaps: false,
+                    role: Some("column".to_owned()),
+                    pending_split: None,
+                    children: windows,
+                }
+            })
+            .collect();
+
+        rift_protocol::ContainerTreeNode {
+            node_id: 0,
+            node_type: rift_protocol::ContainerNodeType::Container,
+            frame: Default::default(),
+            layout_kind: Some(rift_protocol::LayoutKind::Horizontal),
+            weight: None,
+            window_id: None,
+            is_selected: false,
+            is_fullscreen: false,
+            is_fullscreen_within_gaps: false,
+            role: None,
+            pending_split: None,
+            children,
+        }
+    }
+
+    fn calculate_layout(
+        &self,
+        layout: LayoutId,
+        screen: CGRect,
+        _stack_offset: f64,
+        constraints: &HashMap<WindowId, WindowLayoutConstraints>,
+        gaps: &crate::common::config::GapSettings,
+        stack_line_thickness: f64,
+        stack_line_horiz: crate::common::config::HorizontalPlacement,
+        _stack_line_vert: crate::common::config::VerticalPlacement,
+    ) -> Vec<(WindowId, CGRect)> {
+        self.calculate_frames(
+            layout,
+            screen,
+            constraints,
+            gaps,
+            true,
+            stack_line_thickness,
+            stack_line_horiz,
+        )
     }
 
     fn selected_window(&self, layout: LayoutId) -> Option<WindowId> {
@@ -2181,6 +2228,35 @@ mod tests {
     use crate::layout_engine::systems::{LayoutSystem, WindowLayoutConstraints};
     use crate::layout_engine::utils::compute_tiling_area;
     use crate::layout_engine::{Direction, LayoutId, ResizeOrientation};
+
+    #[test]
+    fn logical_frames_preserve_column_order_rows_and_native_parking() {
+        let mut system = ScrollingLayoutSystem::default();
+        let layout = system.create_layout();
+        for idx in 1..=5 {
+            system.add_window_after_selection(layout, wid(1, idx));
+        }
+        system.join_selection_with_direction(layout, Direction::Left);
+        system.select_window(layout, wid(1, 1));
+        let desktop = CGRect::new(CGPoint::new(1200.0, -200.0), CGSize::new(1200.0, 800.0));
+        let mut gaps = GapSettings::default();
+        gaps.inner.horizontal = 17.0;
+        gaps.inner.vertical = 11.0;
+        let native = render(&system, layout, desktop, &gaps);
+        let logical = system.logical_frames(layout, desktop, &HashMap::default(), &gaps);
+        assert_eq!(render(&system, layout, desktop, &gaps), native);
+        assert_eq!(frame_for(&logical, wid(1, 1)), frame_for(&native, wid(1, 1)));
+        for idx in 1..4 {
+            let left = frame_for(&logical, wid(1, idx));
+            let right = frame_for(&logical, wid(1, idx + 1));
+            assert!((right.origin.x - left.max().x - 17.0).abs() <= 1.0);
+        }
+        let upper = frame_for(&logical, wid(1, 4));
+        let lower = frame_for(&logical, wid(1, 5));
+        assert_eq!(upper.origin.x, lower.origin.x);
+        assert!((lower.origin.y - upper.max().y - 11.0).abs() <= 1.0);
+        assert!(upper.origin.x > frame_for(&native, wid(1, 4)).origin.x);
+    }
 
     #[test]
     fn display_default_rebases_untouched_layout_and_preserves_column_offset() {

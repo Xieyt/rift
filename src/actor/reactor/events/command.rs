@@ -166,6 +166,7 @@ fn current_floating_positions(
         == crate::common::config::LayoutMode::Floating;
     layout
         .layout_engine
+        .workspaces()
         .windows_in_active_workspace(&state.windows, space)
         .into_iter()
         .filter(|window| floats_by_layout || layout.layout_engine.is_window_floating(*window))
@@ -456,10 +457,7 @@ pub fn handle_command_reactor_move_window_to_display(
         .is_some()
         && let Some(window_server_id) = payload.window_server_id
     {
-        state
-            .windows
-            .set_window_server_space(window_server_id, Some(payload.target_space));
-        state.windows.mark_window_visible(window_server_id);
+        state.windows.observe_native_space(window_server_id, payload.target_space, true);
     }
 
     Ok(EventOutcome::layout_changed(false)
@@ -530,8 +528,7 @@ pub fn handle_command_reactor_move_workspace_to_display(
             window.frame_monotonic = window_move.target_frame;
         }
         if let Some(window_server_id) = window_move.window_server_id {
-            state.windows.set_window_server_space(window_server_id, Some(target_space));
-            state.windows.mark_window_visible(window_server_id);
+            state.windows.observe_native_space(window_server_id, target_space, true);
         }
         applied_moves.push(window_move);
     }

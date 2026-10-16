@@ -3,7 +3,7 @@ mod floating;
 pub(crate) mod graph;
 pub mod systems;
 pub mod utils;
-mod workspaces;
+pub(crate) mod workspaces;
 
 pub(crate) use engine::WindowLayoutInfo;
 pub use engine::{
@@ -30,6 +30,15 @@ impl From<crate::common::config::MouseDropAction> for WindowDropAction {
     }
 }
 
+/// The user's destination and placement; source membership and classification are authoritative.
+#[derive(Debug, Clone)]
+pub struct WorkspaceDropRequest {
+    pub window: crate::actor::app::WindowId,
+    pub workspace: VirtualWorkspaceId,
+    pub target: Option<(crate::actor::app::WindowId, WindowDropAction)>,
+    pub frame: Option<objc2_core_foundation::CGRect>,
+}
+
 pub(crate) struct WindowDropRequest {
     pub source: crate::actor::app::WindowId,
     pub target: crate::actor::app::WindowId,
@@ -41,7 +50,6 @@ pub use systems::{
     BspLayoutSystem, LayoutSystem, LayoutSystemKind, MasterStackLayoutSystem,
     ScrollingLayoutSystem, StackLayoutSystem, TraditionalLayoutSystem,
 };
-pub(crate) use workspaces::WorkspaceLayouts;
 
 pub use crate::model::virtual_workspace::{VirtualWorkspaceId, WorkspaceStats, WorkspaceStore};
 

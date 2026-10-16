@@ -70,9 +70,20 @@ fmt-check:
 # module without adding its filter is a no-op that looks like coverage.
 # `ui::hints_bar` was missing for months while FORK.md §2.E claimed those tests ran.
 #
-# ONE skip, an upstream failure reproduced on a pristine `upstream/main` worktree
-# via `just upstream-test <TEST>` — not our regression. UPSTREAM-SYNC.md §9.
-#   topology_change_clears_stale_pending_hide_target        long-standing
+# TWO skips, both upstream failures reproduced on a pristine worktree at the
+# current stage checkpoint — not our regressions. UPSTREAM-SYNC.md §9, §12.
+#   confirmed_window_move_forwards_membership_without_space_switch   (stage 1)
+#   empty_active_space_membership_during_wake_race_...               (stage 3)
+#
+# `topology_change_clears_stale_pending_hide_target` was skipped here from §9
+# until the sixth sync's stage 3, when a full sweep of the filtered suite on a
+# pristine `b02bb33` worktree found it GREEN: upstream repaired it somewhere in
+# dcaaaa8..b02bb33. Verified by deletion, as always, and deleted.
+#
+# Method, since one-at-a-time discovery wasted a stage: at each checkpoint, loop
+# the whole filtered suite on a pristine worktree, skipping each aborting test in
+# turn, until it goes green. That yields the complete red set in one pass and
+# proves the skip list has no stale entries left.
 #
 # There were THREE. The first dropped one skipped
 # `ax_invalidation_after_quarantine_release_preserves_live_layout_state`, a test
@@ -96,7 +107,7 @@ fmt-check:
 # tests — this one and the `topology_change_...` above — so the skip list is
 # complete for this checkpoint. Re-verify by deletion at the next one.
 test:
-    nix develop -c cargo test --lib -- layout_engine model common::config actor::raise_manager actor::reactor::tests actor::reactor::mouse_focus_publisher_tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::reactor::utils actor::spaces actor::config actor::drag actor::input actor::menu_bar actor::notification_center actor::process actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip confirmed_window_move_forwards_membership_without_space_switch
+    nix develop -c cargo test --lib -- layout_engine model common::config actor::raise_manager actor::reactor::tests actor::reactor::mouse_focus_publisher_tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::reactor::utils actor::spaces actor::config actor::drag actor::input actor::menu_bar actor::notification_center actor::process actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip confirmed_window_move_forwards_membership_without_space_switch --skip empty_active_space_membership_during_wake_race_does_not_blank_known_active_windows
 
 # whole library suite — only meaningful in a real GUI session
 test-all:

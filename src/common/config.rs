@@ -690,7 +690,7 @@ pub enum WorkspaceDisplayStyle {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct MenuBarSettings {
-    #[serde(default = "no")]
+    #[serde(default = "yes")]
     pub enabled: bool,
     #[serde(default = "no")]
     pub show_empty: bool,
@@ -818,6 +818,11 @@ pub enum StackLineHoverMode {
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MissionControlSettings {
+    /// Include workspaces without windows in Overview.
+    #[serde(default = "yes")]
+    pub show_empty_workspaces: bool,
+    #[serde(default = "yes")]
+    pub window_previews: bool,
     #[serde(default = "no")]
     pub enabled: bool,
     #[serde(default = "no")]
