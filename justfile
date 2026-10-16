@@ -17,6 +17,8 @@ app := "/Applications/Rift.app"
 # Must match `services.rift.signingIdentity` in xnix-config's fern.nix.
 signing_cert := "fern-codesign"
 sys_keychain := "/Library/Keychains/System.keychain"
+plist := env_var('HOME') + "/Library/LaunchAgents/git.acsandmann.rift.plist"
+local_config := justfile_directory() + "/local-config.toml"
 
 # list recipes
 default:
@@ -360,7 +362,15 @@ start:
 
 # is it running, and which binary?
 status:
-    @launchctl print {{agent}} 2>/dev/null | rg -i "state|program|path" || echo "rift agent not loaded"
+    #!/usr/bin/env bash
+    set -uo pipefail
+    launchctl print {{agent}} 2>/dev/null | grep -iE "state|program|path" || echo "rift agent not loaded"
+    cfg=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:2" "{{plist}}" 2>/dev/null || echo "?")
+    if [ "$cfg" = "{{local_config}}" ]; then
+      echo "  config   $cfg   (LOCAL — not the system one; \`just use-system-config\` to revert)"
+    else
+      echo "  config   $cfg"
+    fi
 
 # follow the logs
 logs:
@@ -558,3 +568,101 @@ upstream-test TEST:
     # without it the assertion message is swallowed and you only learn WHICH test died.
     (cd "$wt" && nix develop {{justfile_directory()}} -c \
       cargo test --lib -- {{TEST}} --test-threads=1 --nocapture 2>&1 | tail -20)
+
+# ---------------------------------------------------------------------------
+# local config — test config changes without a darwin-rebuild
+# ---------------------------------------------------------------------------
+#
+# The launchd agent is a PLAIN FILE (home-manager writes it, but nothing keeps
+# it a store symlink), so its `--config` argument can be repointed at a file in
+# this checkout. That is the whole trick: no rebuild, no system generation.
+#
+# There is deliberately NO automatic seeding. A silent copy of the live config
+# rots: you fix something here, nix never learns about it, and six weeks later
+# the two disagree and nobody knows which is right. `seed-local-config` is an
+# explicit one-off, and `diff-config` exists so the drift stays visible.
+#
+# `darwin-rebuild switch` rewrites the plist and silently puts you back on the
+# system config. That is the escape hatch, not a bug — but it is also why
+# `status` prints which config is actually in force.
+
+# point the running agent at ./local-config.toml
+use-local-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ ! -f "{{local_config}}" ]; then
+      echo "no {{local_config}}"
+      echo "create one, or copy the live config once with: just seed-local-config"
+      exit 1
+    fi
+    current=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:2" "{{plist}}")
+    if [ "$current" != "{{local_config}}" ]; then
+      echo "==> repointing the launchd agent"
+      echo "    --config $current"
+      echo "    --config {{local_config}}"
+      # Remember where to go back to; a rebuild changes the store path, and a
+      # rebuild also rewrites the plist, so this only has to survive until then.
+      echo "$current" > "{{justfile_directory()}}/.local-config-previous"
+      /usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 {{local_config}}" "{{plist}}"
+    else
+      echo "==> already on the local config"
+    fi
+    just restart
+    echo "✓ rift now reads ./local-config.toml — edit it and \`just restart\`"
+    echo "  NOTE: \`darwin-rebuild switch\` rewrites this plist and reverts you."
+
+# put the agent back on the home-manager config
+use-system-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    prev_file="{{justfile_directory()}}/.local-config-previous"
+    if [ ! -f "$prev_file" ]; then
+      echo "no record of the previous config path (.local-config-previous missing)."
+      echo "run \`darwin-rebuild switch\` — it rewrites the plist to the system config."
+      exit 1
+    fi
+    prev=$(cat "$prev_file")
+    echo "==> restoring the agent to the home-manager config"
+    echo "    --config $(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:2" "{{plist}}")"
+    echo "    --config $prev"
+    /usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 $prev" "{{plist}}"
+    just restart
+    echo "✓ back on the system config; ./local-config.toml left on disk"
+
+# one-off: copy whatever config the agent currently uses into the checkout
+seed-local-config:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -f "{{local_config}}" ]; then
+      echo "{{local_config}} already exists — refusing to overwrite."
+      echo "see what differs from the system config with: just diff-config"
+      exit 1
+    fi
+    src=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:2" "{{plist}}")
+    echo "==> seeding from $src"
+    install -m 644 "$src" "{{local_config}}"
+    echo "✓ wrote {{local_config}} ($(wc -l < "{{local_config}}" | tr -d ' ') lines)"
+    echo
+    echo "  This is now a COPY. Anything you fix here is invisible to nix until"
+    echo "  you port it back — \`just diff-config\` is how you see what is owed."
+
+# what has ./local-config.toml drifted from the system config?
+diff-config:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if [ ! -f "{{local_config}}" ]; then echo "no {{local_config}}"; exit 1; fi
+    prev_file="{{justfile_directory()}}/.local-config-previous"
+    if [ -f "$prev_file" ]; then
+      sys=$(cat "$prev_file")
+    else
+      sys=$(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:2" "{{plist}}")
+    fi
+    echo "system: $sys"
+    echo "local : {{local_config}}"
+    echo
+    if diff -u "$sys" "{{local_config}}" --label system --label local; then
+      echo "(identical — nothing owed back to nix)"
+    else
+      echo
+      echo "^ every line above is a local-only change nix does not have yet."
+    fi

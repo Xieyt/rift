@@ -5,3 +5,7 @@ dev-config.toml
 src/bin/dev.rs
 result
 .direnv
+# Personal config used by `just use-local-config` to test config changes
+# without a darwin-rebuild. A copy of your real config, not fork content.
+/local-config.toml
+/.local-config-previous
