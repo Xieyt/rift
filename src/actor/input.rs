@@ -80,7 +80,7 @@ pub struct Input {
     mode_indices: RefCell<HashMap<String, usize>>,
     active_mode: Cell<usize>,
     hotkeys_active: Cell<bool>,
-    hyper_held: Cell<bool>,
+    trigger_keys: RefCell<HashSet<KeyCode>>,
     wm_sender: wm_controller::Sender,
     mission_control_tx: RefCell<Option<super::mission_control::Sender>>,
     hints_bar_tx: hints_bar::Sender,
@@ -186,8 +186,8 @@ impl Input {
             // start/stop is frequent enough that rebuilding the WindowServer
             // tap costs more than filtering these releases in the callback.
             state.event_processing_enabled,
-            // Hyper (F20) release must always reach the tap, or the
-            // synthesised modifier jams on after the first press.
+            // A trigger key's release must always reach the tap, or it stays
+            // stuck down and every later keypress matches as if it were held.
             keyed_disable || hotkeys_enabled,
         );
         if self.mission_control_active.get() {
@@ -265,7 +265,7 @@ impl Input {
         }
 
         self.reset_gestures();
-        self.hyper_held.set(false);
+        self.forget_held_triggers();
         self.tap.borrow_mut().take();
         if next_mask == 0 {
             self.event_mask.set(0);
@@ -347,7 +347,7 @@ impl Input {
             mode_indices: RefCell::new(HashMap::default()),
             active_mode: Cell::new(0),
             hotkeys_active: Cell::new(false),
-            hyper_held: Cell::new(false),
+            trigger_keys: RefCell::new(HashSet::default()),
             wm_sender,
             mission_control_tx: RefCell::new(mission_control_tx),
             hints_bar_tx,
@@ -660,10 +660,22 @@ impl Input {
     #[inline]
     fn reset_mouse_move_sample_gate(&self) { self.mouse_move_last_timestamp.set(None); }
 
+    /// Drops the "this trigger is held" memory when the tap is replaced: the
+    /// key-up that would have cleared it goes to the old tap, so without this
+    /// the trigger stays stuck down.
+    fn forget_held_triggers(&self) {
+        let triggers = self.trigger_keys.borrow();
+        if triggers.is_empty() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        state.pressed_keys.retain(|key| !triggers.contains(key));
+    }
+
     fn reconcile_after_tap_reenabled(&self) {
         let mut state = self.state.borrow_mut();
         self.reset_gestures();
-        self.hyper_held.set(false);
+        state.pressed_keys.clear();
         if state.captured_button.take().is_some() {
             self.events_tx.send(Event::DragCancel);
         }
@@ -959,27 +971,22 @@ impl Input {
         event: &CGEvent,
         state: &mut State,
     ) -> bool {
-        // F20 is Left Command remapped by a driver-level hidutil rule, so it
-        // arrives here as an ordinary KeyDown/KeyUp rather than FlagsChanged.
-        // Track it as a held software modifier (Hyper) and never let a real
-        // F20 press/release reach an app, before any normal hotkey matching.
-        if matches!(event_type, CGEventType::KeyDown | CGEventType::KeyUp)
-            && key_code_from_event(event) == Some(KeyCode::F20)
-        {
-            if event_type == CGEventType::KeyUp {
-                self.hyper_held.set(false);
-            } else {
-                // A held key emits repeated KeyDowns; reuse the hotkey
-                // repeat-suppression signal below so the flag is set once.
-                let is_repeat = CGEvent::integer_value_field(
-                    Some(event),
-                    CGEventField::KeyboardEventAutorepeat,
-                ) != 0;
-                if !is_repeat {
-                    self.hyper_held.set(true);
+        // A trigger is an ordinary key that some binding requires to be held
+        // (Left Command, swapped to F20 by a driver-level hidutil rule, is
+        // the usual one). It arrives as a plain KeyDown/KeyUp, never as a
+        // modifier flag, so track it in the pressed-key set and never let the
+        // raw press or release reach an app.
+        if matches!(event_type, CGEventType::KeyDown | CGEventType::KeyUp) {
+            if let Some(key_code) = key_code_from_event(event) {
+                if self.trigger_keys.borrow().contains(&key_code) {
+                    if event_type == CGEventType::KeyUp {
+                        state.note_key_up(key_code);
+                    } else {
+                        state.note_key_down(key_code);
+                    }
+                    return false;
                 }
             }
-            return false;
         }
 
         let key_code_opt = key_code_from_event(event);
@@ -1010,12 +1017,16 @@ impl Input {
 
         if event_type == CGEventType::KeyDown {
             if let Some(key_code) = key_code_opt {
-                let mut modifiers =
+                let modifiers =
                     modifiers_from_flags_with_keys(state.current_flags, &state.pressed_keys);
-                if self.hyper_held.get() {
-                    modifiers.insert(Modifiers::HYPER);
-                }
-                let hotkey = Hotkey::new(modifiers, key_code);
+                let held_keys: Vec<KeyCode> = self
+                    .trigger_keys
+                    .borrow()
+                    .iter()
+                    .filter(|key| state.pressed_keys.contains(*key))
+                    .copied()
+                    .collect();
+                let hotkey = Hotkey::with_held(modifiers, held_keys, key_code);
                 let active_mode = self.active_mode.get();
                 let bindings = self.hotkeys.borrow();
                 // TEMPORARY sync-debug probe — remove before committing.
@@ -1101,6 +1112,9 @@ impl Input {
     fn rebuild_binding_maps(&self) {
         let specs = self.binding_mode_specs.borrow();
         let mut maps = Vec::with_capacity(specs.len());
+        // Which keys the tap must track and swallow is read off the bindings
+        // themselves, so changing the trigger is a config edit, not a rebuild.
+        let mut triggers: HashSet<KeyCode> = HashSet::default();
         for (mode, bindings) in specs.iter() {
             let mut map: HashMap<Hotkey, Vec<WmCommand>> = HashMap::default();
             for (spec, command) in bindings {
@@ -1108,6 +1122,7 @@ impl Input {
                     warn!(%spec, %mode, "Skipping hotkey that no longer resolves for current keyboard layout");
                     continue;
                 };
+                triggers.extend(hotkey.held_keys.iter().copied());
                 let mut insert = |hotkey| {
                     let entry = map.entry(hotkey).or_default();
                     if !entry.contains(command) {
@@ -1116,7 +1131,11 @@ impl Input {
                 };
                 if hotkey.modifiers.has_generic_modifiers() {
                     for modifiers in hotkey.modifiers.expand_to_specific() {
-                        insert(Hotkey::new(modifiers, hotkey.key_code));
+                        insert(Hotkey::with_held(
+                            modifiers,
+                            hotkey.held_keys.clone(),
+                            hotkey.key_code,
+                        ));
                     }
                 } else {
                     insert(hotkey);
@@ -1126,6 +1145,7 @@ impl Input {
         }
         trace!("Updated hotkey maps for current keyboard layout: {}", maps.len());
         *self.hotkeys.borrow_mut() = maps;
+        *self.trigger_keys.borrow_mut() = triggers;
     }
 }
 

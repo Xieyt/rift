@@ -165,7 +165,12 @@ impl Config {
                             bail!("Could not parse hotkey `{key}` in binding mode `{mode}`");
                         };
                         for modifiers in hotkey.modifiers.expand_to_specific() {
-                            if !assigned.insert(Hotkey::new(modifiers, hotkey.key_code)) {
+                            let variant = Hotkey::with_held(
+                                modifiers,
+                                hotkey.held_keys.clone(),
+                                hotkey.key_code,
+                            );
+                            if !assigned.insert(variant) {
                                 bail!(
                                     "Shortcut `{key}` conflicts with another binding in keymap `{mode}`"
                                 );

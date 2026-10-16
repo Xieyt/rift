@@ -30,10 +30,6 @@ impl Modifiers {
     // Specific left/right modifier bits
     pub const SHIFT_LEFT: Modifiers = Modifiers(0b0000_0001);
     pub const SHIFT_RIGHT: Modifiers = Modifiers(0b0000_0010);
-    // Hyper has no device-dependent left/right distinction: it is a single
-    // software modifier synthesised from a remapped physical key (F20), not
-    // a member of any ModFamily/MOD_FAMILIES pair.
-    pub const HYPER: Modifiers = Modifiers(0b1_0000_0000);
 
     pub fn empty() -> Self { Modifiers(0) }
 
@@ -50,11 +46,7 @@ impl Modifiers {
     }
 
     pub fn expand_to_specific(&self) -> Vec<Modifiers> {
-        // Bits that belong to no ModFamily (currently just HYPER) are never
-        // OR'd in by the loop below; seed the base variant with them so they
-        // are not silently dropped from every expanded variant.
-        let family_bits: u16 = MOD_FAMILIES.iter().fold(0u16, |acc, m| acc | m.left.0 | m.right.0);
-        let mut variants = vec![Modifiers(self.0 & !family_bits)];
+        let mut variants = vec![Modifiers::empty()];
 
         for m in MOD_FAMILIES {
             let has_generic = self.contains(m.generic);
@@ -107,10 +99,6 @@ impl Modifiers {
 impl fmt::Display for Modifiers {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts: Vec<&str> = Vec::new();
-
-        if self.contains(Modifiers::HYPER) {
-            parts.push("Hyper");
-        }
 
         for m in MOD_FAMILIES {
             let l = self.contains(m.left);
@@ -250,11 +238,6 @@ fn split_side(token: &str) -> (Option<Side>, &str) {
 
 fn modifier_from_token(token: &str) -> Option<Modifiers> {
     let t = normalize_token(token);
-    if t == "hyper" {
-        // No left/right distinction: Hyper is a single software modifier,
-        // never a MOD_FAMILIES pair, so it bypasses split_side entirely.
-        return Some(Modifiers::HYPER);
-    }
     let (side, base) = split_side(&t);
     let family = match base {
         "alt" | "option" => &MOD_FAMILIES[1],
@@ -271,7 +254,7 @@ fn modifier_from_token(token: &str) -> Option<Modifiers> {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyCode {
     KeyA,
     KeyS,
@@ -797,27 +780,51 @@ fn layout_char_keycode(ch: &str, fallback: KeyCode) -> KeyCode {
 #[derive(Serialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Hotkey {
     pub modifiers: Modifiers,
+    /// Ordinary keys that must already be held when `key_code` is pressed.
+    ///
+    /// A remapped trigger (Left Command swapped to F20 by the HID driver)
+    /// arrives as a plain KeyDown, never as a modifier flag, so it cannot
+    /// live in `modifiers`. Kept sorted so equal sets hash equally: these
+    /// hotkeys are HashMap keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_keys: Vec<KeyCode>,
     pub key_code: KeyCode,
 }
 
 impl Hotkey {
-    pub fn new(modifiers: Modifiers, key_code: KeyCode) -> Self { Self { modifiers, key_code } }
+    pub fn new(modifiers: Modifiers, key_code: KeyCode) -> Self {
+        Self {
+            modifiers,
+            held_keys: Vec::new(),
+            key_code,
+        }
+    }
+
+    pub fn with_held(modifiers: Modifiers, held_keys: Vec<KeyCode>, key_code: KeyCode) -> Self {
+        let mut held_keys = held_keys;
+        held_keys.sort_unstable();
+        held_keys.dedup();
+        Self { modifiers, held_keys, key_code }
+    }
 }
 
 impl fmt::Display for Hotkey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.modifiers == Modifiers::empty() {
-            write!(f, "{}", self.key_code)
-        } else {
-            write!(f, "{} + {}", self.modifiers, self.key_code)
+        let mut parts: Vec<String> = Vec::new();
+        if self.modifiers != Modifiers::empty() {
+            parts.push(self.modifiers.to_string());
         }
+        parts.extend(self.held_keys.iter().map(|key| key.to_string()));
+        parts.push(self.key_code.to_string());
+        write!(f, "{}", parts.join(" + "))
     }
 }
 
-fn parse_mods_and_optional_key(s: &str) -> Result<(Modifiers, Option<KeyCode>), anyhow::Error> {
+fn parse_spec(s: &str) -> Result<(Modifiers, Vec<KeyCode>, Option<KeyCode>), anyhow::Error> {
     let parts: Vec<&str> = s.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
 
     let mut mods = Modifiers::empty();
+    let mut held: Vec<KeyCode> = Vec::new();
     let mut key_opt: Option<KeyCode> = None;
 
     for part in parts {
@@ -825,10 +832,14 @@ fn parse_mods_and_optional_key(s: &str) -> Result<(Modifiers, Option<KeyCode>), 
             continue;
         }
         let code = KeyCode::from_str(part)?;
-        key_opt = Some(code);
+        // The last plain key is the one pressed; every earlier plain key is
+        // a key that must already be held.
+        if let Some(previous) = key_opt.replace(code) {
+            held.push(previous);
+        }
     }
 
-    Ok((mods, key_opt))
+    Ok((mods, held, key_opt))
 }
 
 /// Parses a modifier-only spec such as "Alt" or "Ctrl + Alt".
@@ -836,8 +847,8 @@ fn parse_mods_and_optional_key(s: &str) -> Result<(Modifiers, Option<KeyCode>), 
 /// Rejects specs that name a non-modifier key, so a config that says
 /// `modifier = "Alt + T"` fails loudly instead of silently binding Alt.
 pub fn modifiers_from_str(s: &str) -> Result<Modifiers, anyhow::Error> {
-    let (mods, key) = parse_mods_and_optional_key(s)?;
-    if key.is_some() {
+    let (mods, held, key) = parse_spec(s)?;
+    if key.is_some() || !held.is_empty() {
         return Err(anyhow!("Expected modifiers only, but found a key in: {}", s));
     }
     if mods == Modifiers::empty() {
@@ -850,9 +861,9 @@ impl FromStr for Hotkey {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (mods, key_opt) = parse_mods_and_optional_key(s)?;
+        let (mods, held, key_opt) = parse_spec(s)?;
         let key_code = key_opt.ok_or_else(|| anyhow!("No key specified in hotkey: {}", s))?;
-        Ok(Hotkey::new(mods, key_code))
+        Ok(Hotkey::with_held(mods, held, key_code))
     }
 }
 
@@ -901,10 +912,9 @@ impl<'de> serde::de::Deserialize<'de> for HotkeySpec {
         let repr = HotkeyRepr::deserialize(deserializer)?;
         match repr {
             HotkeyRepr::Str(s) => {
-                let (mods, key_opt) =
-                    parse_mods_and_optional_key(&s).map_err(serde::de::Error::custom)?;
+                let (mods, held, key_opt) = parse_spec(&s).map_err(serde::de::Error::custom)?;
                 if let Some(k) = key_opt {
-                    Ok(HotkeySpec::Hotkey(Hotkey::new(mods, k)))
+                    Ok(HotkeySpec::Hotkey(Hotkey::with_held(mods, held, k)))
                 } else if mods != Modifiers::empty() {
                     Ok(HotkeySpec::ModifiersOnly { modifiers: mods })
                 } else {
@@ -1414,8 +1424,8 @@ mod tests {
             "Alt + P",
             "Alt + Shift + J",
             "Ctrl + Alt + Backspace",
-            "Hyper + H",
-            "Hyper + Shift + L",
+            "F20 + H",
+            "F20 + Shift + L",
         ] {
             let hotkey = Hotkey::from_str(spec).expect("config spec should parse");
             let reparsed =
@@ -1425,14 +1435,39 @@ mod tests {
     }
 
     #[test]
-    fn hyper_bit_survives_expansion() {
-        // expand_to_specific starts from Modifiers::empty() and only OR's in
-        // bits recognised by MOD_FAMILIES; HYPER belongs to no family and
-        // was previously dropped here, silently disabling every Hyper binding.
-        let hotkey = Hotkey::from_str("Hyper + H").unwrap();
-        let variants = hotkey.modifiers.expand_to_specific();
-        assert_eq!(variants.len(), 1, "Hyper has no left/right split: {variants:?}");
-        assert!(variants[0].contains(Modifiers::HYPER));
+    fn an_earlier_plain_key_becomes_a_held_key_instead_of_being_discarded() {
+        // The parser used to overwrite the key on every plain token, so
+        // "F20 + H" silently bound a bare H that fired while typing.
+        let hotkey = Hotkey::from_str("F20 + H").unwrap();
+        assert_eq!(hotkey.key_code, KeyCode::KeyH);
+        assert_eq!(hotkey.held_keys, vec![KeyCode::F20]);
+        assert_eq!(hotkey.modifiers, Modifiers::empty());
+        assert_ne!(hotkey, Hotkey::new(Modifiers::empty(), KeyCode::KeyH));
+    }
+
+    #[test]
+    fn held_keys_hash_equally_whatever_order_they_were_written_in() {
+        // These are HashMap keys: two spellings of the same chord must be
+        // the same entry, or one of them never matches.
+        let a = Hotkey::from_str("F20 + F19 + H").unwrap();
+        let b = Hotkey::from_str("F19 + F20 + H").unwrap();
+        assert_eq!(a, b);
+        let mut map = std::collections::HashMap::new();
+        map.insert(a, ());
+        assert!(map.contains_key(&b));
+    }
+
+    #[test]
+    fn expansion_keeps_the_held_keys_on_every_left_right_variant() {
+        let hotkey = Hotkey::from_str("F20 + Shift + L").unwrap();
+        let variants: Vec<Hotkey> = hotkey
+            .modifiers
+            .expand_to_specific()
+            .into_iter()
+            .map(|m| Hotkey::with_held(m, hotkey.held_keys.clone(), hotkey.key_code))
+            .collect();
+        assert!(variants.len() > 1, "generic Shift should expand: {variants:?}");
+        assert!(variants.iter().all(|v| v.held_keys == vec![KeyCode::F20]));
     }
 
     #[test]

@@ -346,7 +346,7 @@ setup-signing-cert:
 # Nothing else to restart. This used to reload the hyperkey agent too, because
 # both apps put an event tap at the same stage and the most recently created
 # one sat in front — so rift restarting pushed hyperkey's modifier injection
-# behind it and every `hyper + X` binding stopped matching. That is gone:
+# behind it and every trigger-key binding stopped matching. That is gone:
 # Left Command is swapped to F20 by the HID driver, below every tap, so rift
 # sees it no matter who started when. Reloading that agent now does nothing
 # but relaunch a retired app, which overwrites the whole hidutil swap list.

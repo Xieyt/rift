@@ -328,7 +328,7 @@ fn strip_column_visibility(
 /// and whether it lies inside the screen viewport.
 ///
 /// Cell index `i` is deliberately the same index `focus_column i` acts on, because
-/// the bar is the legend for the `hyper + a s d f g` binds. Deriving columns from
+/// the bar is the legend for the `mod1 + a s d f g` binds. Deriving columns from
 /// frame x broke that: parked columns merged, so letters after a merge labelled the
 /// wrong column.
 fn build_hints_bar_cells(
