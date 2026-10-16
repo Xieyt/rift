@@ -1197,3 +1197,31 @@ fn a_fork_era_stack_line_config_still_parses_after_feature_c_retirement() {
     );
     assert!(!config.keys.is_empty(), "the rest of the file survives too");
 }
+
+/// §12.6 HZ-10, found on a LIVE host rather than by a fixture: the sixth sync
+/// retired the fork's `width_presets` in favour of upstream's
+/// `preset_column_widths`, and `ScrollingLayoutSettings` is
+/// `deny_unknown_fields` — so without a migration every fork config written
+/// before 0.7 is rejected at startup and rift silently runs on defaults.
+///
+/// The values must be CARRIED, not dropped: the two keys mean the same thing,
+/// so a user's tuned presets have to keep working under the new name.
+#[test]
+fn fork_width_presets_migrate_to_upstream_preset_column_widths() {
+    let config = Config::parse(
+        r#"
+            [settings.layout.scrolling]
+            column_width_ratio = 0.7
+            width_presets = [0.5, 0.85, 0.93]
+
+            [keys]
+        "#,
+    )
+    .expect("a pre-0.7 fork config must still parse");
+
+    assert_eq!(
+        config.settings.layout.scrolling.preset_column_widths,
+        vec![0.5, 0.85, 0.93],
+        "tuned presets must survive the rename, not reset to the default set"
+    );
+}

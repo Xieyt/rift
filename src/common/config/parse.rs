@@ -298,6 +298,29 @@ fn migrate_legacy_window_snapping(document: &mut toml::Value) -> bool {
 
 /// The stack line became native tabs: drop the old indicator colors and raise thin
 /// indicator thicknesses to the smallest usable tab bar.
+/// §12.6 HZ-10. The fork's `width_presets` was retired in the sixth sync's
+/// stage 4, superseded by upstream's `preset_column_widths` +
+/// `switch_preset_column_width`. `ScrollingLayoutSettings` is
+/// `deny_unknown_fields`, so without this every fork config written before 0.7
+/// fails to parse at startup — found on a live host, not by a fixture.
+///
+/// The values are CARRIED OVER rather than dropped: the two keys mean the same
+/// thing, so a user's tuned presets keep working under the new name.
+fn migrate_fork_width_presets(document: &mut toml::Value) -> bool {
+    let Some(scrolling) = ["settings", "layout", "scrolling"]
+        .into_iter()
+        .try_fold(document, |table, key| table.get_mut(key))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let Some(old) = scrolling.remove("width_presets") else {
+        return false;
+    };
+    scrolling.entry("preset_column_widths").or_insert(old);
+    true
+}
+
 fn migrate_legacy_stack_line(document: &mut toml::Value) -> bool {
     let Some(stack_line) = ["settings", "ui", "stack_line"]
         .into_iter()
@@ -343,5 +366,6 @@ pub(super) fn parse_config_file(buf: &str) -> Result<ConfigSource, toml::de::Err
     migrate_legacy_resize_bindings(&mut document);
     migrate_legacy_window_snapping(&mut document);
     migrate_legacy_stack_line(&mut document);
+    migrate_fork_width_presets(&mut document);
     document.try_into()
 }
