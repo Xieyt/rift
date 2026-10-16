@@ -1061,3 +1061,128 @@ fn test_levenshtein_suggests() {
     let (s, _maybe_dep) = suggestion.unwrap();
     assert_eq!(s, "toggle_stack");
 }
+
+#[test]
+fn stack_tabs_default_on_and_release_the_reservation_when_disabled() {
+    let mut tabs = Config::parse("[keys]\n[settings]").unwrap().settings.ui.stack_line;
+    assert!(tabs.enabled && tabs.validate().is_empty());
+    assert_eq!(tabs.reserve().total(), 28.0);
+    tabs.enabled = false;
+    assert_eq!(tabs.reserve().total(), 0.0);
+}
+
+/// The stack line section of main's `rift.default.toml`, verbatim.
+const MAIN_DEFAULT_STACK_LINE: &str = r#"
+[keys]
+
+[settings.ui.stack_line]
+# experimental stack line indicator (defaults to off)
+enabled = false
+# action on hover: "click" or "hover" (defaults to "hover" which is just a visual indicator)
+hover = "hover"
+# in a horizontal stack where the line will be (top/bottom)
+horiz_placement = "top"
+# in a vertical stack where the line will be (left/right)
+vert_placement = "left"
+# how thick the indicator will be (in px)
+thickness = 20.0
+# spacing between the stack line and window edges (in px)
+spacing = 1.0
+# RGBA components range from 0.0 to 1.0. Each color can be customized
+# selected_color = { r = 0.0, g = 0.5, b = 1.0, a = 1.0 }
+# unselected_color = { r = 0.8, g = 0.8, b = 0.8, a = 1.0 }
+# border_color = { r = 0.6, g = 0.6, b = 0.6, a = 1.0 }
+"#;
+
+#[test]
+fn main_stack_line_configs_keep_their_meaning() {
+    let uncommented = MAIN_DEFAULT_STACK_LINE
+        .replace("# selected", "selected")
+        .replace("# unselected", "unselected")
+        .replace("# border", "border");
+    let thin = uncommented.replace("20.0", "4").replace("false", "true");
+    for (text, enabled) in [
+        (MAIN_DEFAULT_STACK_LINE.into(), false),
+        (uncommented, false),
+        (thin, true),
+    ] {
+        let config = Config::parse(&text).unwrap();
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
+        let tabs = &config.settings.ui.stack_line;
+        assert_eq!(
+            tabs.enabled, enabled,
+            "an explicit setting beats the new default"
+        );
+        assert!(!tabs.hover.selects_on_hover(), "\"hover\" only highlights");
+        assert_eq!((tabs.horiz_placement, tabs.vert_placement), Default::default());
+        // Removed colors are dropped; indicator thicknesses rise to the 20 point minimum.
+        assert_eq!((tabs.thickness, tabs.spacing), (20.0, 1.0));
+        assert_eq!(tabs.reserve().total(), if enabled { 21.0 } else { 0.0 });
+        let mut document = ConfigDocument::parse(&text).unwrap();
+        document.update(|source| source.settings.ui.stack_line.spacing = 2.0).unwrap();
+        assert_eq!(
+            Config::parse(&document.to_string()).unwrap().settings.ui.stack_line.spacing,
+            2.0
+        );
+    }
+    assert!(Config::parse(&MAIN_DEFAULT_STACK_LINE.replace("hover =", "hover_color =")).is_err());
+    let click: StackLineSettings = toml::from_str(r#"hover = "click""#).unwrap();
+    assert!(click.hover.selects_on_hover());
+}
+
+#[test]
+fn stack_tab_geometry_rejects_unusable_values() {
+    for text in [
+        "thickness = 19.5",
+        "thickness = nan",
+        "spacing = -1.0",
+        "spacing = inf",
+    ] {
+        let tabs: StackLineSettings = toml::from_str(text).unwrap();
+        assert_eq!(tabs.validate().len(), 1, "{text}");
+    }
+}
+
+/// §12.6 HZ-2, the second data-losing hazard of the sixth sync.
+///
+/// Upstream's native tab bar (952fc17) has no colour or font API, so fork
+/// feature C's theming keys were deleted from `StackLineSettings`. But
+/// `ConfigSource` is `deny_unknown_fields`: every fork user's existing
+/// `~/.config/rift/config.toml` still carries those keys, and without a
+/// migration rift would fail to parse it at startup and silently fall back to
+/// the default config — losing every other setting in the file too.
+///
+/// This is the pairing that had to land in one commit: the deletion is only
+/// safe because `migrate_legacy_stack_line` strips the retired names.
+#[test]
+fn a_fork_era_stack_line_config_still_parses_after_feature_c_retirement() {
+    let config = Config::parse(
+        r##"
+            [settings.ui.stack_line]
+            enabled = true
+            thickness = 20.0
+            border_width = 0.5
+            show_titles = true
+            active_color = "#3d7bfaee"
+            inactive_color = "#1f1f24ee"
+            active_title_color = "#ffffff"
+            inactive_title_color = "#b8b8be"
+            font_size = 13.0
+
+            [keys]
+            "Alt + H" = { move_focus = "left" }
+        "##,
+    )
+    .expect("a fork-era config must still parse after the retired keys are gone");
+
+    assert!(
+        config.settings.ui.stack_line.enabled,
+        "surviving keys keep their values"
+    );
+    // Below upstream's floor: the migration raises it rather than rejecting.
+    assert_eq!(
+        config.settings.ui.stack_line.thickness,
+        StackLineSettings::MIN_THICKNESS
+    );
+    assert!(!config.keys.is_empty(), "the rest of the file survives too");
+}

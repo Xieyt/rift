@@ -1427,6 +1427,7 @@ impl Reactor {
                     self.space_state.command_space = Some(reported_space);
                 }
                 if self.layout_manager.layout_engine.focused_window() == Some(window) {
+                    LayoutManager::refresh_stack_tabs(self, reported_space);
                     if let Some(input_tx) = &self.communication_manager.input_tx {
                         _ = input_tx.send(crate::actor::input::Request::EnforceHidden);
                     }
@@ -1789,6 +1790,11 @@ impl Reactor {
                 return Ok(outcome);
             }
             Event::WindowTitleChanged(wid, new_title) => {
+                if self.config.settings.ui.stack_line.enabled
+                    && let Some(tx) = &self.communication_manager.stack_line_tx
+                {
+                    tx.send(stack_line::Event::TitleChanged(wid, new_title.clone()));
+                }
                 let mut outcome = window_workflow::handle_window_title_changed(
                     &mut self.state,
                     window_workflow::WindowTitleChangedPayload { window: wid, title: new_title },
@@ -2686,21 +2692,22 @@ impl Reactor {
         if outcome.arrange.passes > 0
             && (!self.is_in_drag() || outcome.arrange.window_was_destroyed)
         {
-            for _ in 0..outcome.arrange.passes.max(1) {
-                layout_changed |= self.update_layout_or_warn(
-                    outcome.arrange.is_resize,
-                    matches!(
-                        self.workspace_switch_manager.workspace_switch_state,
-                        WorkspaceSwitchState::Active
-                    ),
-                    outcome.arrange.space_scope,
-                );
-            }
-            if let Some(space) = outcome.arrange.secondary_space_scope {
+            // Reducers have finished mutating the model; arrange each affected space once.
+            layout_changed = self.update_layout_or_warn(
+                outcome.arrange.is_resize,
+                matches!(
+                    self.workspace_switch_manager.workspace_switch_state,
+                    WorkspaceSwitchState::Active
+                ),
+                outcome.arrange.space_scope,
+            );
+            if let Some(space) = outcome.arrange.secondary_space_scope
+                && outcome.arrange.space_scope.is_some_and(|primary| primary != space)
+            {
                 layout_changed |=
                     self.update_layout_or_warn(outcome.arrange.is_resize, false, Some(space));
             }
-            // Publish the menu state once after all arrange passes have completed.
+            // Publish the menu state once after all affected spaces have been arranged.
             self.maybe_send_menu_update();
         }
         if layout_changed && outcome.drop_haptic && !cfg!(test) {
@@ -4104,6 +4111,9 @@ impl Reactor {
                 self.refresh_active_drag_scene();
             }
         }
+        if !geometry_changed && let Some(space) = event_space {
+            LayoutManager::refresh_stack_tabs(self, space);
+        }
         if matches!(
             event_clone,
             LayoutEvent::WindowRemoved(_)
@@ -4540,6 +4550,16 @@ impl Reactor {
         if self.is_in_drag() {
             self.workspace_switch_manager.mark_workspace_switch_inactive();
             return;
+        }
+
+        if !response.changed
+            && let Some(window) = response.focus_window
+        {
+            if let Some(space) =
+                workspace_switch_space.or_else(|| self.best_space_for_window_id(window))
+            {
+                LayoutManager::refresh_stack_tabs(self, space);
+            }
         }
 
         let mut pending_refocus_space =

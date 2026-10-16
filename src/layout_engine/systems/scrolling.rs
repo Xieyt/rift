@@ -244,7 +244,7 @@ struct Geometry {
     frames: Vec<(WindowId, CGRect)>,
     bounds: (f64, f64),
     snaps: Vec<SnapPoint>,
-    stack_line: (f64, crate::common::config::HorizontalPlacement),
+    stack_line: crate::common::config::StackLineReserve,
 }
 
 /// Prepared world frames and temporary camera motion. Built only at semantic
@@ -404,7 +404,7 @@ impl Geometry {
         screen: CGRect,
         constraints: HashMap<WindowId, WindowLayoutConstraints>,
         gaps: GapSettings,
-        stack_line: (f64, crate::common::config::HorizontalPlacement),
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Self {
         let tiling = compute_tiling_area(screen, &gaps);
         let mut columns = Vec::with_capacity(state.columns.len());
@@ -483,9 +483,9 @@ impl Geometry {
             // is ordered below the windows — is not occluded by the focused tab.
             let tabbed = column.tabbed && column.windows.len() > 1;
             let (tab_y, tab_height) = if tabbed {
-                let bar = stack_line.0.max(0.0);
+                let bar = stack_line.total().max(0.0);
                 let h = (tiling.size.height - bar).max(1.0);
-                let y = match stack_line.1 {
+                let y = match stack_line.horiz {
                     crate::common::config::HorizontalPlacement::Top => tiling.origin.y + bar,
                     _ => tiling.origin.y,
                 };
@@ -546,7 +546,7 @@ impl Geometry {
         screen: CGRect,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &GapSettings,
-        stack_line: (f64, crate::common::config::HorizontalPlacement),
+        stack_line: crate::common::config::StackLineReserve,
     ) -> bool {
         self.screen == screen
             && self.constraints == *constraints
@@ -871,7 +871,7 @@ impl LayoutState {
         screen: CGRect,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &GapSettings,
-        stack_line: (f64, crate::common::config::HorizontalPlacement),
+        stack_line: crate::common::config::StackLineReserve,
     ) {
         if self
             .geometry
@@ -1113,7 +1113,7 @@ pub struct ScrollingLayoutSystem {
     /// threaded through every call. Part of `Geometry::matches`, so toggling the
     /// bar invalidates the cache instead of leaving stale insets (§12.6 H6).
     #[serde(skip)]
-    stack_line: std::cell::Cell<(f64, crate::common::config::HorizontalPlacement)>,
+    stack_line: std::cell::Cell<crate::common::config::StackLineReserve>,
 }
 
 impl ScrollingLayoutSystem {
@@ -1257,9 +1257,7 @@ impl ScrollingLayoutSystem {
         layout: LayoutId,
         _screen: CGRect,
         _gaps: &crate::common::config::GapSettings,
-        _stack_line_thickness: f64,
-        _stack_line_horiz: crate::common::config::HorizontalPlacement,
-        _stack_line_vert: crate::common::config::VerticalPlacement,
+        _stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<crate::layout_engine::engine::GroupContainerInfo> {
         let Some(state) = self.layouts.get(layout) else {
             return Vec::new();
@@ -1746,13 +1744,11 @@ impl LayoutSystem for ScrollingLayoutSystem {
         _stack_offset: f64,
         constraints: &HashMap<WindowId, WindowLayoutConstraints>,
         gaps: &GapSettings,
-        stack_line_thickness: f64,
-        stack_line_horiz: crate::common::config::HorizontalPlacement,
-        _stack_line_vert: crate::common::config::VerticalPlacement,
+        stack_line: crate::common::config::StackLineReserve,
     ) -> Vec<(WindowId, CGRect)> {
         // The one trait entry point handed the indicator geometry; record it so
         // `prepare_layout`'s geometry builds agree with this one (FORK.md §2.D).
-        self.stack_line.set((stack_line_thickness, stack_line_horiz));
+        self.stack_line.set(stack_line);
         self.calculate_frames(layout, screen, constraints, gaps, true)
     }
 
@@ -2461,9 +2457,12 @@ pub(crate) mod tests {
                 0.0,
                 &f.constraints,
                 &f.gaps,
-                bar,
-                horiz,
-                VerticalPlacement::Left,
+                crate::common::config::StackLineReserve {
+                    thickness: bar,
+                    spacing: 0.0,
+                    horiz,
+                    vert: VerticalPlacement::Left,
+                },
             )
         };
         let top = frames_with(HorizontalPlacement::Top);
@@ -2486,9 +2485,7 @@ pub(crate) mod tests {
             0.0,
             &f.constraints,
             &f.gaps,
-            0.0,
-            HorizontalPlacement::Bottom,
-            VerticalPlacement::Left,
+            crate::common::config::StackLineReserve::default(),
         );
         let none_f = none.iter().find(|(w, _)| *w == wid(1)).unwrap().1;
         assert!(
@@ -2510,9 +2507,7 @@ pub(crate) mod tests {
             f.layout,
             f.screen,
             &f.gaps,
-            0.0,
-            HorizontalPlacement::Bottom,
-            VerticalPlacement::Left,
+            crate::common::config::StackLineReserve::default(),
         );
         assert_eq!(groups.len(), 1, "only the tabbed column is a group");
         assert_eq!(groups[0].total_count, 2);

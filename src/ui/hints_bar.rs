@@ -25,7 +25,53 @@ use crate::common::config::{
     HintsBarPad, HintsBarPosition, HintsBarSettings,
 };
 use crate::sys::app::NSRunningApplicationExt;
-use crate::ui::stack_line::{Color, point_hits_indicator_frame};
+
+// ---- re-homed from src/ui/stack_line.rs ------------------------------
+// Upstream's 952fc17 replaced the custom-drawn stack-line indicator with a
+// native cgs::TabBar and DELETED that file (UPSTREAM-SYNC.md §12.3: fork
+// feature C is superseded). These two were the only pieces the hint bar — a
+// fork-only subsystem upstream has no equivalent of — still needed.
+
+#[derive(Debug, Clone, Copy)]
+pub struct Color {
+    pub r: f64,
+    pub g: f64,
+    pub b: f64,
+    pub a: f64,
+}
+
+impl Color {
+    pub fn new(r: f64, g: f64, b: f64, a: f64) -> Self { Self { r, g, b, a } }
+
+    pub fn blue() -> Self { Self::new(0.0, 0.5, 1.0, 1.0) }
+
+    pub fn light_gray() -> Self { Self::new(0.8, 0.8, 0.8, 1.0) }
+
+    pub fn gray() -> Self { Self::new(0.6, 0.6, 0.6, 1.0) }
+
+    pub fn to_nscolor(&self) -> Retained<objc2_app_kit::NSColor> {
+        objc2_app_kit::NSColor::colorWithRed_green_blue_alpha(self.r, self.g, self.b, self.a)
+    }
+
+    /// Parse `#RRGGBB` or `#RRGGBBAA` (case-insensitive, leading `#` optional).
+    pub fn from_hex(s: &str) -> Option<Self> {
+        let s = s.trim().trim_start_matches('#');
+        let (r, g, b, a): (&str, &str, &str, &str) = match s.len() {
+            6 => (&s[0..2], &s[2..4], &s[4..6], "ff"),
+            8 => (&s[0..2], &s[2..4], &s[4..6], &s[6..8]),
+            _ => return None,
+        };
+        let p = |h: &str| u8::from_str_radix(h, 16).ok().map(|v| v as f64 / 255.0);
+        Some(Self::new(p(r)?, p(g)?, p(b)?, p(a)?))
+    }
+}
+
+pub fn point_hits_indicator_frame(point: CGPoint, frame: CGRect) -> bool {
+    point.x >= frame.origin.x
+        && point.x < frame.origin.x + frame.size.width
+        && point.y >= frame.origin.y
+        && point.y < frame.origin.y + frame.size.height
+}
 
 // Chip layout metrics (in points, before any fit-scaling).
 const MARGIN: f64 = 8.0; // gap from the bar's left/right edge

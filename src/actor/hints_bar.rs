@@ -23,8 +23,8 @@ use crate::sys::screen::SpaceId;
 use crate::sys::timer::Timer;
 use crate::ui::hints_bar::{
     ColumnCell, HintsBar as HintsBarWindow, HintsBarData, HintsBarStyle, WorkspaceCell,
+    point_hits_indicator_frame,
 };
-use crate::ui::stack_line::point_hits_indicator_frame;
 
 /// Bar frames published for the event tap to hit-test clicks against.
 pub type SharedHitRects = Arc<ArcSwap<Vec<CGRect>>>;

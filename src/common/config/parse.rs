@@ -296,9 +296,52 @@ fn migrate_legacy_window_snapping(document: &mut toml::Value) -> bool {
     settings.remove("window_snapping").is_some()
 }
 
+/// The stack line became native tabs: drop the old indicator colors and raise thin
+/// indicator thicknesses to the smallest usable tab bar.
+fn migrate_legacy_stack_line(document: &mut toml::Value) -> bool {
+    let Some(stack_line) = ["settings", "ui", "stack_line"]
+        .into_iter()
+        .try_fold(document, |table, key| table.get_mut(key))
+        .and_then(toml::Value::as_table_mut)
+    else {
+        return false;
+    };
+    let mut migrated = false;
+    // The first three are upstream's own legacy names. The rest are the fork's
+    // retired feature-C theming keys (UPSTREAM-SYNC.md §12.3): upstream's native
+    // cgs::TabBar has no colour/font API, so the fields are gone. `ConfigSource`
+    // is `deny_unknown_fields`, so without stripping them here EVERY existing
+    // fork user's config stops parsing at startup and rift silently falls back
+    // to defaults — §12.6 HZ-2, the second of the two data-losing hazards.
+    for key in [
+        "selected_color",
+        "unselected_color",
+        "border_color",
+        "show_titles",
+        "active_color",
+        "inactive_color",
+        "active_title_color",
+        "inactive_title_color",
+        "font_size",
+        "border_width",
+    ] {
+        migrated |= stack_line.remove(key).is_some();
+    }
+    let min = StackLineSettings::MIN_THICKNESS;
+    if let Some(thickness) = stack_line.get_mut("thickness") {
+        let value = thickness.as_float().or_else(|| thickness.as_integer().map(|v| v as f64));
+        if value.is_some_and(|value| value.is_finite() && value < min) {
+            *thickness = toml::Value::Float(min);
+            migrated = true;
+        }
+    }
+    migrated
+}
+
 pub(super) fn parse_config_file(buf: &str) -> Result<ConfigSource, toml::de::Error> {
     let mut document = toml::from_str::<toml::Value>(buf)?;
     migrate_legacy_resize_bindings(&mut document);
     migrate_legacy_window_snapping(&mut document);
+    migrate_legacy_stack_line(&mut document);
     document.try_into()
 }

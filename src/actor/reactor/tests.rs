@@ -92,6 +92,98 @@ fn no_op_layout_command_does_not_schedule_arrange() {
 
     assert_eq!(outcome.arrange.passes, 0);
     assert_eq!(outcome.layout_responses.len(), 1);
+    let before = reactor.layout_update_count;
+    reactor.apply_event_outcome(outcome);
+    assert_eq!(reactor.layout_update_count, before);
+}
+
+#[test]
+fn combined_inventory_geometry_changes_arrange_and_notify_once() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(3));
+    apps.requests();
+    let (tx, rx) = super::animation::AnimationSender::channel();
+    reactor.animation_tx = Some(tx);
+    reactor.config.settings.animate = true;
+    let (tx, mut broadcasts) = crate::actor::channel();
+    reactor.communication_manager.event_broadcaster = tx;
+    let windows: Vec<_> = (1..=3).map(|idx| WindowId::new(1, idx)).collect();
+    let observed = windows
+        .iter()
+        .map(|&wid| {
+            let mut info = reactor.state.windows.window(wid).unwrap().info.clone();
+            info.frame.origin.x += 40.0;
+            (wid, info)
+        })
+        .collect();
+    let before = reactor.layout_update_count;
+    reactor.discover_test_windows(1, observed, windows.clone());
+    assert_eq!(reactor.layout_update_count - before, 1);
+    let message = rx.commands.try_recv().expect("animation command");
+    assert!(matches!(message, super::animation::Message::Replace(_)));
+    assert!(rx.commands.try_recv().is_err(), "duplicate animation command");
+    super::animation::AnimationManager::new().handle_message(message);
+    let mut animated: Vec<_> = apps
+        .requests()
+        .into_iter()
+        .filter_map(|request| match request {
+            Request::BeginWindowAnimation(window) => Some(window),
+            _ => None,
+        })
+        .collect();
+    animated.sort();
+    assert_eq!(animated, windows);
+    assert_eq!(
+        std::iter::from_fn(|| broadcasts.try_recv().ok())
+            .filter(|(_, event)| matches!(event, BroadcastEvent::LayoutChanged { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn secondary_arrangement_only_updates_a_space_outside_primary_scope() {
+    for (scope, expected) in [
+        (None, 1),
+        (Some(SpaceId::new(1)), 1),
+        (Some(SpaceId::new(2)), 2),
+    ] {
+        let (mut reactor, _, _, source, _, _, _) = reactor_with_window_on_space1_two_displays();
+        let mut outcome = EventOutcome::layout_changed(false).with_arrange_space_scope(scope);
+        outcome.arrange.secondary_space_scope = Some(source);
+        let before = reactor.layout_update_count;
+        reactor.apply_event_outcome(outcome);
+        assert_eq!(reactor.layout_update_count - before, expected);
+    }
+}
+
+#[test]
+fn membership_removal_events_retile_once_and_ignore_repeated_notifications() {
+    for kind in 0..3 {
+        let (mut apps, mut reactor) = test_context();
+        let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+        let space = SpaceId::new(1);
+        apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(2));
+        let removed = WindowId::new(1, 2);
+        let wsid = reactor.test_window_server_id(removed);
+        let event = || match kind {
+            0 => Event::WindowMinimized(removed),
+            1 => Event::WindowDestroyed(removed),
+            _ => Event::WindowClosed(wsid),
+        };
+        let before = reactor.layout_update_count;
+        reactor.handle_event(event());
+        assert_eq!(reactor.layout_update_count - before, 1, "{:?}", event());
+        reactor.handle_event(event());
+        assert_eq!(reactor.layout_update_count - before, 1);
+        apps.simulate_until_quiet(&mut reactor);
+        let layout = test_layout(&mut reactor, space, screen);
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].0, WindowId::new(1, 1));
+        assert!(apps.windows[&layout[0].0].frame.same_as(layout[0].1));
+    }
 }
 
 #[test]
@@ -1702,6 +1794,9 @@ fn external_resize_requests_one_arrange_pass() {
     assert!(outcome.arrange.passes > 0);
     assert_eq!(outcome.arrange.passes, 1);
     assert!(outcome.arrange.is_resize);
+    let before = reactor.layout_update_count;
+    reactor.apply_event_outcome(outcome);
+    assert_eq!(reactor.layout_update_count - before, 1);
 }
 
 #[test]
@@ -1979,6 +2074,12 @@ fn cancelling_tiled_modifier_move_reconciles_layout() {
     reactor.drag_manager.actor.motion(crate::actor::drag::DragMotion {
         point: CGPoint::new(frame.mid().x + 30.0, frame.mid().y),
     });
+    assert!(reactor.is_in_drag());
+    let before = reactor.layout_update_count;
+    reactor.apply_event_outcome(EventOutcome::layout_changed(false));
+    assert_eq!(reactor.layout_update_count, before);
+    reactor.apply_event_outcome(EventOutcome::window_membership_changed(true, false));
+    assert_eq!(reactor.layout_update_count - before, 1);
     reactor.drag_manager.externally_controlled_window = Some(wid);
     let move_cancel = reactor.dispatch_workflow(Event::DragCancel).unwrap();
     assert!(move_cancel.arrange.passes > 0);
@@ -1996,8 +2097,11 @@ fn cancelling_tiled_modifier_move_reconciles_layout() {
     let mut config = reactor.config.clone();
     config.settings.drag_drop.enabled = false;
     let config_cancel = reactor.dispatch_workflow(Event::ConfigUpdated(config)).unwrap();
-    assert!(config_cancel.arrange.passes > 0);
+    assert_eq!(config_cancel.arrange.passes, 1);
     assert!(!reactor.drag_manager.actor.is_active());
+    let before = reactor.layout_update_count;
+    reactor.apply_event_outcome(config_cancel);
+    assert_eq!(reactor.layout_update_count - before, 1);
 }
 
 #[test]
@@ -2943,7 +3047,9 @@ fn workspace_switch_batches_all_window_positions_with_eui_enabled() {
     apps.simulate_until_quiet(&mut reactor);
     let _ = apps.requests();
 
+    let before = reactor.layout_update_count;
     reactor.handle_test_layout_command(LayoutCommand::SwitchToWorkspace(1));
+    assert_eq!(reactor.layout_update_count - before, 1);
 
     let requests = apps.requests();
     assert!(
@@ -3061,8 +3167,6 @@ fn topology_change_clears_stale_pending_hide_target_before_next_workspace_layout
             space,
             screen,
             &gaps,
-            0.0,
-            Default::default(),
             Default::default(),
             |query_wid| {
                 reactor.state.windows.window(query_wid).map(|window| window.frame_monotonic)
@@ -5395,21 +5499,17 @@ fn has_window_in_layout(
     reactor
         .layout_manager
         .layout_engine
-        .calculate_layout(space, screen, &gaps, 0.0, Default::default(), Default::default())
+        .calculate_layout(space, screen, &gaps, Default::default())
         .iter()
         .any(|(layout_wid, _)| *layout_wid == wid)
 }
 
 fn test_layout(reactor: &mut Reactor, space: SpaceId, screen: CGRect) -> Vec<(WindowId, CGRect)> {
     let gaps = reactor.config.settings.layout.gaps.clone();
-    reactor.layout_manager.layout_engine.calculate_layout(
-        space,
-        screen,
-        &gaps,
-        0.0,
-        crate::common::config::HorizontalPlacement::Top,
-        crate::common::config::VerticalPlacement::Right,
-    )
+    reactor
+        .layout_manager
+        .layout_engine
+        .calculate_layout(space, screen, &gaps, Default::default())
 }
 
 fn make_active_app(
@@ -7420,8 +7520,6 @@ fn laid_out_frame(
             space,
             screen,
             &gaps,
-            0.0,
-            Default::default(),
             Default::default(),
             |q| reactor.state.windows.window(q).map(|w| w.frame_monotonic),
             &[screen],
@@ -7616,6 +7714,16 @@ fn overview_cross_display_drop_arranges_only_source_and_destination_spaces() {
         target
     );
     assert_eq!(reactor.state.windows.workspace_for_window(source, window), None);
+    apps.requests();
+    let before = reactor.layout_update_count;
+    reactor.apply_event_outcome(outcome);
+    assert_eq!(reactor.layout_update_count - before, 2);
+    apps.simulate_until_quiet(&mut reactor);
+    for (wid, space) in [(window, destination), (WindowId::new(1, 2), source)] {
+        let screen = reactor.space_state.screen_by_space(space).unwrap().frame;
+        let expected = laid_out_frame(&mut reactor, space, screen, wid).unwrap();
+        assert!(apps.windows[&wid].frame.same_as(expected));
+    }
 }
 
 #[test]
@@ -8097,4 +8205,156 @@ fn topology_snapshot_preserves_workspace_placement_with_incomplete_delta() {
             }
         }
     }
+}
+
+#[test]
+fn stack_tabs_follow_focus_without_arranging_windows() {
+    let (mut apps, mut reactor) = test_context();
+    let space = SpaceId::new(1);
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    reactor.config.settings.ui.stack_line.enabled = true;
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    reactor.handle_events(apps.make_app(1, make_windows(2)));
+    apps.simulate_until_quiet(&mut reactor);
+    reactor.handle_test_layout_command(LayoutCommand::ToggleStack);
+    apps.simulate_until_quiet(&mut reactor);
+    let (tx, mut rx) = actor::channel();
+    reactor.communication_manager.stack_line_tx = Some(tx);
+    let first = WindowId::new(1, 1);
+    let second = WindowId::new(1, 2);
+    for window in [second, first, first] {
+        reactor.handle_event(Event::WindowServerFocusChanged(window, space));
+        let (_, stack_line::Event::GroupsUpdated { groups, .. }) =
+            rx.try_recv().expect("focus-only changes must publish fresh tab selection")
+        else {
+            panic!("expected tab groups");
+        };
+        assert!(groups.iter().any(|group| {
+            group.tabs.get(group.selected_index).is_some_and(|tab| tab.window_id == window)
+        }));
+        assert!(
+            !apps
+                .requests()
+                .iter()
+                .any(|request| matches!(request, Request::SetWindowFrames(..))),
+            "focus must not arrange windows"
+        );
+    }
+}
+
+type Inbox<T> = actor::Receiver<T>;
+
+/// Three offset windows in a stack, with tab and broadcast events captured from the start.
+fn stacked_reactor(
+    horizontal: bool,
+) -> (Apps, Reactor, Inbox<stack_line::Event>, Inbox<BroadcastEvent>) {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    reactor.config.settings.layout.stack.stack_offset = 40.0;
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(SpaceId::new(1))]));
+    reactor.handle_events(apps.make_app(1, make_windows(3)));
+    apps.simulate_until_quiet(&mut reactor);
+    let (tabs_tx, tabs) = actor::channel();
+    let (events_tx, events) = actor::channel();
+    reactor.communication_manager.stack_line_tx = Some(tabs_tx);
+    reactor.communication_manager.event_broadcaster = events_tx;
+    reactor.handle_test_layout_command(LayoutCommand::ToggleStack);
+    if horizontal {
+        reactor.handle_test_layout_command(LayoutCommand::ToggleOrientation);
+    }
+    apps.simulate_until_quiet(&mut reactor);
+    (apps, reactor, tabs, events)
+}
+
+fn last_groups(rx: &mut Inbox<stack_line::Event>) -> Option<Vec<stack_line::GroupInfo>> {
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|(_, event)| match event {
+            stack_line::Event::GroupsUpdated { groups, .. } => Some(groups),
+            _ => None,
+        })
+        .last()
+}
+
+#[test]
+fn stack_tabs_publish_in_on_screen_order_and_follow_focus() {
+    for horizontal in [true, false] {
+        let (mut apps, mut reactor, mut tabs, mut events) = stacked_reactor(horizontal);
+        let along = |reactor: &Reactor, window: WindowId| {
+            let origin = reactor.state.windows.window(window).unwrap().frame_monotonic.origin;
+            if horizontal { origin.x } else { origin.y }
+        };
+        for idx in [3, 1, 2] {
+            let focused = WindowId::new(1, idx);
+            reactor.handle_event(Event::WindowServerFocusChanged(focused, SpaceId::new(1)));
+            let [group] = &last_groups(&mut tabs).unwrap()[..] else {
+                panic!()
+            };
+            assert_eq!(group.horizontal, horizontal);
+            let at: Vec<_> = group.tabs.iter().map(|t| along(&reactor, t.window_id)).collect();
+            assert!(at.len() == 3 && at.windows(2).all(|p| p[0] < p[1]), "{at:?}");
+            assert_eq!(group.tabs[group.selected_index].window_id, focused);
+        }
+        // A tab click focuses its window.
+        let clicked = WindowId::new(1, 3);
+        reactor.handle_event(Event::Command(Command::Reactor(ReactorCommand::FocusWindow {
+            window_id: clicked.into(),
+            window_server_id: None,
+        })));
+        apps.simulate_until_quiet(&mut reactor);
+        let [group] = &last_groups(&mut tabs).unwrap()[..] else {
+            panic!()
+        };
+        assert_eq!(group.tabs[group.selected_index].window_id, clicked);
+        // Clients have always received vertical stacks bottom to top.
+        let stack = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|(_, event)| match event {
+                BroadcastEvent::StacksChanged { mut stacks, .. } => stacks.pop(),
+                _ => None,
+            })
+            .last()
+            .unwrap();
+        let mut expected: Vec<_> =
+            group.tabs.iter().map(|t| t.window_id.to_debug_string()).collect();
+        if !horizontal {
+            expected.reverse();
+        }
+        assert_eq!(stack.windows, expected);
+    }
+}
+
+#[test]
+fn toggling_stack_tabs_reserves_and_publishes_only_while_enabled() {
+    let (mut apps, mut reactor, mut tabs, _) = stacked_reactor(false);
+    let left = |reactor: &Reactor| {
+        reactor
+            .state
+            .windows
+            .window(WindowId::new(1, 1))
+            .unwrap()
+            .frame_monotonic
+            .origin
+            .x
+    };
+    let enabled_left = left(&reactor);
+    last_groups(&mut tabs);
+    for enabled in [false, true] {
+        let mut config = reactor.config.clone();
+        config.settings.ui.stack_line.enabled = enabled;
+        reactor.handle_event(Event::ConfigUpdated(config));
+        reactor.handle_event(Event::WindowServerFocusChanged(
+            WindowId::new(1, 2),
+            SpaceId::new(1),
+        ));
+        apps.simulate_until_quiet(&mut reactor);
+        // A vertical stack's bar sits on its left edge.
+        assert_eq!(enabled_left - left(&reactor), if enabled { 0.0 } else { 28.0 });
+        assert_eq!(last_groups(&mut tabs).map(|g| g.len()), enabled.then_some(1));
+    }
+    reactor.handle_test_layout_command(LayoutCommand::ToggleStack);
+    apps.simulate_until_quiet(&mut reactor);
+    assert_eq!(
+        last_groups(&mut tabs),
+        Some(Vec::new()),
+        "unstacked spaces drop their bars"
+    );
 }

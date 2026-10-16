@@ -15,15 +15,15 @@ use objc2_core_graphics::{
 };
 use tracing::{debug, error, trace, warn};
 
+use super::hints_bar;
 use super::reactor::{self, Event};
-use super::{hints_bar, stack_line};
 use crate::actor;
 use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{
     BindingModeSpecs, Config, DragDropSettings, HorizontalMouseWarp, LayoutMode, MouseAction,
-    MouseModifier, StackLineHoverMode,
+    MouseModifier,
 };
 use crate::sys::event::{self, Hotkey, KeyCode};
 use crate::sys::hotkey::{
@@ -31,8 +31,9 @@ use crate::sys::hotkey::{
     modifiers_from_flags_with_keys,
 };
 use crate::sys::screen::{CoordinateConverter, SpaceId};
+use crate::sys::timer::Timer;
 use crate::sys::{gesture, power, window_server};
-use crate::ui::stack_line::point_hits_indicator_frame;
+use crate::ui::hints_bar::point_hits_indicator_frame;
 
 const MOUSE_MOVE_MIN_INTERVAL_NS_NORMAL: u64 = 16_000_000; // 16ms ~= 62 Hz
 const MOUSE_MOVE_MIN_INTERVAL_NS_LOW_POWER: u64 = 32_000_000; // 32ms ~= 31 Hz
@@ -80,9 +81,7 @@ pub struct Input {
     active_mode: Cell<usize>,
     hotkeys_active: Cell<bool>,
     wm_sender: wm_controller::Sender,
-    stack_line_tx: stack_line::Sender,
     mission_control_tx: RefCell<Option<super::mission_control::Sender>>,
-    stack_line_hit_rects: stack_line::SharedHitRects,
     hints_bar_tx: hints_bar::Sender,
     hints_bar_hit_rects: hints_bar::SharedHitRects,
 }
@@ -104,16 +103,13 @@ struct State {
     screens: Vec<CGRect>,
     event_processing_enabled: bool,
     focus_follows_mouse_enabled: bool,
-    stack_line_enabled: bool,
     hints_bar_enabled: bool,
-    stack_line_hover_mode: StackLineHoverMode,
     disable_hotkey_active: bool,
     low_power_mode: bool,
     pressed_keys: HashSet<KeyCode>,
     current_flags: CGEventFlags,
     screen_spaces: Vec<(CGRect, SpaceId)>,
     layout_mode_by_space: HashMap<SpaceId, crate::common::config::LayoutMode>,
-    last_stack_line_hit: Option<bool>,
     mouse_features_enabled: bool,
     mouse_settings: DragDropSettings,
     captured_button: Option<crate::actor::drag::MouseButton>,
@@ -131,16 +127,13 @@ impl Default for State {
             screens: Vec::new(),
             event_processing_enabled: false,
             focus_follows_mouse_enabled: true,
-            stack_line_enabled: false,
             hints_bar_enabled: false,
-            stack_line_hover_mode: StackLineHoverMode::default(),
             disable_hotkey_active: false,
             low_power_mode: power::is_low_power_mode_enabled(),
             pressed_keys: HashSet::with_capacity_and_hasher(256, Default::default()),
             current_flags: CGEventFlags::empty(),
             screen_spaces: Vec::new(),
             layout_mode_by_space: HashMap::default(),
-            last_stack_line_hit: None,
             mouse_features_enabled: false,
             mouse_settings: DragDropSettings::default(),
             captured_button: None,
@@ -180,21 +173,16 @@ impl Input {
             hotkeys_enabled || keyed_disable || self.mission_control_active.get(),
             hotkeys_enabled || disable_hotkey.is_some(),
             (state.event_processing_enabled
-                && (state.stack_line_enabled
-                    || state.mouse_hides_on_focus
+                && (state.mouse_hides_on_focus
                     || self.horizontal_mouse_warp.get().is_some()
                     || (state.focus_follows_mouse_config_enabled
                         && state.focus_follows_mouse_enabled)))
                 || self.mission_control_active.get(),
-            // The buttons argument. §2.E: the hint bar hit-tests LeftMouseDown to
-            // route chip clicks, so it must keep button delivery alive on its own.
-            // Before this, the mask only asked for buttons when stack_line or
-            // mouse_hides_on_focus was on, so a hints_bar-only config - the one §2.E
-            // recommends - got no MouseDown events at all and every chip was dead.
+            // §2.E: the hint bar hit-tests LeftMouseDown to route chip clicks,
+            // so it must keep button delivery alive on its own. Upstream's
+            // native tab bar hit-tests itself and no longer contributes here.
             state.event_processing_enabled
-                && (state.stack_line_enabled
-                    || state.hints_bar_enabled
-                    || state.mouse_hides_on_focus),
+                && (state.hints_bar_enabled || state.mouse_hides_on_focus),
             // Mouse-up delivery is part of the stable configured mask. Drag
             // start/stop is frequent enough that rebuilding the WindowServer
             // tap costs more than filtering these releases in the callback.
@@ -310,9 +298,7 @@ impl Input {
         events_tx: reactor::Sender,
         requests_rx: Receiver,
         wm_sender: wm_controller::Sender,
-        stack_line_tx: stack_line::Sender,
         mission_control_tx: Option<super::mission_control::Sender>,
-        stack_line_hit_rects: stack_line::SharedHitRects,
         hints_bar_tx: hints_bar::Sender,
         hints_bar_hit_rects: hints_bar::SharedHitRects,
         native_motion_active: Arc<AtomicBool>,
@@ -325,9 +311,7 @@ impl Input {
         let mut state = State::default();
         state.mouse_hides_on_focus = config.settings.mouse_hides_on_focus;
         state.focus_follows_mouse_config_enabled = config.settings.focus_follows_mouse;
-        state.stack_line_enabled = config.settings.ui.stack_line.enabled;
         state.hints_bar_enabled = config.settings.ui.hints_bar.enabled;
-        state.stack_line_hover_mode = config.settings.ui.stack_line.hover;
         state.default_layout_mode = config.settings.layout.mode;
         state.mouse_features_enabled = config.settings.drag_drop.enabled;
         state.mouse_settings = config.settings.drag_drop;
@@ -363,9 +347,7 @@ impl Input {
             active_mode: Cell::new(0),
             hotkeys_active: Cell::new(false),
             wm_sender,
-            stack_line_tx,
             mission_control_tx: RefCell::new(mission_control_tx),
-            stack_line_hit_rects,
             hints_bar_tx,
             hints_bar_hit_rects,
         };
@@ -391,17 +373,28 @@ impl Input {
             }
         }
 
+        // One reusable hold timer, rearmed only when the deadline changes.
+        let mut hold_timer = Timer::manual();
+        let mut armed = None;
         loop {
             let hold_deadline = this.gesture_filter.borrow().hold_deadline();
+            if hold_deadline != armed {
+                armed = hold_deadline;
+                hold_timer.set_next_fire(hold_deadline.map_or(Duration::MAX, |d| {
+                    d.saturating_duration_since(std::time::Instant::now())
+                }));
+            }
             tokio::select! {
-                _ = async { crate::sys::timer::Timer::sleep(hold_deadline.unwrap().saturating_duration_since(std::time::Instant::now())).await }, if hold_deadline.is_some() => {
+                Some(()) = hold_timer.next(), if armed.is_some() => {
+                    // Fires once per arm; rearm next turn even if the deadline is unchanged.
+                    armed = None;
                     let owner = this.gesture_control.ownership_guard();
                     this.gesture_filter.borrow_mut().release_expired(*owner);
                 }
 
                 // select evaluates disabled futures too; defer timer creation
                 // so healthy taps allocate no timer and schedule no wakeup.
-                _ = async { crate::sys::timer::Timer::sleep(Duration::from_secs(1)).await },
+                _ = async { Timer::sleep(Duration::from_secs(1)).with_tolerance(Duration::from_millis(100)).await },
                     if this.tap.borrow().is_none() && this.desired_event_mask() != 0 => {
                     this.rebuild_event_tap_mask_if_needed(&recovery_tx);
                     if this.tap.borrow().is_some() { this.reconcile_after_tap_reenabled(); }
@@ -514,7 +507,6 @@ impl Input {
                     self.events_tx.send(Event::DragCancel);
                 }
                 state.event_processing_enabled = enabled;
-                state.reset(enabled);
                 if enabled {
                     self.reset_mouse_move_sample_gate();
                 }
@@ -526,7 +518,6 @@ impl Input {
                     if enabled { "enabled" } else { "disabled" }
                 );
                 state.focus_follows_mouse_enabled = enabled;
-                state.reset(enabled);
                 if enabled {
                     self.reset_mouse_move_sample_gate();
                 }
@@ -559,9 +550,7 @@ impl Input {
                 state.gesture_settings = super::gesture::Settings::new(&new_config);
                 let mouse_hides_on_focus = new_config.settings.mouse_hides_on_focus;
                 let focus_follows_mouse_config_enabled = new_config.settings.focus_follows_mouse;
-                let stack_line_enabled = new_config.settings.ui.stack_line.enabled;
                 let hints_bar_enabled = new_config.settings.ui.hints_bar.enabled;
-                let stack_line_hover_mode = new_config.settings.ui.stack_line.hover;
                 let default_layout_mode = new_config.settings.layout.mode;
                 let mouse_features_enabled = new_config.settings.drag_drop.enabled;
                 let disable_hotkey = new_config
@@ -574,21 +563,17 @@ impl Input {
                     let prev_mouse_hides_on_focus = state.mouse_hides_on_focus;
                     let prev_focus_follows_mouse_config_enabled =
                         state.focus_follows_mouse_config_enabled;
-                    let prev_stack_line_enabled = state.stack_line_enabled;
-                    let prev_stack_line_hover_mode = state.stack_line_hover_mode;
                     state.mouse_hides_on_focus = mouse_hides_on_focus;
                     state.focus_follows_mouse_config_enabled = focus_follows_mouse_config_enabled;
                     let direction = new_config.settings.horizontal_mouse_warp;
                     if self.horizontal_mouse_warp.replace(direction) != direction {
                         sort_warp_screens(&mut self.warp_screens.borrow_mut(), direction);
                     }
-                    state.stack_line_enabled = stack_line_enabled;
                     // §2.E hot reload: toggling `ui.hints_bar.enabled` must rebuild
                     // the tap mask, or chips stay dead until restart (see
                     // `desired_event_mask`). `should_rebuild_mask` is already set for
                     // every ConfigUpdated below.
                     state.hints_bar_enabled = hints_bar_enabled;
-                    state.stack_line_hover_mode = stack_line_hover_mode;
                     state.default_layout_mode = default_layout_mode;
                     state.mouse_features_enabled = mouse_features_enabled;
                     state.mouse_settings = new_config.settings.drag_drop;
@@ -600,15 +585,11 @@ impl Input {
                         .map(|target| state.compute_disable_hotkey_active(target))
                         .unwrap_or(false);
                     if prev_active && !state.disable_hotkey_active {
-                        state.reset(true);
                         self.reset_mouse_move_sample_gate();
                     }
                     if prev_focus_follows_mouse_config_enabled
                         != state.focus_follows_mouse_config_enabled
-                        || prev_stack_line_enabled != state.stack_line_enabled
-                        || prev_stack_line_hover_mode != state.stack_line_hover_mode
                     {
-                        state.reset_mouse_sampling();
                         self.reset_mouse_move_sample_gate();
                     }
                     if prev_mouse_hides_on_focus
@@ -635,7 +616,6 @@ impl Input {
                 if state.low_power_mode != enabled {
                     debug!("low_power_mode changed in event tap: {}", enabled);
                     state.low_power_mode = enabled;
-                    state.reset_mouse_sampling();
                     self.mouse_move_min_interval_ticks.set(mouse_move_sampling_profile(enabled));
                     self.reset_mouse_move_sample_gate();
                 }
@@ -677,7 +657,6 @@ impl Input {
         state.disable_hotkey_active = state.compute_disable_hotkey_active(&target);
         if state.disable_hotkey_active != prev_active {
             if !state.disable_hotkey_active {
-                state.reset(true);
                 self.reset_mouse_move_sample_gate();
             }
         }
@@ -842,19 +821,6 @@ impl Input {
                     });
                     return false;
                 }
-                if state.stack_line_enabled {
-                    let loc = CGEvent::location(Some(event));
-                    let hits = self
-                        .stack_line_hit_rects
-                        .load()
-                        .iter()
-                        .copied()
-                        .any(|frame| point_hits_indicator_frame(loc, frame));
-                    if hits && !window_server::is_point_occluded_by_external_window(loc) {
-                        let _ = self.stack_line_tx.try_send(stack_line::Event::MouseDown(loc));
-                        return false;
-                    }
-                }
                 if state.hints_bar_enabled {
                     let loc = CGEvent::location(Some(event));
                     let hits = self
@@ -936,27 +902,6 @@ impl Input {
                 state.current_flags = flags;
                 state.reconcile_modifier_keys();
                 self.refresh_disable_hotkey_state(&mut state);
-            }
-        }
-
-        // Click mode only needs hit-test transitions for cursor feedback.
-        // Hover mode forwards samples so the actor can detect segment changes.
-        if state.stack_line_enabled {
-            let hits = self
-                .stack_line_hit_rects
-                .load()
-                .iter()
-                .copied()
-                .any(|frame| point_hits_indicator_frame(loc, frame))
-                && !window_server::is_point_occluded_by_external_window(loc);
-            if (state.stack_line_hover_mode != StackLineHoverMode::Click && hits)
-                || state.last_stack_line_hit != Some(hits)
-            {
-                state.last_stack_line_hit = Some(hits);
-                let _ = self.stack_line_tx.try_send(stack_line::Event::MouseMoved {
-                    point: loc,
-                    hits_indicator: hits,
-                });
             }
         }
 
@@ -1332,17 +1277,6 @@ impl State {
             self.pressed_keys.contains(&key_code)
         }
     }
-
-    /// Leaves `captured_button` alone: dropping it here strands a modifier drag without a
-    /// DragCancel, so callers that end a drag take it and cancel explicitly.
-    fn reset(&mut self, enabled: bool) {
-        if enabled {
-            self.reset_mouse_sampling();
-        }
-    }
-
-    #[inline]
-    fn reset_mouse_sampling(&mut self) { self.last_stack_line_hit = None; }
 }
 
 fn mouse_modifier_flag(modifier: MouseModifier) -> CGEventFlags {
@@ -1864,7 +1798,6 @@ mod tests {
         let (events_tx, events_rx) = actor::channel();
         let (_, requests_rx) = actor::channel();
         let (wm_tx, wm_rx) = actor::channel();
-        let (stack_tx, _) = actor::channel();
         let (mc_tx, _) = actor::channel();
         let (hints_tx, _) = actor::channel();
         let mut config = Config::default();
@@ -1873,16 +1806,13 @@ mod tests {
         config.settings.focus_follows_mouse = false;
         config.settings.focus_follows_mouse_disable_hotkey = None;
         config.settings.mouse_hides_on_focus = false;
-        config.settings.ui.stack_line.enabled = false;
         (
             Input::new(
                 config,
                 events_tx,
                 requests_rx,
                 wm_tx,
-                stack_tx,
                 Some(mc_tx),
-                stack_line::new_shared_hit_rects(),
                 hints_tx,
                 hints_bar::new_shared_hit_rects(),
                 Arc::default(),
@@ -2213,19 +2143,6 @@ mod tests {
             events_rx.try_recv().unwrap().1,
             Event::MouseUp(crate::actor::drag::MouseButton::Right)
         ));
-    }
-
-    #[test]
-    fn focus_follows_mouse_reset_keeps_a_captured_drag() {
-        let (input, _, _) = input();
-        let mut state = input.state.borrow_mut();
-        state.captured_button = Some(crate::actor::drag::MouseButton::Left);
-        state.reset(false);
-        state.reset(true);
-        assert_eq!(
-            state.captured_button,
-            Some(crate::actor::drag::MouseButton::Left)
-        );
     }
 
     #[test]

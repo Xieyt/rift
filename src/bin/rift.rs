@@ -106,10 +106,12 @@ fn spawn_supervised<F: Future<Output = ()> + 'static>(
 }
 
 fn main() {
+    let entry = rift_wm::ui::settings::timing::start();
     sigpipe::reset();
     let opt = Cli::parse();
 
     if opt.settings {
+        rift_wm::ui::settings::timing::finish(entry, "entry/argument parsing");
         log::init_logging();
         rift_wm::ui::settings::process::run(opt.config.unwrap_or_else(config_file));
     }
@@ -334,7 +336,6 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
 
     let process_actor = ProcessActor::new(wm_controller_sender.clone(), spaces_tx);
 
-    let stack_line_hit_rects = rift_wm::actor::stack_line::new_shared_hit_rects();
     let hints_bar_hit_rects = rift_wm::actor::hints_bar::new_shared_hit_rects();
     let hints_bar_hit_rects_for_input = hints_bar_hit_rects.clone();
     let menu = Menu::new(
@@ -348,10 +349,10 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
     let stack_line = StackLine::new(
         config.clone(),
         stack_line_rx,
+        stack_line_tx.clone(),
         mtm,
         events_tx.clone(),
         CoordinateConverter::default(),
-        stack_line_hit_rects.clone(),
     );
     let hints_bar = HintsBar::new(
         config.clone(),
@@ -396,9 +397,7 @@ Enable it in System Settings > Desktop & Dock (Mission Control) and restart Rift
             events_tx,
             input_rx,
             input_wm_sender,
-            stack_line_tx,
             input_mc_tx,
-            stack_line_hit_rects,
             hints_bar_tx,
             hints_bar_hit_rects_for_input,
             native_motion_active,
