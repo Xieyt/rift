@@ -192,6 +192,9 @@ install: build
     # Falls back to ad-hoc (re-grant each build) if the cert isn't set up.
     if security find-certificate -c "{{signing_cert}}" "{{sys_keychain}}" >/dev/null 2>&1; then
       sign="{{signing_cert}}"
+      origin="repo default"
+      [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/rift/signing-identity" ] && origin="~/.config/rift/signing-identity"
+      echo "signing with: $sign  ($origin)"
     else
       sign="-"
       echo "!! '{{signing_cert}}' not in System keychain; signing ad-hoc."
