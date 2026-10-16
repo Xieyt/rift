@@ -570,8 +570,13 @@ fn forwarded_space_snapshot_respects_toggled_space_activation_policy() {
     let mut reactor = test_reactor();
     let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
     let space = SpaceId::new(1);
+    let other_screen = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    let other_space = SpaceId::new(2);
 
-    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    reactor.handle_event(space_state_event(vec![screen, other_screen], vec![
+        Some(space),
+        Some(other_space),
+    ]));
     assert!(reactor.is_space_active(space));
 
     reactor.handle_event(Event::Command(Command::Reactor(
@@ -579,12 +584,72 @@ fn forwarded_space_snapshot_respects_toggled_space_activation_policy() {
     )));
     assert!(!reactor.is_space_active(space));
 
-    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    reactor.handle_event(space_state_event(vec![screen, other_screen], vec![
+        Some(space),
+        Some(other_space),
+    ]));
 
     assert!(
         !reactor.is_space_active(space),
         "forwarded raw active spaces must not re-enable a space disabled by ToggleSpaceActivated"
     );
+
+    let displays = reactor.query_displays();
+    let display = serde_json::to_value(rift_protocol::DisplayData::from(displays[0].clone()))
+        .expect("serialize display query");
+    assert_eq!(display["is_visible_space"], true);
+    assert_eq!(display["is_active_space"], false);
+    assert_eq!(display["is_active_context"], true);
+    assert_eq!(display["active_space_ids"], serde_json::json!([]));
+    assert_eq!(display["inactive_space_ids"], serde_json::json!([1]));
+    assert!(displays[1].is_visible_space);
+    assert!(displays[1].is_active_space);
+    assert!(!displays[1].is_active_context);
+
+    reactor.handle_event(Event::Command(Command::Reactor(
+        ReactorCommand::ToggleSpaceActivated,
+    )));
+    assert!(reactor.query_displays()[0].is_active_space);
+}
+
+#[test]
+fn gesture_routes_exclude_disabled_displays_and_clear_when_all_are_disabled() {
+    let mut reactor = test_reactor();
+    let left = CGRect::new(CGPoint::ZERO, CGSize::new(1000., 1000.));
+    let right = CGRect::new(CGPoint::new(1000., 0.), CGSize::new(1000., 1000.));
+    let left_space = SpaceId::new(1);
+    let right_space = SpaceId::new(2);
+    reactor.handle_event(space_state_event(vec![left, right], vec![
+        Some(left_space),
+        Some(right_space),
+    ]));
+    let (input_tx, mut input_rx) = actor::channel();
+    reactor.communication_manager.input_tx = Some(input_tx);
+    reactor.update_event_tap_layout_mode();
+    let initial = input_rx.try_recv().unwrap().1;
+    assert!(matches!(initial, input::Request::LayoutModesChanged(modes) if modes.len() == 2));
+
+    for (space, expected) in [
+        (left_space, vec![right_space]),
+        (right_space, vec![]),
+        (left_space, vec![left_space]),
+    ] {
+        reactor.space_state.command_space = Some(space);
+        reactor.handle_event(Event::Command(Command::Reactor(
+            ReactorCommand::ToggleSpaceActivated,
+        )));
+        let modes = std::iter::from_fn(|| input_rx.try_recv().ok())
+            .filter_map(|(_, request)| match request {
+                input::Request::LayoutModesChanged(modes) => Some(modes),
+                _ => None,
+            })
+            .last()
+            .expect("activation changes must update gesture routing, including an empty set");
+        assert_eq!(
+            modes.into_iter().map(|(space, _)| space).collect::<Vec<_>>(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -7007,55 +7072,64 @@ fn native_tab_departure_keeps_recovery_without_a_native_successor() {
 
 #[test]
 fn closing_focused_window_refocuses_survivor() {
-    let (mut apps, mut reactor) = test_context_with_workspace_count(2);
-    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
-    let space = SpaceId::new(1);
-    let survivor = WindowId::new(1, 1);
-    let closed = WindowId::new(1, 2);
-    let other_workspace_window = WindowId::new(1, 3);
+    for mode in [LayoutMode::Traditional, LayoutMode::Stack] {
+        for (closed_idx, survivor_idx) in [(2, 3), (3, 2)] {
+            let (mut apps, mut reactor) = test_context_with_workspace_count(2);
+            let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+            let space = SpaceId::new(1);
+            let survivor = WindowId::new(1, survivor_idx);
+            let closed = WindowId::new(1, closed_idx);
+            let other_workspace_window = WindowId::new(1, 4);
 
-    apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(3));
-    let active_workspace = reactor
-        .layout_manager
-        .layout_engine
-        .workspaces()
-        .active_workspace(space)
-        .unwrap();
-    let other_workspace = reactor
-        .test_workspace_ids(space)
-        .into_iter()
-        .find(|workspace| *workspace != active_workspace)
-        .unwrap();
-    assert!(reactor.assign_test_window_to_workspace(
-        space,
-        other_workspace_window,
-        other_workspace
-    ));
-    let (raise_manager_tx, mut raise_manager_rx) = actor::channel();
-    reactor.communication_manager.raise_manager_tx = raise_manager_tx;
-    reactor.handle_event(Event::ApplicationGloballyActivated(1));
-    reactor.send_layout_event(LayoutEvent::WindowFocused(space, closed));
-    assert_eq!(
-        reactor.layout_manager.layout_engine.focused_window(),
-        Some(closed)
-    );
-    while raise_manager_rx.try_recv().is_ok() {}
+            apps.make_app_and_settle_on_screen(&mut reactor, screen, space, 1, make_windows(4));
+            let active_workspace = reactor
+                .layout_manager
+                .layout_engine
+                .workspaces()
+                .active_workspace(space)
+                .unwrap();
+            let other_workspace = reactor
+                .test_workspace_ids(space)
+                .into_iter()
+                .find(|workspace| *workspace != active_workspace)
+                .unwrap();
+            assert!(reactor.assign_test_window_to_workspace(
+                space,
+                other_workspace_window,
+                other_workspace
+            ));
+            reactor.handle_test_layout_command(LayoutCommand::SetWorkspaceLayout {
+                workspace: None,
+                mode,
+            });
+            apps.simulate_until_quiet(&mut reactor);
+            let (raise_manager_tx, mut raise_manager_rx) = actor::channel();
+            reactor.communication_manager.raise_manager_tx = raise_manager_tx;
+            reactor.handle_event(Event::ApplicationGloballyActivated(1));
+            reactor.send_layout_event(LayoutEvent::WindowFocused(space, closed));
+            assert_eq!(
+                reactor.layout_manager.layout_engine.focused_window(),
+                Some(closed)
+            );
+            while raise_manager_rx.try_recv().is_ok() {}
 
-    reactor.handle_event(Event::WindowClosed(reactor.test_window_server_id(closed)));
+            reactor.handle_event(Event::WindowClosed(reactor.test_window_server_id(closed)));
 
-    let requests: Vec<_> = std::iter::from_fn(|| raise_manager_rx.try_recv().ok())
-        .map(|(_, event)| event)
-        .collect();
-    assert!(
-        requests.iter().any(|event| matches!(
-            event,
-            raise_manager::Event::RaiseRequest(RaiseRequest { focus_window: Some((wid, _)), app_handles, .. })
-                if *wid == survivor && app_handles.contains_key(&survivor.pid)
-        )),
-        "closing the focused window must request deliverable focus for the survivor: {requests:?}"
-    );
-    reactor.handle_event(Event::WindowServerFocusChanged(survivor, space));
-    assert!(reactor.create_window_data(survivor).unwrap().is_focused);
+            let requests: Vec<_> = std::iter::from_fn(|| raise_manager_rx.try_recv().ok())
+                .map(|(_, event)| event)
+                .collect();
+            assert!(
+                requests.iter().any(|event| matches!(
+                    event,
+                    raise_manager::Event::RaiseRequest(RaiseRequest { focus_window: Some((wid, _)), app_handles, .. })
+                        if *wid == survivor && app_handles.contains_key(&survivor.pid)
+                )),
+                "closing the focused window must request deliverable focus for the survivor: {requests:?}"
+            );
+            reactor.handle_event(Event::WindowServerFocusChanged(survivor, space));
+            assert!(reactor.create_window_data(survivor).unwrap().is_focused);
+        }
+    }
 }
 
 #[test]
@@ -7602,6 +7676,8 @@ fn binding_mode_changes_update_query_state_before_broadcast() {
     let mut reactor = test_reactor();
     let (tx, mut rx) = crate::actor::channel();
     reactor.communication_manager.event_broadcaster = tx;
+    let (menu_tx, mut menu_rx) = crate::actor::channel();
+    reactor.menu_manager.menu_tx = Some(menu_tx);
     assert_eq!(reactor.binding_mode, "default");
     reactor.handle_loop_event(Event::BindingModeChanged { mode: "resize".into() });
     assert_eq!(reactor.binding_mode, "resize");
@@ -7609,8 +7685,18 @@ fn binding_mode_changes_update_query_state_before_broadcast() {
         previous_mode: "default".into(),
         mode: "resize".into(),
     });
+    assert!(matches!(
+        menu_rx.try_recv().unwrap().1,
+        menu_bar::Event::BindingModeChanged(mode) if mode == "resize"
+    ));
     reactor.handle_loop_event(Event::BindingModeChanged { mode: "resize".into() });
     assert!(rx.try_recv().is_err());
+    assert!(menu_rx.try_recv().is_err());
+    reactor.handle_loop_event(Event::BindingModeChanged { mode: "default".into() });
+    assert!(matches!(
+        menu_rx.try_recv().unwrap().1,
+        menu_bar::Event::BindingModeChanged(mode) if mode == "default"
+    ));
 }
 
 #[test]

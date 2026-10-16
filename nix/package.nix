@@ -80,7 +80,6 @@
         # the derivation was actually built from instead. Keep in step with
         # Cargo.toml's `[package] version`; the release workflow's update-nix job
         # rewrites `version = "…"` below on a published release.
-        RIFT_VERSION_OVERRIDE = riftVersion;
 
         nativeBuildInputs = [ ];
         # Mission Control previews go through ScreenCaptureKit, which only exists in
@@ -160,9 +159,9 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>${riftVersion}</string>
   <key>CFBundleVersion</key>
-  <string>0.1.0</string>
+  <string>${riftVersion}</string>
   <key>LSMinimumSystemVersion</key>
   <string>${minOsVersion}</string>
   <key>LSUIElement</key>

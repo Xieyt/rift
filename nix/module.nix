@@ -138,13 +138,17 @@
             The same keying covers Screen Recording, which Mission Control's
             ScreenCaptureKit previews require — but it is a SEPARATE TCC consent
             record from Accessibility, so a stable identity does not carry an
-            existing Accessibility grant over to it. Every user gets ONE new prompt
-            at the next login after this is first installed; grant Rift under
-            System Settings > Privacy & Security > Screen & System Audio Recording,
-            otherwise Mission Control renders black previews. Because the prompt
-            comes from a launchd agent at login it is easy to miss. With
-            `signingIdentity = "-"` this grant, like Accessibility, is re-prompted
-            on every rebuild.
+            existing Accessibility grant over to it.
+
+            That prompt is now DOUBLE opt-in and a default install never sees it:
+            `[settings.ui.mission_control] enabled` is false, and since upstream's
+            0.6.x overview rewrite `window_previews` is false as well. Only
+            enabling BOTH reaches ScreenCaptureKit. When it does fire it comes from
+            a launchd agent at login, which is easy to miss; grant Rift under
+            System Settings > Privacy & Security > Screen & System Audio Recording.
+            Denial is no longer silent — rift logs a line naming that exact pane
+            instead of rendering blank previews. With `signingIdentity = "-"` this
+            grant, like Accessibility, is re-prompted on every rebuild.
           '';
         };
 

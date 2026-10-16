@@ -22,8 +22,7 @@ use crate::actor::spaces::ForwardedSpaceState;
 use crate::actor::wm_controller::{self, WmCommand, WmEvent};
 use crate::common::collections::{HashMap, HashSet};
 use crate::common::config::{
-    BindingModeSpecs, Config, DragDropSettings, HorizontalMouseWarp, LayoutMode, MouseAction,
-    MouseModifier,
+    BindingModeSpecs, Config, DragDropSettings, HorizontalMouseWarp, MouseAction, MouseModifier,
 };
 use crate::sys::event::{self, Hotkey, KeyCode};
 use crate::sys::hotkey::{
@@ -50,6 +49,7 @@ pub enum Request {
     SetBindingMode(String),
     KeyboardLayoutChanged,
     ConfigUpdated(Config),
+    /// Complete gesture routes for visible spaces with Rift management enabled.
     LayoutModesChanged(Vec<(SpaceId, crate::common::config::LayoutMode)>),
     SetLowPowerMode(bool),
     SetMissionControlActive(bool),
@@ -98,7 +98,6 @@ struct State {
     hide_count: u32,
     mouse_hides_on_focus: bool,
     focus_follows_mouse_config_enabled: bool,
-    default_layout_mode: LayoutMode,
     converter: CoordinateConverter,
     screens: Vec<CGRect>,
     event_processing_enabled: bool,
@@ -122,7 +121,6 @@ impl Default for State {
             hide_count: 0,
             mouse_hides_on_focus: false,
             focus_follows_mouse_config_enabled: false,
-            default_layout_mode: LayoutMode::Traditional,
             converter: CoordinateConverter::default(),
             screens: Vec::new(),
             event_processing_enabled: false,
@@ -312,7 +310,6 @@ impl Input {
         state.mouse_hides_on_focus = config.settings.mouse_hides_on_focus;
         state.focus_follows_mouse_config_enabled = config.settings.focus_follows_mouse;
         state.hints_bar_enabled = config.settings.ui.hints_bar.enabled;
-        state.default_layout_mode = config.settings.layout.mode;
         state.mouse_features_enabled = config.settings.drag_drop.enabled;
         state.mouse_settings = config.settings.drag_drop;
         state.disable_hotkey_active = disable_hotkey
@@ -551,7 +548,6 @@ impl Input {
                 let mouse_hides_on_focus = new_config.settings.mouse_hides_on_focus;
                 let focus_follows_mouse_config_enabled = new_config.settings.focus_follows_mouse;
                 let hints_bar_enabled = new_config.settings.ui.hints_bar.enabled;
-                let default_layout_mode = new_config.settings.layout.mode;
                 let mouse_features_enabled = new_config.settings.drag_drop.enabled;
                 let disable_hotkey = new_config
                     .settings
@@ -574,7 +570,6 @@ impl Input {
                     // `desired_event_mask`). `should_rebuild_mask` is already set for
                     // every ConfigUpdated below.
                     state.hints_bar_enabled = hints_bar_enabled;
-                    state.default_layout_mode = default_layout_mode;
                     state.mouse_features_enabled = mouse_features_enabled;
                     state.mouse_settings = new_config.settings.drag_drop;
                     let prev_active = state.disable_hotkey_active;
@@ -628,16 +623,11 @@ impl Input {
                 state
                     .screen_spaces
                     .iter()
-                    .map(|&(frame, space)| {
-                        (
-                            frame,
-                            space,
-                            state
-                                .layout_mode_by_space
-                                .get(&space)
-                                .copied()
-                                .unwrap_or(state.default_layout_mode),
-                        )
+                    .filter_map(|&(frame, space)| {
+                        // Missing routes are disabled or not ready, rather than
+                        // candidates for the configured default layout.
+                        let mode = state.layout_mode_by_space.get(&space).copied()?;
+                        Some((frame, space, mode))
                     })
                     .collect(),
             );

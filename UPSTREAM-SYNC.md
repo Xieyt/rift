@@ -2258,3 +2258,83 @@ One durable correction for `FORK.md`, independent of the merge: §2.B's claim of
 the settings child. Feature B is still fork-only *in substance* (nothing upstream
 foregrounds an app on a focus move), but the claim needs rewording to say so, or the
 next person re-verifying it will conclude we were superseded and delete the feature.
+
+### 12.11 Outcome — executed 2026-10-16, nine stages, all green
+
+```
+merged              83f3b66 -> 250d992 (v0.7.0), 132 commits, 9 merge commits
+conflict hunks      ~70 across 9 stages (predicted: 68 across 18 files)
+curated tests       821 -> 841, plus 15 crate tests
+fork features       6 -> 4   (C and F retired as superseded)
+rustc               1.91.1 -> 1.99.1 (forced; see below)
+```
+
+**Per stage, as landed.** The prediction that mattered was §12.7's shape, not its
+numbers: the two structural stages (4 and 6) cost nearly everything, and the
+stages after them got cheaper *because* of how they were resolved.
+
+| Stage | Checkpoint | Commits | Conflicted files | Notes |
+|---|---|---|---|---|
+| 1 | `0ddcf73` | 20 | 10 | drag subsystem; `drag_swap.rs` dropped |
+| 2 | `e21dae0` | 23 | 3 | binding modes, SkyLight titles; all additive |
+| 3 | `b02bb33` | 4 | 4 | **feature F retired**; state-ownership renames |
+| 4 | `6f78ad3` | 14 | 6 | **the scrolling rewrite; feature D re-ported** |
+| 5 | `cf84836` | 24 | 3 | cheap *because* of stage 4 — see below |
+| 6 | `483b20f` | 11 | 3 | **settings UI + config split**; toolchain bump |
+| 7 | `d5f3245` | 6 | **0** | merged, gated and committed unattended |
+| 8 | `51dca01` | 11 | 9 | **feature C retired** + its migration |
+| 9 | `250d992` | 19 | 5 | packaging cleanup, 0.7.0 |
+
+**Stage 4's resolution is the finding.** `scrolling.rs` arrived with 24 hunks
+against a wholly new internal model. It was resolved by taking upstream's file
+**wholesale** and re-applying feature D as a deliberate patch series, rather than
+reconciling hunks (FORK.md §4 item 8). Stage 5 then absorbed 24 commits of
+upstream's own follow-ups to that rewrite with **three** conflicted files, and
+stage 7 took six commits with zero. The fork's layer stopped being a diverged
+file and became a thin set of insertions. That is the whole argument for "take
+their structure, re-apply our layer", measured rather than asserted.
+
+**Both data-losing hazards fired, and both were caught by tests that did not
+exist when the plan was written.**
+- **H1** (`StoredColumn` drops `tabbed`): fixed in stage 4, verified by mutation —
+  setting `tabbed: false` in the conversion makes
+  `tabbed_flag_survives_a_save_load_round_trip` fail.
+- **HZ-2** (`deny_unknown_fields` bricks pre-0.7 fork configs): fixed in stage 8
+  **in the same commit as the deletion**, verified by mutation — removing one
+  name from `migrate_legacy_stack_line` makes
+  `a_fork_era_stack_line_config_still_parses_after_feature_c_retirement` fail.
+
+**HZ-9 fired too, and was introduced BY this sync.** Stage 1's `rift.default.toml`
+resolution left a duplicate `[settings.ui.mission_control]` table; the default
+config is `include_str!`'d and parsed at startup, so it aborted the suite. It was
+caught two stages later by `default_config_parses` — a test that §12.6 HZ-12 then
+nearly deleted in stage 6. The hazard register named this one in advance and it
+still happened: **the register's value is the test it tells you to keep, not the
+mistake it tells you to avoid.**
+
+**One fork bug found by upstream's tests, not by the merge.** Feature B's
+`MoveFocusArgs` had a hand-written dual-form `Deserialize` against a *derived*
+`Serialize`. Asymmetric since it was written. Harmless until `b391d56` shipped
+config write-back — at which point the first save from the settings UI would
+rewrite every untouched `move_focus = "left"` into the table form. Now
+symmetric. Upstream's own round-trip test is the guard.
+
+**The toolchain pin was stale, not wrong.** Upstream's overview rewrite uses
+`atomic_try_update`; our fenix pin was rustc 1.91.1 (2025-11) while upstream CI
+builds on plain stable. `nix flake update fenix nixpkgs` → 1.99.1. Stage 6 could
+not have landed without it. Worth adding to §7's tripwire list: *upstream
+building on stable does not mean upstream builds on OUR stable.*
+
+**Guards earned their keep, repeatedly.** The allowlist guard caught four new
+test modules (`actor::reactor::utils`, `actor::gesture`, `actor::reactor::gesture`,
+`ui::settings`); the mirror guard caught two dead filters (`actor::drag_swap` in
+stage 1, `ui::stack_line` in stage 8, both naming modules upstream had deleted);
+the skip guard's §12.8 sweep method found that
+`topology_change_clears_stale_pending_hide_target` — skipped since §9 — had been
+**repaired upstream**, and deleted it. Three upstream-red tests are skipped now,
+each verified by deletion on a pristine checkpoint worktree.
+
+**Still owed: §12.9.** Every gate here is headless. The native tab bar replacing
+feature C, tab raise order, the bar tracking `presented_frames` during a
+`CameraSpring` animation, the settings window launching from inside the nix
+`.app`, and feature B's activation attribution are all unverified on hardware.

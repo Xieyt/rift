@@ -270,36 +270,25 @@ deprecation is irrelevant here.
 now spans a crate boundary as well. Kept as a *single* commit so you resolve it
 once per upstream bump, not once per sub-change.
 
-### C. `feat: tabbed column display`
-**Files:** `src/common/config.rs`, `src/actor/stack_line.rs`,
-`src/actor/reactor/managers.rs`, `src/ui/stack_line.rs`, `rift.default.toml`.
+### ~~C. `feat: tabbed column display`~~ — RETIRED 2026-10-16, superseded
 
-- Renders window **titles as tab labels** on the existing stack-line indicator
-  (niri-style tabbed columns). Rift's stack layout already collapses a group to
-  one frame and draws a clickable segmented bar; this threads per-window titles
-  (`GroupInfo` → `GroupDisplayData`) from the window registry through the
-  `stack_line` actor and draws a centered `CATextLayer` per segment, reusing
-  `calculate_segment_frame` so labels line up with the selected-segment
-  highlight and the click hit-testing.
-- Opt-in: `[settings.ui.stack_line] show_titles` (default `false`); wants a
-  larger `thickness` (20+) to fit text.
-- **Render fix + theming:** the indicator CGS window is `setGeometryFlipped(true)`
-  (like `ui/mission_control.rs`) so titles draw upright, not mirrored. Colors and
-  size are configurable under `[settings.ui.stack_line]`: `active_color`,
-  `inactive_color`, `active_title_color`, `inactive_title_color` (hex
-  `#RRGGBB[AA]`) and `font_size`; unset → dark bar + accent-blue active tab.
-- **Debug logging** for the indicator pipeline (`managers` group feed, actor
-  event/enable state, positioned frames) is kept at `debug!` and enabled by
-  default for the fork via `nix` `logLevel` (env RUST_LOG), not a config flag.
+Deleted in the sixth sync's stage 8. Upstream's `952fc17` replaced the
+custom-drawn stack-line indicator with a native `cgs::TabBar` that renders
+window titles **and** app icons **and** close buttons with system styling, and
+hit-tests itself — strictly more than this feature did. `src/ui/stack_line.rs`
+is gone, along with `show_titles`, `border_width`, and the four hex colour keys
+plus `font_size` (the native bar exposes no colour/font API).
 
-**Why:** turns the minimalist stack indicator into readable tabs — niri's
-space-saver — with no new layout plumbing (pure display variant).
-**Conflict risk:** LOW–MEDIUM — `ui/stack_line.rs` + the `stack_line` actor + one
-`managers.rs` map; not upstream's most-churned area.
-**Verify:** `cargo check` + `just test` (geometry unit test
-`tab_segments_tile_the_bar_without_gaps_or_overlap`). Visuals need `just install`
-on a real Mac — SkyLight indicator windows can't render in a headless session.
+**If you are reading this because a user's config has those keys:** they are
+stripped by `migrate_legacy_stack_line` in `src/common/config/parse.rs`, guarded
+by `a_fork_era_stack_line_config_still_parses_after_feature_c_retirement`. That
+migration is not optional — `ConfigSource` is `deny_unknown_fields`, so without
+it every pre-0.7 fork config fails to parse at startup and silently falls back
+to defaults. See `UPSTREAM-SYNC.md` §12.6 HZ-2.
 
+Two pieces outlived it and now live in `src/ui/hints_bar.rs`, because feature E
+still needs them: `Color` (with `from_hex`/`to_nscolor`) and
+`point_hits_indicator_frame`.
 ### D. `feat: niri tabbed columns (scrolling)`
 **Files:** `src/layout_engine/systems/scrolling.rs`,
 `src/layout_engine/systems.rs`, `src/layout_engine/engine.rs`, `src/bin/rift-cli.rs`.
@@ -474,51 +463,32 @@ workspace rail, hint letters, focused chip fill, `show_titles`, the detail overl
 and the `overflow = "bar"` second strip all render, and `focus-column N` lights the
 Nth `keys` letter (`focus-column 2` → `D` for `keys = "asdfghjkl;"`).
 
-### F. `fix: degrade Mission Control previews when Screen Recording is denied`
-**Files:** `src/ui/mission_control.rs`.
+### ~~F. `fix: degrade Mission Control previews when Screen Recording is denied`~~ — RETIRED 2026-10-16, superseded
 
-- Upstream's Mission Control runs on ScreenCaptureKit, which is TCC-gated
-  (`kTCCServiceScreenCapture`, §2.A). A denied grant gives a silently blank preview
-  grid with no explanation. We probe `CGPreflightScreenCaptureAccess()` **once**
-  through a `LazyLock<bool>` (`SCREEN_CAPTURE_PERMITTED`) and fail the capture batch
-  with one clear `warn!` naming the missing permission instead of rendering nothing.
-  Preflight only — it never raises the prompt, so it is safe to call on any capture
-  path.
-- **Mission Control is OPT-IN, and that is the first thing to check.**
-  `rift.default.toml` ships `[settings.ui.mission_control] enabled = false` under a
-  `# experimental mission control` comment, and `MissionControlActor::run()` gates on
-  it *inside* its receive loop:
+Deleted in the sixth sync's stage 3. Upstream's overview rewrite (`dcaaaa8`)
+now calls `CGPreflightScreenCaptureAccess()` itself inside `PreviewSession::open`
+and logs a line naming **System Settings > Privacy & Security > Screen
+Recording** — more actionable than the fork's `warn!`, and upstream ships a test
+for the disabled path. The `SCREEN_CAPTURE_PERMITTED` `LazyLock` and its capture
+guard are gone.
 
-  ```rust
-  while let Some((span, event)) = self.rx.recv().await {
-      if self.config.settings.ui.mission_control.enabled {
-          self.handle_event(event);   // dropped entirely when disabled
-      }
-  }
-  ```
+**What did NOT change, and still matters for packaging:** Mission Control is
+still ScreenCaptureKit, so §2.A's `apple-sdk_14` pin and the
+`NSScreenCaptureUsageDescription` strings in both plists are still load-bearing.
 
-  So with the default config, `rift-cli execute mission-control show-all` returns
-  `"Command executed successfully"`, the reactor logs the command, `wm_controller`
-  forwards it — **and nothing happens, silently, with no log line from the actor.**
-  That is indistinguishable from a broken feature, and it cost a full debugging
-  detour during the 2026-08 sync: the symptom was read as an upstream regression in
-  `0bf5549` before anyone checked the flag. Verified working once enabled: live
-  ScreenCaptureKit previews, legible window contents, focus border, dimmed backdrop.
-
-  **Triage order for "Mission Control does nothing / is blank":**
-  1. `[settings.ui.mission_control] enabled = true` in your config? (Not in
-     `dev-config.toml` by default.) This is almost always it.
-  2. Screen Recording granted? Check for this section's `warn!`, or
-     `sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
-     "select service,auth_value from access where client='git.acsandmann.rift'"`
-     — `kTCCServiceScreenCapture` with `auth_value = 2` means granted.
-  3. Only then suspect the code.
-
-**Why:** a WM should degrade loudly, not silently (§8 stability item 2). The new
-Screen Recording prompt is easy to miss (§2.A), so "Mission Control is blank" would
-otherwise arrive as an unattributable bug report.
-**Conflict risk:** LOW — one `LazyLock` plus one guard at the top of `capture`, in a
-file upstream owns but away from its SCK plumbing.
+**Triage order for "Mission Control does nothing / is blank" — now TWO flags:**
+1. `[settings.ui.mission_control] enabled = true`? Still opt-in, still the
+   usual answer. The actor is not even spawned when it is false
+   (`channel_if_enabled` returns `None`), so the command succeeds and nothing
+   happens, silently — which cost a full debugging detour in the 2026-08 sync.
+2. `window_previews = true`? Previews became a **second** opt-in in the rewrite
+   and also default to `false`. Neither flag alone reaches ScreenCaptureKit, so
+   a default install never even raises the Screen Recording prompt.
+3. Screen Recording granted? Look for upstream's log line, or
+   `sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db \
+   "select service,auth_value from access where client='git.acsandmann.rift'"`
+   — `kTCCServiceScreenCapture` with `auth_value = 2` means granted.
+4. Only then suspect the code.
 
 ### Dropped / superseded (do NOT re-add)
 - **scrolling off-left snap** — a per-column `x` clamp in `scrolling.rs`. Reverted:
@@ -557,17 +527,21 @@ file upstream owns but away from its SCK plumbing.
 
 ## 3. Syncing with upstream (rebase vs merge)
 
-> **Currently 132 commits behind `upstream/main`** (merged through `83f3b66`,
-> 2026-09-18; upstream tip `250d992`, v0.7.0). **Do not start this merge without
-> reading `UPSTREAM-SYNC.md` §12** — it is the measured plan: 68 conflict hunks
-> across 18 files, four upstream subsystem rewrites landing on four of our six
-> features, a nine-stage checkpoint table, and a twelve-entry hazard register
-> whose first two entries lose *user data* if merged carelessly (persisted tab
-> groups, and every existing fork user's config failing to parse).
-> §12.3 is the per-feature "do we still need ours?" verdict — **features C and F
-> are superseded and get deleted this sync**. §12.10 is why this backlog grew to
-> 132 commits and the rule changes that prevent the next one.
-> The **§11.8 live desktop checklist is still unrun**; it is folded into §12.9.
+> **Currently 0 commits behind `upstream/main`** (merged through `250d992`,
+> v0.7.0, 2026-10-16). That sync — 132 commits in nine staged merges — is
+> recorded in `UPSTREAM-SYNC.md` §12. Read **§12.10 first** if you are about to
+> sync: it is why that backlog reached 132 when the previous one was 77, and the
+> two rule changes now enforcing the cadence (a weekly tripwire workflow, and a
+> hard "never skip two upstream minors" ceiling).
+>
+> §12.3 is the per-feature verdict, and this sync was the first to **retire**
+> fork features rather than defend them: **C and F are gone, superseded by
+> better upstream implementations.** §12.6's twelve-entry hazard register is
+> worth reading as a class of bug — two of its entries lose *user data* through
+> a merge that compiles and passes every test, and both fired exactly as written.
+>
+> The **§12.9 live desktop checklist is unrun**, and it now carries §11.8's
+> unrun items too. Nothing in it is testable headless.
 
 **Use `merge`, not `rebase`, for routine syncs.** We carry a large feature set (see
 §2) and sync periodically, so upstream deltas are non-trivial. A merge resolves the
