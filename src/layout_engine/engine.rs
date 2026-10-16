@@ -2224,7 +2224,9 @@ impl LayoutEngine {
 
         match command {
             LayoutCommand::ToggleWindowFloating
-            | LayoutCommand::ToggleWindowFloatingWithOptions(_) => unreachable!(),
+            | LayoutCommand::ToggleWindowFloatingWithOptions(_) => {
+                unreachable!()
+            }
             LayoutCommand::ToggleFocusFloating => unreachable!(),
 
             LayoutCommand::SwapWindows(a, b) => {
@@ -2675,7 +2677,11 @@ impl LayoutEngine {
                 {
                     system.initialize_frames(layout, screen, constraints, &|wid| {
                         get_window_frame(wid).filter(|frame| {
-                            !crate::model::hidden_window_placement::HiddenWindowPlacement::is_hidden(screen, *frame, all_screens)
+                            !crate::model::hidden_window_placement::HiddenWindowPlacement::is_hidden(
+                                screen,
+                                *frame,
+                                all_screens,
+                            )
                         })
                     });
                 }

@@ -118,6 +118,7 @@ fn restored_workspace_is_resolved_before_app_rule_assignment() {
     engine.persistence.pending_windows.insert(window);
     window_store.insert_window(window, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -218,6 +219,7 @@ fn full_save_records_floating_window_in_its_inactive_workspace() {
         .unwrap();
     window_store.insert_window(window, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -279,6 +281,7 @@ fn full_save_removes_stale_floating_frame_from_a_tiled_window() {
     let workspace = engine.workspaces().active_workspace(space).unwrap();
     window_store.insert_window(window, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -322,6 +325,33 @@ fn full_save_removes_stale_floating_frame_from_a_tiled_window() {
     );
     assert_eq!(loaded.floating_positions.get(space, workspace, window), None);
     assert!(!loaded.floating.is_floating(window));
+}
+
+#[test]
+fn full_save_accepts_workspaces_of_a_space_that_was_never_shown() {
+    let mut engine = test_engine();
+    let mut window_store = WindowStore::default();
+    let size = CGSize::new(1200.0, 800.0);
+    let shown = SpaceId::new(700);
+    let never_shown = SpaceId::new(701);
+    let _ = engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(shown, size));
+    // Window assignment and app rules initialize workspaces on Spaces Rift never lays out, such
+    // as a deactivated display or a Space ID left over from sleep.
+    engine.workspaces.ensure_space_initialized(never_shown);
+    let workspace = engine.workspaces.list_workspaces(never_shown)[0].0;
+    assert!(engine.workspaces[workspace].active_layout().is_none());
+    let path = std::env::temp_dir().join(format!(
+        "rift-never-shown-space-save-test-{}-{}.ron",
+        std::process::id(),
+        never_shown.get(),
+    ));
+
+    engine.save_current_layout(path.clone(), &window_store, Some(shown)).unwrap();
+    let mut loaded = LayoutEngine::load(path.clone()).unwrap();
+    let _ = std::fs::remove_file(path);
+    let _ = loaded.handle_event(&mut window_store, LayoutEvent::SpaceExposed(never_shown, size));
+
+    assert!(loaded.workspaces[workspace].active_layout().is_some());
 }
 
 #[test]
@@ -542,6 +572,7 @@ fn workspace_restore_keeps_current_windows_absent_from_snapshot() {
     let target_workspace = engine.workspaces().active_workspace(space).unwrap();
     let live_state = |title: &str, bundle_id: &str, window_server_id: u32| WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -663,6 +694,7 @@ fn scoped_restore_does_not_consume_same_id_live_window_on_another_space() {
         engine.workspaces.active_layout(external_space, external_workspace).unwrap();
     window_store.insert_window(reused_id, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -772,6 +804,7 @@ fn space_restore_uses_workspace_assignment_over_stale_window_server_space() {
         engine.workspaces.active_layout(external_space, external_workspace).unwrap();
     window_store.insert_window(live, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -885,6 +918,7 @@ fn workspace_restore_does_not_consume_live_window_from_sibling_workspace() {
     let sibling_layout = engine.workspaces.active_layout(space, sibling_workspace).unwrap();
     window_store.insert_window(live, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,
@@ -986,6 +1020,7 @@ fn workspace_restore_preserves_live_window_when_saved_process_local_id_is_reused
     let target_workspace = engine.workspaces().active_workspace(space).unwrap();
     window_store.insert_window(reused, WindowState {
         info: WindowInfo {
+            has_native_tabs: false,
             is_standard: true,
             is_root: true,
             is_minimized: false,

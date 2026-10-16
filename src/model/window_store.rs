@@ -1389,9 +1389,11 @@ impl WindowStore {
             }
         }
         for (workspace, ids) in &self.workspace_windows {
-            debug_assert!(ids.iter().all(|wid| self.windows.get(wid).is_some_and(|record| {
-                record.state.is_some() && record.workspace == Some(*workspace)
-            })));
+            debug_assert!(ids.iter().all(|wid| {
+                self.windows.get(wid).is_some_and(|record| {
+                    record.state.is_some() && record.workspace == Some(*workspace)
+                })
+            }));
         }
     }
 }
@@ -1592,6 +1594,7 @@ mod tests {
         window_store.insert_window(
             wid,
             WindowState::from(crate::sys::app::WindowInfo {
+                has_native_tabs: false,
                 is_standard: true,
                 is_root: true,
                 is_minimized: false,

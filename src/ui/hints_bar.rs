@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use cgs::{CgsWindow, CgsWindowError, render_layer_to_cgs_window, with_disabled_actions};
 use objc2::rc::Retained;
 use objc2::{MainThreadMarker, msg_send};
 use objc2_app_kit::{NSRunningApplication, NSScreen, NSStatusWindowLevel};
@@ -24,8 +25,6 @@ use crate::common::config::{
     HintsBarPad, HintsBarPosition, HintsBarSettings,
 };
 use crate::sys::app::NSRunningApplicationExt;
-use crate::sys::cgs_window::{CgsWindow, CgsWindowError};
-use crate::ui::common::{render_layer_to_cgs_window, with_disabled_actions};
 use crate::ui::stack_line::{Color, point_hits_indicator_frame};
 
 // Chip layout metrics (in points, before any fit-scaling).

@@ -21,10 +21,35 @@ use crate::{
 /// binds, and that file is parsed by `Config::default()`, so dropping it is a
 /// runtime panic at startup that `cargo check` cannot see. The same impl also
 /// covers legacy untyped IPC clients sending `{"Reactor":{"move_focus":"left"}}`.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MoveFocusArgs {
     pub direction: Direction,
     pub activate: bool,
+}
+
+/// Mirror of the dual-form `Deserialize` below: emit the BARE form whenever
+/// `activate` is at its default, and the table form only when it carries
+/// information.
+///
+/// This is not cosmetic. Upstream's config write-back (`ConfigDocument::
+/// edited_from`) re-serializes the typed source and patches back only the keys
+/// whose value changed — so a struct-shaped Serialize rewrites every untouched
+/// `move_focus = "left"` in the user's file into
+/// `{ direction = "left", activate = false }` the first time anything is saved
+/// from the settings UI. Round-trip stability is the contract there, and
+/// upstream's own tests assert the bare spelling survives.
+impl Serialize for MoveFocusArgs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where S: serde::Serializer {
+        if !self.activate {
+            return self.direction.serialize(serializer);
+        }
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("MoveFocusArgs", 2)?;
+        s.serialize_field("direction", &self.direction)?;
+        s.serialize_field("activate", &self.activate)?;
+        s.end()
+    }
 }
 
 impl<'de> Deserialize<'de> for MoveFocusArgs {
@@ -137,6 +162,7 @@ pub enum LayoutCommand {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReactorCommand {
+    OpenSettings,
     BindingMode(String),
     Debug,
     Serialize,
@@ -219,7 +245,17 @@ pub enum ConfigCommand {
     ReloadConfig,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    PartialEq,
+    Serialize,
+    Deserialize,
+    rift_config_derive::ConfigEnum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AnimationEasing {
     #[default]

@@ -10,6 +10,7 @@ mod gesture;
 pub(crate) use crate::layout_engine::WorkspaceDropRequest as OverviewDrop;
 mod main_window;
 mod managers;
+mod native_tabs;
 mod query;
 mod replay;
 pub mod transaction_manager;
@@ -99,6 +100,7 @@ use crate::sys::window_server::{
 
 pub type Sender = actor::Sender<Event>;
 type Receiver = actor::Receiver<Event>;
+pub(crate) use query::QueryRequest;
 pub use query::ReactorQueryHandle;
 
 pub(crate) use crate::model::reactor::{AppState, WindowState};
@@ -414,6 +416,7 @@ pub struct Reactor {
     spaces_tx: Option<crate::actor::spaces::Sender>,
     main_window_tracker: MainWindowTracker,
     pending_mouse_focus: Option<(WindowId, Instant)>,
+    mouse_inventory_hit: Option<WindowServerId>,
     drag_manager: managers::DragManager,
     workspace_switch_manager: managers::WorkspaceSwitchManager,
     recording_manager: managers::RecordingManager,
@@ -435,6 +438,10 @@ pub struct Reactor {
     event_outcome_phase_trace: Vec<&'static str>,
     #[cfg(test)]
     layout_update_count: usize,
+    #[cfg(test)]
+    native_focus_for_removal: Option<WindowId>,
+    #[cfg(test)]
+    native_tab_successor: Option<(WindowId, CGRect)>,
 }
 
 impl Reactor {
@@ -508,6 +515,7 @@ impl Reactor {
             space_activation_policy: SpaceActivationPolicy::new(),
             main_window_tracker: MainWindowTracker::default(),
             pending_mouse_focus: None,
+            mouse_inventory_hit: None,
             drag_manager: managers::DragManager {
                 actor: crate::actor::drag::DragActor::new(config.settings.drag_drop),
                 native_motion_active: std::sync::Arc::default(),
@@ -548,6 +556,7 @@ impl Reactor {
             menu_manager: managers::MenuManager {
                 menu_state: MenuState::Closed,
                 menu_tx: None,
+                last_projection_signature: None,
             },
             mission_control_manager: managers::MissionControlManager {
                 mission_control_state: MissionControlState::Inactive,
@@ -576,6 +585,10 @@ impl Reactor {
             event_outcome_phase_trace: Vec::new(),
             #[cfg(test)]
             layout_update_count: 0,
+            #[cfg(test)]
+            native_focus_for_removal: None,
+            #[cfg(test)]
+            native_tab_successor: None,
         };
         reactor
     }
@@ -1045,7 +1058,8 @@ impl Reactor {
             Event::MouseMoved(wsid) => {
                 self.suppress_auto_workspace_switch_until_input = false;
                 if let Some(window) = self.state.windows.tracked_window_id(wsid)
-                    && self.main_window() == Some(window)
+                    && (self.main_window() == Some(window)
+                        || crate::sys::app::is_own_window_focused(window))
                     && self.layout_manager.layout_engine.focused_window() == Some(window)
                 {
                     if let Some(space) = self.assigned_space_for_window_id(window)
@@ -1054,6 +1068,7 @@ impl Reactor {
                     {
                         self.space_state.command_space = Some(space);
                     }
+                    self.mouse_inventory_hit = None;
                     // Refresh the command display without native queries or
                     // outcome processing when focus already matches the hit.
                     return;
@@ -1479,8 +1494,9 @@ impl Reactor {
                 outcome.focused_window = raised_window;
                 return Ok(outcome);
             }
-            Event::WindowCreated(wid, window, ws_info, mouse_state) => {
+            Event::WindowCreated(wid, mut window, ws_info, mouse_state) => {
                 let _ = mouse_state;
+                self.replace_native_tab(wid, &mut window);
                 let mut outcome = window_workflow::handle_window_created(
                     &mut self.state,
                     &mut self.layout_manager,
@@ -1503,6 +1519,10 @@ impl Reactor {
                     return Ok(EventOutcome::default());
                 }
 
+                if self.retain_native_tab_slot_on_departure(wid) {
+                    return Ok(EventOutcome::default());
+                }
+
                 let mut outcome = window_workflow::handle_window_destroyed(
                     &mut self.state,
                     &self.transaction_manager,
@@ -1517,6 +1537,9 @@ impl Reactor {
                     self.state.windows.mark_window_hidden(wsid);
                     return Ok(EventOutcome::default());
                 };
+                if self.retain_native_tab_slot_on_departure(wid) {
+                    return Ok(EventOutcome::default());
+                }
                 let mut outcome = window_workflow::handle_window_destroyed(
                     &mut self.state,
                     &self.transaction_manager,
@@ -1557,6 +1580,12 @@ impl Reactor {
                     return Ok(EventOutcome::no_change());
                 }
                 let tracked_window = self.state.windows.tracked_window_id(wsid);
+                if matches!(kind, SpaceEventKind::User)
+                    && tracked_window
+                        .is_some_and(|wid| self.retain_native_tab_slot_on_departure(wid))
+                {
+                    return Ok(EventOutcome::default());
+                }
                 let last_known_user_space = tracked_window
                     .and_then(|window| self.best_space_for_window_id(window))
                     .or_else(|| self.space_state.iter_known_spaces().next());
@@ -2012,7 +2041,12 @@ impl Reactor {
                 return Ok(system_workflow::handle_menu_closed(&mut self.menu_manager, pid)?);
             }
             Event::MouseMoved(wsid) => {
-                let window = self.state.windows.tracked_window_id(wsid);
+                // Attached sheets focus their owning window; they are not
+                // independent tiling targets and may not appear in AXWindows.
+                let window = self.state.windows.tracked_window_id(wsid).or_else(|| {
+                    window_server::window_parent(wsid)
+                        .and_then(|parent| self.state.windows.tracked_window_id(parent))
+                });
                 if window.is_some_and(|window| {
                     self.pending_mouse_focus.is_some_and(|(pending, started)| {
                         pending == window && started.elapsed() < Duration::from_secs(1)
@@ -2021,6 +2055,10 @@ impl Reactor {
                     return Ok(EventOutcome::default());
                 }
                 if window.is_none() {
+                    if self.mouse_inventory_hit == Some(wsid) {
+                        return Ok(EventOutcome::default());
+                    }
+                    self.mouse_inventory_hit = Some(wsid);
                     trace!(?wsid, "Mouse hit window missing from inventory");
                     if let Some(info) = self
                         .state
@@ -2034,6 +2072,7 @@ impl Reactor {
                     }
                     return Ok(EventOutcome::default());
                 }
+                self.mouse_inventory_hit = None;
                 let active_space = window.and_then(|window| {
                     self.state.windows.window(window).and_then(|state| {
                         self.best_space_for_window(&state.frame_monotonic, state.info.sys_id)
@@ -2058,7 +2097,10 @@ impl Reactor {
                         should_sync: window.is_some_and(|window| {
                             self.should_raise_on_mouse_over(window, active_space)
                         }),
-                        is_main: window.is_some_and(|window| self.main_window() == Some(window)),
+                        is_main: window.is_some_and(|window| {
+                            self.main_window() == Some(window)
+                                || crate::sys::app::is_own_window_focused(window)
+                        }),
                         needs_layout_sync,
                         active_space,
                     },
@@ -2105,6 +2147,11 @@ impl Reactor {
             }
             Event::Command(Command::Metrics(cmd)) => {
                 return command_workflow::handle_command_metrics(cmd);
+            }
+            Event::Command(Command::Reactor(ReactorCommand::OpenSettings)) => {
+                if let Some(tx) = &self.menu_manager.menu_tx {
+                    tx.send(menu_bar::Event::OpenSettings);
+                }
             }
             Event::Command(Command::Reactor(ReactorCommand::Debug)) => {
                 return command_workflow::handle_command_reactor_debug(
@@ -2743,7 +2790,8 @@ impl Reactor {
                 warn!(%error, "failed to update hints bar config");
             }
             if let Some(tx) = &self.menu_manager.menu_tx
-                && let Err(error) = tx.try_send(menu_bar::Event::ConfigUpdated(config.clone()))
+                && let Err(error) =
+                    tx.try_send(menu_bar::Event::ConfigUpdated(Box::new(config.clone())))
             {
                 warn!(%error, "failed to update menu bar config");
             }
@@ -3356,10 +3404,14 @@ impl Reactor {
     fn on_windows_discovered_with_app_info(
         &mut self,
         pid: pid_t,
-        new: Vec<(WindowId, WindowInfo)>,
+        mut new: Vec<(WindowId, WindowInfo)>,
         known_visible: Vec<WindowId>,
         app_info: Option<AppInfo>,
     ) {
+        // Rebind the visible tab before inventory retirement removes its old slot.
+        for (wid, info) in &mut new {
+            self.replace_native_tab(*wid, info);
+        }
         let app_info =
             app_info.or_else(|| self.app_manager.apps.get(&pid).map(|app| app.info.clone()));
         // AX can observe a native move before the display callback. It may refresh
@@ -4876,6 +4928,33 @@ impl Reactor {
                 .filter(|space| self.is_space_active(*space))
                 .or_else(|| self.workspace_command_space())
         {
+            // A native tab departure can arrive before either AX or the debounced
+            // WindowServer focus notification. Sample native focus before raising
+            // a fallback, otherwise that raise can steal focus from the new tab.
+            #[cfg(not(test))]
+            let native_focus = matches!(event, LayoutEvent::WindowRemoved(_))
+                .then(|| window_server::key_focused_window(space))
+                .flatten();
+            #[cfg(test)]
+            let native_focus = self.native_focus_for_removal;
+            if matches!(event, LayoutEvent::WindowRemoved(_))
+                && let Some(native) = native_focus
+                && native.pid == wid.pid
+                && native != wid
+            {
+                let successor = self
+                    .state
+                    .windows
+                    .tracked_window_id(WindowServerId::new(native.idx.get()))
+                    .unwrap_or(native);
+                if successor != wid && !self.window_in_non_active_workspace(space, successor) {
+                    if !self.state.windows.contains_window(successor) {
+                        self.request_window_inventory(successor.pid);
+                    }
+                    debug!(?wid, ?successor, "Preserving native focus during window removal");
+                    return;
+                }
+            }
             self.refocus_manager.refocus_state = RefocusState::Pending(space);
         }
     }
