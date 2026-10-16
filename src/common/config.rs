@@ -6,7 +6,7 @@ use regex::RegexBuilder;
 pub use rift_protocol::{AnimationEasing, ConfigCommand, LayoutMode, WorkspaceSelector};
 use serde::{Deserialize, Serialize};
 
-use super::collections::HashMap;
+use super::collections::{HashMap, HashSet};
 use crate::actor::wm_controller::WmCommand;
 use crate::sys::hotkey::{Hotkey, HotkeySpec};
 
@@ -335,6 +335,8 @@ struct ConfigFile {
     settings: Settings,
     keys: HashMap<String, WmCommand>,
     #[serde(default)]
+    binding_modes: HashMap<String, HashMap<String, WmCommand>>,
+    #[serde(default)]
     virtual_workspaces: VirtualWorkspaceSettings,
     /// Modifier combinations that can be reused in key bindings
     /// e.g., "comb1" = "Alt + Shift" allows using "comb1 + C" in keys
@@ -382,9 +384,11 @@ pub struct Config {
     pub settings: Settings,
     pub keys: Vec<(Hotkey, WmCommand)>,
     #[serde(default)]
-    pub key_specs: Vec<(String, WmCommand)>,
+    pub binding_mode_specs: BindingModeSpecs,
     pub virtual_workspaces: VirtualWorkspaceSettings,
 }
+
+pub type BindingModeSpecs = Vec<(String, Vec<(String, WmCommand)>)>;
 
 impl<'de> Deserialize<'de> for Config {
     fn deserialize<D>(deserializer: D) -> Result<Config, D::Error>
@@ -395,24 +399,31 @@ impl<'de> Deserialize<'de> for Config {
             keys: Vec<(Hotkey, WmCommand)>,
             #[serde(default)]
             key_specs: Vec<(String, WmCommand)>,
+            #[serde(default)]
+            binding_mode_specs: BindingModeSpecs,
             virtual_workspaces: VirtualWorkspaceSettings,
         }
 
         let config = ConfigSerde::deserialize(deserializer)?;
-        let key_specs = if config.key_specs.is_empty() && !config.keys.is_empty() {
-            config
-                .keys
-                .iter()
-                .map(|(hotkey, command)| (hotkey.to_string(), command.clone()))
-                .collect()
+        let binding_mode_specs = if config.binding_mode_specs.is_empty() {
+            let default_specs = if config.key_specs.is_empty() {
+                config
+                    .keys
+                    .iter()
+                    .map(|(hotkey, command)| (hotkey.to_string(), command.clone()))
+                    .collect()
+            } else {
+                config.key_specs
+            };
+            vec![("default".to_string(), default_specs)]
         } else {
-            config.key_specs
+            config.binding_mode_specs
         };
 
         Ok(Config {
             settings: config.settings,
             keys: config.keys,
-            key_specs,
+            binding_mode_specs,
             virtual_workspaces: config.virtual_workspaces,
         })
     }
@@ -440,6 +451,10 @@ pub struct Settings {
     pub mouse_hides_on_focus: bool,
     #[serde(default = "yes")]
     pub focus_follows_mouse: bool,
+    /// Treat vertically stacked displays as a horizontal pointer chain.
+    /// `top-to-bottom` maps higher displays to the left; `bottom-to-top` reverses it.
+    #[serde(default)]
+    pub horizontal_mouse_warp: Option<HorizontalMouseWarp>,
     /// Hotkey that disables focus-follows-mouse while held.
     /// Accepts either a full hotkey (e.g. "Ctrl + A") or a modifier-only spec (e.g. "Ctrl")
     #[serde(default)]
@@ -468,6 +483,13 @@ pub struct Settings {
     /// Enable hot-reloading of the config file when it changes
     #[serde(default = "yes")]
     pub hot_reload: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum HorizontalMouseWarp {
+    TopToBottom,
+    BottomToTop,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
@@ -1159,6 +1181,8 @@ fn default_align_center() -> HintsBarAlign { HintsBarAlign::Center }
 pub struct BspLayoutSettings {
     #[serde(flatten)]
     pub base: BaseLayoutSettings,
+    /// Center a lone window at this width-to-height ratio.
+    pub single_window_aspect_ratio: Option<f64>,
 }
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
 #[serde(deny_unknown_fields)]
@@ -1225,6 +1249,9 @@ pub struct ScrollingLayoutSettings {
     /// (niri-style preset cycling of the selected column).
     #[serde(default = "default_scrolling_width_presets")]
     pub width_presets: Vec<f64>,
+    /// Sparse width overrides keyed by display UUID.
+    #[serde(default)]
+    pub per_display: HashMap<String, ScrollingWidthOverride>,
     /// Alignment for the focused column (left, center, right).
     #[serde(default)]
     pub alignment: ScrollingAlignment,
@@ -1248,11 +1275,20 @@ impl Default for ScrollingLayoutSettings {
             min_column_width_ratio: default_scrolling_min_column_width_ratio(),
             max_column_width_ratio: default_scrolling_max_column_width_ratio(),
             width_presets: default_scrolling_width_presets(),
+            per_display: HashMap::default(),
             alignment: ScrollingAlignment::default(),
             focus_navigation_style: ScrollingFocusNavigationStyle::default(),
             gestures: ScrollingGestureSettings::default(),
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ScrollingWidthOverride {
+    pub column_width_ratio: Option<f64>,
+    pub min_column_width_ratio: Option<f64>,
+    pub max_column_width_ratio: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy, Default)]
@@ -1549,44 +1585,39 @@ impl LayoutSettings {
 }
 
 impl ScrollingLayoutSettings {
+    pub fn widths_for_display(&self, display_uuid: Option<&str>) -> (f64, f64, f64) {
+        let override_ = display_uuid.and_then(|uuid| self.per_display.get(uuid));
+        (
+            override_.and_then(|o| o.column_width_ratio).unwrap_or(self.column_width_ratio),
+            override_
+                .and_then(|o| o.min_column_width_ratio)
+                .unwrap_or(self.min_column_width_ratio),
+            override_
+                .and_then(|o| o.max_column_width_ratio)
+                .unwrap_or(self.max_column_width_ratio),
+        )
+    }
+
+    pub fn effective_for_display(&self, display_uuid: Option<&str>) -> Self {
+        let mut resolved = self.clone();
+        (
+            resolved.column_width_ratio,
+            resolved.min_column_width_ratio,
+            resolved.max_column_width_ratio,
+        ) = self.widths_for_display(display_uuid);
+        resolved.per_display.clear();
+        resolved
+    }
+
     pub fn validate(&self) -> Vec<String> {
         let mut issues = Vec::new();
-
-        if !(0.0..=1.0).contains(&self.column_width_ratio) {
-            issues.push(format!(
-                "layout.scrolling.column_width_ratio must be between 0.0 and 1.0, got {}",
-                self.column_width_ratio
-            ));
-        }
-
-        if !(0.0..=1.0).contains(&self.min_column_width_ratio) {
-            issues.push(format!(
-                "layout.scrolling.min_column_width_ratio must be between 0.0 and 1.0, got {}",
-                self.min_column_width_ratio
-            ));
-        }
-
-        if !(0.0..=1.0).contains(&self.max_column_width_ratio) {
-            issues.push(format!(
-                "layout.scrolling.max_column_width_ratio must be between 0.0 and 1.0, got {}",
-                self.max_column_width_ratio
-            ));
-        }
-
-        if self.min_column_width_ratio > self.max_column_width_ratio {
-            issues.push(format!(
-                "layout.scrolling.min_column_width_ratio ({}) must be <= max_column_width_ratio ({})",
-                self.min_column_width_ratio, self.max_column_width_ratio
-            ));
-        }
-
-        if !(self.min_column_width_ratio..=self.max_column_width_ratio)
-            .contains(&self.column_width_ratio)
-        {
-            issues.push(format!(
-                "layout.scrolling.column_width_ratio ({}) must be within min/max bounds",
-                self.column_width_ratio
-            ));
+        Self::validate_widths("layout.scrolling", self.widths_for_display(None), &mut issues);
+        for uuid in self.per_display.keys() {
+            Self::validate_widths(
+                &format!("layout.scrolling.per_display[{uuid}]"),
+                self.widths_for_display(Some(uuid)),
+                &mut issues,
+            );
         }
 
         for p in &self.width_presets {
@@ -1606,6 +1637,34 @@ impl ScrollingLayoutSettings {
         }
 
         issues
+    }
+
+    fn validate_widths(path: &str, (ratio, min, max): (f64, f64, f64), issues: &mut Vec<String>) {
+        if !(0.0..=1.0).contains(&ratio) {
+            issues.push(format!(
+                "{path}.column_width_ratio must be between 0.0 and 1.0, got {ratio}",
+            ));
+        }
+        if !(0.0..=1.0).contains(&min) {
+            issues.push(format!(
+                "{path}.min_column_width_ratio must be between 0.0 and 1.0, got {min}",
+            ));
+        }
+        if !(0.0..=1.0).contains(&max) {
+            issues.push(format!(
+                "{path}.max_column_width_ratio must be between 0.0 and 1.0, got {max}",
+            ));
+        }
+        if min > max {
+            issues.push(format!(
+                "{path}.min_column_width_ratio ({min}) must be <= max_column_width_ratio ({max})",
+            ));
+        }
+        if !(min..=max).contains(&ratio) {
+            issues.push(format!(
+                "{path}.column_width_ratio ({ratio}) must be within min/max bounds",
+            ));
+        }
     }
 }
 
@@ -1809,9 +1868,16 @@ impl Config {
         let config_file = ConfigFile {
             settings: self.settings.clone(),
             keys: self
-                .key_specs
+                .binding_mode_specs
+                .first()
+                .filter(|(name, _)| name == "default")
+                .map(|(_, specs)| specs.iter().cloned().collect())
+                .unwrap_or_default(),
+            binding_modes: self
+                .binding_mode_specs
                 .iter()
-                .map(|(hotkey, command)| (hotkey.clone(), command.clone()))
+                .skip(1)
+                .map(|(name, specs)| (name.clone(), specs.iter().cloned().collect()))
                 .collect(),
             virtual_workspaces: self.virtual_workspaces.clone(),
             modifier_combinations: HashMap::default(),
@@ -1837,6 +1903,27 @@ impl Config {
 
         // Validate virtual workspace settings
         issues.extend(self.virtual_workspaces.validate());
+
+        let mode_names: HashSet<_> =
+            self.binding_mode_specs.iter().map(|(name, _)| name.as_str()).collect();
+        if mode_names.len() != self.binding_mode_specs.len() {
+            issues.push("Binding mode names must be unique".to_string());
+        }
+        if self.binding_mode_specs.first().map(|(name, _)| name.as_str()) != Some("default") {
+            issues.push("The default binding mode must be the first mode".to_string());
+        }
+        for (mode, bindings) in &self.binding_mode_specs {
+            for (_, command) in bindings {
+                if let WmCommand::Wm(crate::actor::wm_controller::WmCmd::BindingMode(target)) =
+                    command
+                    && !mode_names.contains(target.as_str())
+                {
+                    issues.push(format!(
+                        "Binding mode `{mode}` references nonexistent mode `{target}`"
+                    ));
+                }
+            }
+        }
 
         issues
     }
@@ -2053,27 +2140,51 @@ impl Config {
         None
     }
 
-    fn parse(buf: &str) -> anyhow::Result<Config> {
+    pub(crate) fn parse(buf: &str) -> anyhow::Result<Config> {
         // Attempt to deserialize. If it fails, and the error indicates an unknown enum
         // variant, attempt to provide a helpful suggestion.
         match parse_config_file(buf) {
             Ok(c) => {
+                if c.binding_modes.contains_key("default") {
+                    bail!("`default` is reserved and cannot be defined in [binding_modes]");
+                }
+
+                let mut binding_sets: Vec<_> = c.binding_modes.into_iter().collect();
+                binding_sets.sort_by(|a, b| a.0.cmp(&b.0));
+                binding_sets.insert(0, ("default".to_string(), c.keys));
+
+                let mut binding_mode_specs = Vec::with_capacity(binding_sets.len());
                 let mut keys = Vec::new();
-                let mut key_specs = Vec::new();
-                for (key, cmd) in c.keys {
-                    let expanded_key =
-                        Self::expand_modifier_combinations(&key, &c.modifier_combinations);
-                    let normalized_key = Self::normalize_hotkey_string(&expanded_key);
-                    let Ok(hotkey) = Hotkey::from_str(&normalized_key) else {
-                        bail!("Could not parse hotkey: {key}");
-                    };
-                    keys.push((hotkey, cmd.clone()));
-                    key_specs.push((normalized_key, cmd));
+                let mode_names: HashSet<String> =
+                    binding_sets.iter().map(|(name, _)| name.clone()).collect();
+                for (mode, bindings) in binding_sets {
+                    let mut specs = Vec::with_capacity(bindings.len());
+                    for (key, cmd) in bindings {
+                        let expanded_key =
+                            Self::expand_modifier_combinations(&key, &c.modifier_combinations);
+                        let normalized_key = Self::normalize_hotkey_string(&expanded_key);
+                        let Ok(hotkey) = Hotkey::from_str(&normalized_key) else {
+                            bail!("Could not parse hotkey `{key}` in binding mode `{mode}`");
+                        };
+                        if let WmCommand::Wm(crate::actor::wm_controller::WmCmd::BindingMode(
+                            target,
+                        )) = &cmd
+                            && target != "default"
+                            && !mode_names.contains(target)
+                        {
+                            bail!("Binding mode `{mode}` references nonexistent mode `{target}`");
+                        }
+                        if mode == "default" {
+                            keys.push((hotkey, cmd.clone()));
+                        }
+                        specs.push((normalized_key, cmd));
+                    }
+                    binding_mode_specs.push((mode, specs));
                 }
                 Ok(Config {
                     settings: c.settings,
                     keys,
-                    key_specs,
+                    binding_mode_specs,
                     virtual_workspaces: c.virtual_workspaces,
                 })
             }
@@ -2531,6 +2642,34 @@ mod tests {
     }
 
     #[test]
+    fn scrolling_display_widths_merge_and_validate() {
+        let settings: ScrollingLayoutSettings = toml::from_str(
+            r#"
+            column_width_ratio = 0.7
+            min_column_width_ratio = 0.3
+            max_column_width_ratio = 0.9
+            [per_display."display-a"]
+            column_width_ratio = 0.5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(settings.widths_for_display(Some("display-a")), (0.5, 0.3, 0.9));
+        assert_eq!(settings.widths_for_display(Some("other")), (0.7, 0.3, 0.9));
+        assert_eq!(settings.widths_for_display(None), (0.7, 0.3, 0.9));
+        assert!(settings.validate().is_empty());
+        assert!(settings.effective_for_display(Some("display-a")).per_display.is_empty());
+
+        let mut invalid = settings;
+        invalid.per_display.get_mut("display-a").unwrap().max_column_width_ratio = Some(0.4);
+        assert!(
+            invalid
+                .validate()
+                .iter()
+                .any(|issue| issue.contains("per_display[display-a].column_width_ratio"))
+        );
+    }
+
+    #[test]
     fn layout_insertion_point_supports_global_default_and_per_mode_override() {
         let settings: LayoutSettings = toml::from_str(
             r#"
@@ -2648,6 +2787,21 @@ mod tests {
         let issues = settings.validate();
         assert!(issues.iter().any(|issue| issue.contains("invalid title_regex")));
         assert!(issues.iter().any(|issue| issue.contains("effects are ignored")));
+    }
+
+    #[test]
+    fn horizontal_mouse_warp_config_parsing() {
+        let missing: Settings = toml::from_str("").unwrap();
+        assert_eq!(missing.horizontal_mouse_warp, None);
+        for (value, expected) in [
+            ("top-to-bottom", HorizontalMouseWarp::TopToBottom),
+            ("bottom-to-top", HorizontalMouseWarp::BottomToTop),
+        ] {
+            let settings: Settings =
+                toml::from_str(&format!("horizontal_mouse_warp = \"{value}\" ")).unwrap();
+            assert_eq!(settings.horizontal_mouse_warp, Some(expected));
+        }
+        assert!(toml::from_str::<Settings>("horizontal_mouse_warp = \"sideways\"").is_err());
     }
 
     #[test]
@@ -2830,26 +2984,101 @@ mod tests {
     }
 
     #[test]
-    fn serde_round_trip_preserves_key_specs() {
+    fn serde_round_trip_preserves_binding_mode_specs() {
         let cfg = Config::default();
-        assert!(!cfg.key_specs.is_empty());
+        assert!(!cfg.binding_mode_specs[0].1.is_empty());
 
         let json = serde_json::to_string(&cfg).unwrap();
         let round_tripped: Config = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(round_tripped.key_specs, cfg.key_specs);
+        assert_eq!(round_tripped.binding_mode_specs, cfg.binding_mode_specs);
     }
 
     #[test]
-    fn serde_without_key_specs_reconstructs_from_keys() {
+    fn serde_without_binding_mode_specs_reconstructs_from_keys() {
         let cfg = Config::default();
         let mut json = serde_json::to_value(&cfg).unwrap();
-        json.as_object_mut().unwrap().remove("key_specs");
+        json.as_object_mut().unwrap().remove("binding_mode_specs");
 
         let round_tripped: Config = serde_json::from_value(json).unwrap();
 
-        assert_eq!(round_tripped.key_specs.len(), round_tripped.keys.len());
-        assert!(!round_tripped.key_specs.is_empty());
+        assert_eq!(
+            round_tripped.binding_mode_specs[0].1.len(),
+            round_tripped.keys.len()
+        );
+        assert!(!round_tripped.binding_mode_specs[0].1.is_empty());
+    }
+
+    #[test]
+    fn keys_only_config_still_has_only_the_default_binding_set() {
+        let config = Config::parse(
+            r#"
+                [settings]
+                [keys]
+                "A" = "reload_config"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.binding_mode_specs.len(), 1);
+        assert_eq!(config.binding_mode_specs[0].0, "default");
+        assert!(config.binding_mode_specs[0].1.iter().any(|(spec, _)| spec == "A"));
+    }
+
+    #[test]
+    fn custom_binding_modes_parse_and_expand_modifier_combinations() {
+        let config = Config::parse(
+            r#"
+                [settings]
+                [modifier_combinations]
+                nav = "Alt + Shift"
+                [keys]
+                "Alt + R" = { binding_mode = "resize" }
+                [binding_modes.resize]
+                "nav + N" = { binding_mode = "default" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.binding_mode_specs[0].0, "default");
+        assert_eq!(config.binding_mode_specs[1].0, "resize");
+        assert!(config.binding_mode_specs[1]
+            .1
+            .iter()
+            .any(|(spec, command)| spec == "Alt + Shift + N"
+                && matches!(command, WmCommand::Wm(crate::actor::wm_controller::WmCmd::BindingMode(target)) if target == "default")));
+    }
+
+    #[test]
+    fn binding_mode_config_rejects_bad_targets_reserved_default_and_bad_hotkeys() {
+        let missing = r#"
+            [settings]
+            [keys]
+            "Alt + R" = { binding_mode = "does-not-exist" }
+            [binding_modes.resize]
+            "Escape" = { binding_mode = "default" }
+        "#;
+        assert!(Config::parse(&missing).unwrap_err().to_string().contains("does-not-exist"));
+
+        let reserved = r#"
+            [settings]
+            [keys]
+            [binding_modes.default]
+        "#;
+        assert!(Config::parse(&reserved).unwrap_err().to_string().contains("reserved"));
+
+        let malformed = r#"
+            [settings]
+            [keys]
+            "NotARealHotkey" = { binding_mode = "default" }
+        "#;
+        assert!(Config::parse(&malformed).unwrap_err().to_string().contains("hotkey"));
+    }
+
+    #[test]
+    fn config_validation_rejects_duplicate_binding_mode_names() {
+        let mut json = serde_json::to_value(Config::default()).unwrap();
+        json["binding_mode_specs"] = serde_json::json!([["default", []], ["default", []]]);
+        let config: Config = serde_json::from_value(json).unwrap();
+        assert!(config.validate().iter().any(|issue| issue.contains("unique")));
     }
 
     #[test]

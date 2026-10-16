@@ -496,12 +496,7 @@ impl LayoutEngine {
 
         if mode == LayoutMode::Scrolling && self.layout_settings.scrolling.preserve_window_sizes {
             for &wid in &window_order {
-                if let (Some(frame), Some(constraints)) = (
-                    window_store.window(wid).map(|window| window.frame_monotonic),
-                    self.window_layout_constraints.get_mut(&wid),
-                ) {
-                    constraints.locked_width = frame.size.width;
-                }
+                self.preserve_scrolling_window_width(window_store, wid);
             }
         }
 
@@ -527,6 +522,10 @@ impl LayoutEngine {
 
         if let Some(selected) = selected_window.filter(|wid| !self.floating.is_floating(*wid)) {
             let _ = workspace.layout_system.select_window(new_layout, selected);
+        }
+
+        if mode == LayoutMode::Scrolling {
+            self.sync_scrolling_widths_for_space(space);
         }
 
         true
@@ -703,6 +702,7 @@ impl LayoutEngine {
                 }
                 LayoutSystemKind::Bsp(system) => {
                     system.set_window_insertion_point(insertion_point);
+                    system.set_single_window_aspect_ratio(settings.bsp.single_window_aspect_ratio);
                 }
                 LayoutSystemKind::Stack(system) => {
                     system.update_settings(settings.stack.default_orientation, insertion_point);
@@ -713,7 +713,8 @@ impl LayoutEngine {
                     system.update_settings(mode_settings);
                 }
                 LayoutSystemKind::Scrolling(system) => {
-                    let mut mode_settings = settings.scrolling.clone();
+                    let display = self.space_display_map.get(&ws.space).and_then(Option::as_deref);
+                    let mut mode_settings = settings.scrolling.effective_for_display(display);
                     mode_settings.base = settings.resolved_base_for(mode);
                     system.update_settings(&mode_settings);
                 }
@@ -750,6 +751,7 @@ impl LayoutEngine {
                     );
                 }
             }
+            self.sync_scrolling_widths_for_space(space);
         }
     }
 
@@ -1375,12 +1377,7 @@ impl LayoutEngine {
                     LayoutSystemKind::Scrolling(_)
                 ) && self.layout_settings.scrolling.preserve_window_sizes
                 {
-                    if let (Some(window), Some(constraints)) = (
-                        window_store.window(wid),
-                        self.window_layout_constraints.get_mut(&wid),
-                    ) {
-                        constraints.locked_width = window.frame_monotonic.size.width;
-                    }
+                    self.preserve_scrolling_window_width(window_store, wid);
                 }
                 self.workspace_tree_mut(assigned_workspace)
                     .add_window_after_selection(layout, wid);
@@ -1393,6 +1390,24 @@ impl LayoutEngine {
         }
 
         self.space_with_window(wid) != active_space_before
+    }
+
+    fn preserve_scrolling_window_width(&mut self, window_store: &WindowStore, wid: WindowId) {
+        if let Some(window) = window_store.window(wid) {
+            let constraints = self.window_layout_constraints.entry(wid).or_insert_with(|| {
+                WindowLayoutConstraints {
+                    is_resizable: window.info.is_resizable,
+                    locked_height: window.frame_monotonic.size.height,
+                    min_width: window.info.min_size.map_or(0.0, |size| size.width),
+                    min_height: window.info.min_size.map_or(0.0, |size| size.height),
+                    max_width: window.info.max_size.map_or(0.0, |size| size.width),
+                    max_height: window.info.max_size.map_or(0.0, |size| size.height),
+                    ..Default::default()
+                }
+                .normalized()
+            });
+            constraints.locked_width = window.frame_monotonic.size.width;
+        }
     }
 
     fn remove_window_from_all_tiling_trees(&mut self, wid: WindowId) {
@@ -1458,6 +1473,19 @@ impl LayoutEngine {
         } else {
             self.space_display_map.remove(&space);
         }
+        self.sync_scrolling_widths_for_space(space);
+    }
+
+    fn sync_scrolling_widths_for_space(&mut self, space: SpaceId) {
+        let display = self.space_display_map.get(&space).and_then(Option::as_deref);
+        let widths = self.layout_settings.scrolling.widths_for_display(display);
+        for (_, ws) in self.virtual_workspace_manager.workspaces.iter_mut() {
+            if ws.space == space {
+                if let LayoutSystemKind::Scrolling(system) = &mut ws.layout_system {
+                    system.update_width_settings(widths);
+                }
+            }
+        }
     }
 
     pub fn last_space_for_display_uuid(&self, display_uuid: &str) -> Option<SpaceId> {
@@ -1517,6 +1545,9 @@ impl LayoutEngine {
         self.space_display_map.retain(|_, uuid_opt| {
             uuid_opt.as_ref().map(|uuid| active.contains(uuid.as_str())).unwrap_or(false)
         });
+        for space in self.virtual_workspace_manager.initialized_spaces() {
+            self.sync_scrolling_widths_for_space(space);
+        }
     }
 
     pub fn new(
@@ -1645,6 +1676,7 @@ impl LayoutEngine {
 
                 let workspaces =
                     self.virtual_workspace_manager_mut().list_workspaces(space).to_vec();
+                self.sync_scrolling_widths_for_space(space);
                 for (id, _) in workspaces {
                     let tree = &mut self.virtual_workspace_manager.workspaces[id].layout_system;
                     self.workspace_layouts.ensure_active_for_workspace(space, size, id, tree);
@@ -2256,6 +2288,13 @@ impl LayoutEngine {
                             .visible_windows_under_selection(layout);
                         for wid in windows {
                             self.workspace_tree_mut(workspace_id).remove_window(wid);
+                            if matches!(
+                                self.workspace_tree(new_ws_id),
+                                LayoutSystemKind::Scrolling(_)
+                            ) && self.layout_settings.scrolling.preserve_window_sizes
+                            {
+                                self.preserve_scrolling_window_width(window_store, wid);
+                            }
                             self.workspace_tree_mut(new_ws_id)
                                 .add_window_after_selection(new_layout, wid);
                             self.virtual_workspace_manager.assign_window_to_workspace(
@@ -2952,6 +2991,13 @@ impl LayoutEngine {
                     if let Some(target_layout) =
                         self.workspace_layouts.active(op_space, target_workspace_id)
                     {
+                        if matches!(
+                            self.workspace_tree(target_workspace_id),
+                            LayoutSystemKind::Scrolling(_)
+                        ) && self.layout_settings.scrolling.preserve_window_sizes
+                        {
+                            self.preserve_scrolling_window_width(window_store, focused_window);
+                        }
                         self.workspace_tree_mut(target_workspace_id)
                             .add_window_after_selection(target_layout, focused_window);
                     }
@@ -3018,6 +3064,7 @@ impl LayoutEngine {
             LayoutCommand::CreateWorkspace => {
                 match self.virtual_workspace_manager.create_workspace(space, None) {
                     Ok(_workspace_id) => {
+                        self.sync_scrolling_widths_for_space(space);
                         self.broadcast_workspace_changed(space);
                         EventResponse {
                             changed: true,
@@ -3399,7 +3446,9 @@ impl LayoutEngine {
     }
 
     fn ensure_workspace_layouts(&mut self, space: SpaceId, screen_size: CGSize) {
-        for (workspace_id, _) in self.virtual_workspace_manager.list_workspaces(space) {
+        let workspaces = self.virtual_workspace_manager.list_workspaces(space);
+        self.sync_scrolling_widths_for_space(space);
+        for (workspace_id, _) in workspaces {
             let tree = &mut self.virtual_workspace_manager.workspaces[workspace_id].layout_system;
             self.workspace_layouts.ensure_active_for_workspace(
                 space,
@@ -3457,6 +3506,13 @@ impl LayoutEngine {
         } else if let Some(target_layout) =
             self.workspace_layouts.active(target_space, target_workspace_id)
         {
+            if matches!(
+                self.workspace_tree(target_workspace_id),
+                LayoutSystemKind::Scrolling(_)
+            ) && self.layout_settings.scrolling.preserve_window_sizes
+            {
+                self.preserve_scrolling_window_width(window_store, window_id);
+            }
             self.workspace_tree_mut(target_workspace_id)
                 .add_window_after_selection(target_layout, window_id);
         }
@@ -3703,6 +3759,53 @@ mod tests {
         AppRulePosition, AppRuleSize, AppWorkspaceRule, LayoutMode, LayoutSettings,
         VirtualWorkspaceSettings, WorkspaceLayoutRule, WorkspaceSelector,
     };
+
+    #[test]
+    fn scrolling_widths_follow_space_displays_and_reload() {
+        let mut workspaces = VirtualWorkspaceSettings::default();
+        let mut settings = LayoutSettings::default();
+        workspaces.default_workspace_count = 2;
+        settings.mode = LayoutMode::Scrolling;
+        settings.scrolling.per_display.insert(
+            "display-a".into(),
+            crate::common::config::ScrollingWidthOverride {
+                column_width_ratio: Some(0.5),
+                ..Default::default()
+            },
+        );
+        let mut engine = LayoutEngine::new(&workspaces, &settings, None);
+        let a = SpaceId::new(100);
+        let b = SpaceId::new(101);
+        engine.update_space_display(a, Some("display-a".into()));
+        engine.update_space_display(b, Some("display-b".into()));
+        assert!(engine.virtual_workspace_manager.existing_workspaces(a).is_empty());
+        let mut window_store = WindowStore::default();
+        let size = CGSize::new(1000.0, 800.0);
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(a, size));
+        let _ = engine.handle_event(&mut window_store, LayoutEvent::SpaceExposed(b, size));
+        let ids_a = engine.virtual_workspace_manager.list_workspaces(a);
+        let ids_b = engine.virtual_workspace_manager.list_workspaces(b);
+        let width = |engine: &LayoutEngine, id| match &engine.virtual_workspace_manager.workspaces
+            [id]
+            .layout_system
+        {
+            LayoutSystemKind::Scrolling(system) => system.configured_widths().0,
+            _ => panic!("expected scrolling"),
+        };
+        assert_eq!(width(&engine, ids_a[0].0), 0.5);
+        assert_eq!(width(&engine, ids_a[1].0), 0.5);
+        assert_eq!(width(&engine, ids_b[0].0), 0.7);
+        engine.update_space_display(a, Some("display-b".into()));
+        assert_eq!(width(&engine, ids_a[0].0), 0.7);
+        settings.scrolling.column_width_ratio = 0.6;
+        settings.scrolling.per_display.get_mut("display-a").unwrap().column_width_ratio = Some(0.4);
+        engine.update_space_display(a, Some("display-a".into()));
+        engine.set_layout_settings(&settings);
+        assert_eq!(width(&engine, ids_a[0].0), 0.4);
+        assert_eq!(width(&engine, ids_b[0].0), 0.6);
+        engine.prune_display_state(&[]);
+        assert_eq!(width(&engine, ids_a[0].0), 0.6);
+    }
 
     fn test_engine() -> LayoutEngine {
         LayoutEngine::new(

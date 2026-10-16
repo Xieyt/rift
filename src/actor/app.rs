@@ -535,7 +535,6 @@ struct State {
     events_tx: reactor::Sender,
     windows: HashMap<WindowId, AppWindowState>,
     elem_to_wid: HashMap<AXUIElement, WindowId>,
-    last_window_idx: u32,
     main_window: Option<WindowId>,
     last_activated: Option<(Instant, Quiet, Option<WindowId>, oneshot::Sender<()>)>,
     pending_activation_quiet: Option<(Instant, Quiet)>,
@@ -567,6 +566,25 @@ struct PendingFrame {
     interactive: bool,
 }
 
+/// Some AX bridges (notably Qt's) surface menu elements through window discovery.
+/// They are never valid layout targets, even when they have a WindowServer peer.
+fn is_transient_menu_role(role: Option<&str>) -> bool {
+    matches!(role, Some("AXPopover" | "AXMenu" | "AXMenuItem"))
+}
+
+fn is_menu_backing_window(elem: &AXUIElement, info: &WindowInfo) -> bool {
+    if info.ax_role.as_deref() != Some("AXWindow") || info.ax_subrole.as_deref() != Some("AXDialog")
+    {
+        return false;
+    }
+
+    elem.children().is_ok_and(|children| {
+        children
+            .into_iter()
+            .any(|child| child.role().is_ok_and(|role| role == "AXMenu"))
+    })
+}
+
 impl State {
     fn refresh_window_inventory(&mut self, token: WindowInventoryToken) -> Result<(), AxError> {
         let window_elems = match self.app.windows() {
@@ -594,14 +612,19 @@ impl State {
         for (elem, mut identity) in window_elems {
             let wsid = identity.resolve(|| WindowServerId::try_from(&elem).ok());
             let hint = wsid.and_then(|id| server_info_by_id.get(&id).copied());
-            let info = match WindowInfo::from_ax_element_with_identity(&elem, hint, &mut identity) {
-                Ok((info, _)) => info,
-                Err(err) => {
-                    let id = self.id_with_identity(&elem, &mut identity).ok();
-                    trace!(?id, ?err, "Failed to refresh window info; will retry later");
-                    continue;
-                }
-            };
+            let mut info =
+                match WindowInfo::from_ax_element_with_identity(&elem, hint, &mut identity) {
+                    Ok((info, _)) => info,
+                    Err(err) => {
+                        let id = self.id_with_identity(&elem, &mut identity).ok();
+                        trace!(?id, ?err, "Failed to refresh window info; will retry later");
+                        continue;
+                    }
+                };
+            if self.should_ignore_window_info(&elem, &info) {
+                continue;
+            }
+            self.normalize_window_info(&elem, &mut info);
             if !Self::has_visible_cg_peer(wsid, hint) && !info.is_minimized {
                 trace!(pid = ?self.pid, ?wsid, "Ignoring AX window without a visible CG window");
                 continue;
@@ -1249,7 +1272,11 @@ impl State {
                 // merely live on another space. This fallback therefore only prunes
                 // windows whose AX element has actually gone invalid.
                 self.remove_stale_windows();
-                self.on_main_window_changed(None, false);
+                // Some apps (notably Java-based ones like IBKR) can report a new
+                // main window before AXWindowCreated or before we have fully
+                // registered it. Treat main-window changes as a valid discovery
+                // path so the new primary window gets tracked immediately.
+                self.on_main_window_changed(None, true);
             }
             AxNotificationKind::WindowCreated => {
                 if self.id(&elem).is_ok() {
@@ -1398,7 +1425,12 @@ impl State {
                     trace!(?wid, "Ignoring title change for superseded AX element");
                     return;
                 }
-                match elem.title() {
+                let wsid = self.windows.get(&wid).and_then(|window| window.window_server_id);
+                let sls_title = wsid
+                    .and_then(window_server::window_title)
+                    .filter(|(pid, _)| *pid == self.pid)
+                    .map(|(_, title)| title);
+                match sls_title.map(Ok).unwrap_or_else(|| elem.title()) {
                     Ok(title) => {
                         let Ok(window) = self.window_mut(wid) else {
                             return;
@@ -1810,6 +1842,29 @@ impl State {
         server_info_hint: Option<WindowServerInfo>,
         identity: &mut NativeWindowIdentity,
     ) -> Option<(WindowInfo, WindowId, Option<WindowServerInfo>)> {
+        // Resolve the WindowServer id before building the WindowInfo so that
+        // every id-derived field (sys_id, is_root, min/max size, bundle path)
+        // is computed from the same identity that keys the window.
+        //
+        // An AX window that does not resolve to a WindowServer window cannot be
+        // tracked through any of the WindowServer paths (space membership,
+        // WindowServerDestroyed, transactions) and would bypass every
+        // layer/level filter that keys on the id. System HUDs such as Control
+        // Center's volume bezel report AXWindowCreated with window number 0
+        // before (or without) a backing CG window. A later eligible
+        // WindowServerAppeared for the app requests an inventory refresh;
+        // registration then succeeds if AX exposes the window with a native
+        // id by that point.
+        let Some(window_server_id) = server_info_hint
+            .map(|hint| hint.id)
+            .filter(|id| id.as_nonzero().is_some())
+            .or_else(|| identity.resolve(|| WindowServerId::try_from(&elem).ok()))
+        else {
+            debug!(pid = ?self.pid, ?elem, "Ignoring AX window without a WindowServer id");
+            return None;
+        };
+        let idx = window_server_id.as_nonzero()?;
+
         let Ok((mut info, server_info)) =
             WindowInfo::from_ax_element_with_identity(&elem, server_info_hint, identity)
         else {
@@ -1820,58 +1875,12 @@ impl State {
             return None;
         }
 
-        let bundle_is_widget = info.bundle_id.as_deref().map_or(false, |id| {
-            let id_lower = id.to_ascii_lowercase();
-            id_lower.ends_with(".widget") || id_lower.contains(".widget.")
-        });
-
-        let path_is_extension = info.path.as_ref().and_then(|p| p.to_str()).map_or(false, |path| {
-            let lower = path.to_ascii_lowercase();
-            lower.contains(".appex/") || lower.ends_with(".appex")
-        });
-
-        if bundle_is_widget || path_is_extension {
-            trace!(bundle_id = ?info.bundle_id, path = ?info.path, "Ignoring widget/app-extension window");
+        if self.should_ignore_window_info(&elem, &info) {
             return None;
         }
 
-        if info.ax_role.as_deref() == Some("AXPopover") || info.ax_role.as_deref() == Some("AXMenu")
-        //|| info.ax_subrole.as_deref() == Some("AXUnknown")
-        {
-            trace!(
-                role = ?info.ax_role,
-                subrole = ?info.ax_subrole,
-                "Ignoring non-standard AX window"
-            );
-            return None;
-        }
+        self.normalize_window_info(&elem, &mut info);
 
-        // TODO: improve this heuristic using ideas from AeroSpace(maybe implement a similar testing architecture based on ax dumps)
-        if (self.bundle_id.as_deref() == Some("com.googlecode.iterm2")
-            || self.bundle_id.as_deref() == Some("com.apple.TextInputUI.xpc.CursorUIViewService"))
-            && elem.attribute("AXTitleUIElement").is_err()
-        {
-            info.is_standard = false;
-        }
-
-        if let Some(wsid) = info.sys_id {
-            info.is_root = window_server::window_parent(wsid).is_none();
-        } else {
-            info.is_root = true;
-        }
-
-        let window_server_id = info.sys_id.filter(|sid| sid.as_nonzero().is_some()).or_else(|| {
-            identity.resolve(|| {
-                WindowServerId::try_from(&elem)
-                    .map_err(|e| info!("Could not get window server id for {elem:?}: {e}"))
-                    .ok()
-            })
-        });
-
-        let idx = window_server_id.and_then(WindowServerId::as_nonzero).unwrap_or_else(|| {
-            self.last_window_idx += 1;
-            NonZeroU32::new(self.last_window_idx).unwrap()
-        });
         let wid = WindowId { pid: self.pid, idx };
         if self.windows.contains_key(&wid) {
             trace!(?wid, "Window already registered; skipping duplicate");
@@ -1884,14 +1893,14 @@ impl State {
         // unavailable; app-level discovery remains the lifecycle fallback.
         let notifications_registered = self.register_window_notifications(&elem, wid);
         let hidden_by_app = self.is_hidden;
-        let last_seen_txid = self.txid_from_store(window_server_id).unwrap_or_default();
+        let last_seen_txid = self.txid_from_store(Some(window_server_id)).unwrap_or_default();
 
         let old = self.windows.insert(wid, AppWindowState {
             elem: elem.clone(),
             notifications_registered,
             last_seen_txid,
             hidden_by_app,
-            window_server_id,
+            window_server_id: Some(window_server_id),
             title: info.title.clone(),
             is_animating: false,
             last_animation_frame: None,
@@ -2010,6 +2019,84 @@ impl State {
     #[inline]
     fn has_visible_cg_peer(wsid: Option<WindowServerId>, hint: Option<WindowServerInfo>) -> bool {
         wsid.is_none() || hint.is_some()
+    }
+
+    fn should_ignore_window_info(&self, elem: &AXUIElement, info: &WindowInfo) -> bool {
+        let bundle_is_widget = info.bundle_id.as_deref().map_or(false, |id| {
+            let id_lower = id.to_ascii_lowercase();
+            id_lower.ends_with(".widget") || id_lower.contains(".widget.")
+        });
+
+        let path_is_extension = info.path.as_ref().and_then(|p| p.to_str()).map_or(false, |path| {
+            let lower = path.to_ascii_lowercase();
+            lower.contains(".appex/") || lower.ends_with(".appex")
+        });
+
+        if bundle_is_widget || path_is_extension {
+            trace!(bundle_id = ?info.bundle_id, path = ?info.path, "Ignoring widget/app-extension window");
+            return true;
+        }
+
+        if is_transient_menu_role(info.ax_role.as_deref()) || is_menu_backing_window(elem, info) {
+            trace!(
+                role = ?info.ax_role,
+                subrole = ?info.ax_subrole,
+                "Ignoring non-standard AX window"
+            );
+            return true;
+        }
+
+        false
+    }
+
+    fn normalize_window_info(&self, elem: &AXUIElement, info: &mut WindowInfo) {
+        // TODO: improve this heuristic using ideas from AeroSpace(maybe implement a similar testing architecture based on ax dumps)
+        if (self.bundle_id.as_deref() == Some("com.googlecode.iterm2")
+            || self.bundle_id.as_deref() == Some("com.apple.TextInputUI.xpc.CursorUIViewService"))
+            && elem.attribute("AXTitleUIElement").is_err()
+        {
+            info.is_standard = false;
+        }
+
+        if let Some(wsid) = info.sys_id {
+            info.is_root = window_server::window_parent(wsid).is_none();
+
+            if self.bundle_id.as_deref() == Some("com.google.Chrome")
+                && !info.is_standard
+                && !info.is_resizable
+            {
+                trace!(
+                    ?wsid,
+                    title = %info.title,
+                    role = ?info.ax_role,
+                    subrole = ?info.ax_subrole,
+                    "Ignoring Chrome non-standard non-resizable window by marking it non-root"
+                );
+                info.is_root = false;
+                return;
+            }
+
+            if !info.is_root && !info.is_standard {
+                // Non-standard subrole windows (e.g. Java/Swing) may report a
+                // parent because the toolkit creates a container window. If
+                // that parent is not on-screen (frame is zero-sized or not
+                // visible in the window list), treat this as a root window so
+                // it can be managed.
+                if let Some(parent_id) = window_server::window_parent(wsid) {
+                    if let Some(parent_info) = window_server::get_window(parent_id) {
+                        let on_screen = parent_info.frame.size.width > 1.0
+                            && parent_info.frame.size.height > 1.0;
+                        if !on_screen {
+                            info.is_root = true;
+                        }
+                    } else {
+                        info.is_root = true;
+                    }
+                }
+            }
+        } else {
+            info.is_root = true;
+        }
     }
 
     fn handle_ax_error(&mut self, wid: WindowId, err: &AXError) -> bool {
@@ -2267,7 +2354,6 @@ fn app_thread_main(
         events_tx,
         windows: HashMap::default(),
         elem_to_wid: HashMap::default(),
-        last_window_idx: 0,
         main_window: None,
         last_activated: None,
         pending_activation_quiet: None,
@@ -2310,4 +2396,18 @@ fn trace<T>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_menu_role;
+
+    #[test]
+    fn transient_menu_roles_are_not_window_candidates() {
+        assert!(is_transient_menu_role(Some("AXPopover")));
+        assert!(is_transient_menu_role(Some("AXMenu")));
+        assert!(is_transient_menu_role(Some("AXMenuItem")));
+        assert!(!is_transient_menu_role(Some("AXWindow")));
+        assert!(!is_transient_menu_role(Some("AXTextField")));
+    }
 }

@@ -11,7 +11,6 @@ use dispatchr::time::Time;
 use objc2_app_kit::{NSApplicationActivationPolicy, NSRunningApplication};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use serde_json;
 use strum::VariantNames;
 use tracing::{debug, error, info, instrument, warn};
 
@@ -82,6 +81,7 @@ pub enum WmCmd {
     ToggleSpaceActivated,
     Exec(ExecCmd),
     ReloadConfig,
+    BindingMode(String),
 
     NextWorkspace,
     PrevWorkspace,
@@ -145,7 +145,6 @@ pub struct WmController {
     window_tx_store: Option<WindowTxStore>,
     receiver: Receiver,
     sender: Sender,
-    hotkeys_installed: bool,
     apps: AppLifecycle,
 }
 
@@ -231,7 +230,6 @@ impl WmController {
             window_tx_store,
             receiver,
             sender: sender.clone(),
-            hotkeys_installed: false,
             apps: AppLifecycle::default(),
         };
         (this, sender)
@@ -278,12 +276,8 @@ impl WmController {
                 }
             }
             AppEventsRegistered => {
+                _ = self.input_tx.send(input::Request::EnableHotkeys);
                 _ = self.input_tx.send(input::Request::SetEventProcessing(false));
-
-                if !self.hotkeys_installed {
-                    self.register_hotkeys();
-                    self.hotkeys_installed = true;
-                }
 
                 let sender = self.sender.clone();
                 let input_tx = self.input_tx.clone();
@@ -327,32 +321,9 @@ impl WmController {
                 }
             }
             ConfigUpdated(new_cfg) => {
-                let old_keys_ser = serde_json::to_string(&self.config.config.keys).ok();
-
                 self.config.config = new_cfg;
 
                 _ = self.input_tx.send(input::Request::ConfigUpdated(self.config.config.clone()));
-
-                if !self.hotkeys_installed {
-                    debug!(
-                        "hotkeys not yet installed; deferring hotkey update until AppEventsRegistered"
-                    );
-                    return;
-                }
-
-                if let Some(old_ser) = old_keys_ser {
-                    if serde_json::to_string(&self.config.config.keys).ok().as_deref()
-                        != Some(&old_ser)
-                    {
-                        debug!("hotkey bindings changed; reloading hotkeys");
-                        self.register_hotkeys();
-                    } else {
-                        debug!("hotkey bindings unchanged; skipping reload");
-                    }
-                } else {
-                    debug!("could not compare hotkey bindings; reloading hotkeys");
-                    self.register_hotkeys();
-                }
             }
             PowerStateChanged(is_low_power_mode) => {
                 info!("Power state changed: low power mode = {}", is_low_power_mode);
@@ -362,6 +333,9 @@ impl WmController {
                 _ = self.input_tx.send(input::Request::KeyboardLayoutChanged);
             }
             Command(Wm(ReloadConfig)) => self.reload_config(),
+            Command(Wm(BindingMode(target))) => {
+                _ = self.input_tx.send(input::Request::SetBindingMode(target));
+            }
             Command(Wm(crate::actor::wm_controller::WmCmd::ToggleSpaceActivated)) => {
                 self.events_tx.send(reactor::Event::Command(reactor::Command::Reactor(
                     reactor::ReactorCommand::ToggleSpaceActivated,
@@ -523,13 +497,6 @@ impl WmController {
                 rx,
             );
         }
-    }
-
-    fn register_hotkeys(&mut self) {
-        debug!("register_hotkeys");
-        let bindings: Vec<(String, WmCommand)> =
-            self.config.config.key_specs.iter().cloned().collect();
-        _ = self.input_tx.send(input::Request::SetHotkeys(bindings));
     }
 
     fn reload_config(&self) {

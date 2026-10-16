@@ -443,7 +443,8 @@ impl NativeWindowIdentity {
             return Some(id);
         }
         let resolved = query();
-        // Zero still uses a process-local identity and may acquire a native ID later.
+        // Zero is not cached: the element is not registered without a native
+        // id, and a later lookup may still acquire one.
         self.0 = resolved.filter(|id| id.as_nonzero().is_some());
         resolved
     }
@@ -485,7 +486,7 @@ impl WindowInfo {
             .or_else(|| identity.resolve(|| WindowServerId::try_from(element).ok()));
         let is_resizable = element.can_resize().unwrap_or(true);
 
-        let (bundle_id, path) = if !is_standard {
+        let (bundle_id, path) = if ax_role.as_deref() != Some(AX_WINDOW_ROLE) {
             (None, None)
         } else if let Some(info) = server_info {
             bundle_info_for_pid(info.pid)
