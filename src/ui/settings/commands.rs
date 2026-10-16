@@ -234,6 +234,37 @@ fn glyphs(key: &str, s: &ConfigSource) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
+
+/// The ordinary keys a shortcut requires to be held, by config token.
+///
+/// The macOS key recorder reports four modifier flags plus one key, so it can
+/// neither see nor store a held ordinary key (Left Command arrives as F20, an
+/// ordinary key, because of the driver swap). Recording over such a shortcut
+/// would drop the held key and leave a binding that fires while typing, so the
+/// sheet refuses instead.
+fn held_key_tokens(key: &str, s: &ConfigSource) -> Vec<String> {
+    let expanded: Vec<String> = key
+        .split('+')
+        .flat_map(|part| {
+            let part = part.trim();
+            match s.modifier_combinations.get(part) {
+                Some(value) => value.split('+').map(|v| v.trim().to_string()).collect::<Vec<_>>(),
+                None => vec![part.to_string()],
+            }
+        })
+        .collect();
+    let Some((_, leading)) = expanded.split_last() else {
+        return Vec::new();
+    };
+    leading
+        .iter()
+        .filter(|token| {
+            let mut probe = crate::sys::hotkey::Modifiers::empty();
+            !probe.insert_from_token(token)
+        })
+        .cloned()
+        .collect()
+}
 const MODIFIER_NAMES: [(Modifiers, &str); 4] = [
     (Modifiers::Control, "Ctrl"),
     (Modifiers::Option, "Alt"),
@@ -595,10 +626,32 @@ fn binding_sheet(ui: Ui, model: &Rc<Model>, mode: String, old: Option<String>, c
     });
     let key_changed = changed.clone();
     let key_cb = key.clone();
+    // A shortcut whose config spec holds an ordinary key cannot be re-recorded:
+    // the macOS recorder would report only the final key, silently turning
+    // "mod1 + H" into a bare "H" that fires while typing.
+    let held_keys = old
+        .as_deref()
+        .map(|old| held_key_tokens(old, &model.source.borrow()))
+        .unwrap_or_default();
+    let recording_blocked = Rc::new(Cell::new(false));
+    let blocked_cb = recording_blocked.clone();
+    let held_for_cb = !held_keys.is_empty();
     let recorder = KeyRecorder::new(&ui).on_change(move |v| {
+        if held_for_cb {
+            blocked_cb.set(true);
+            return;
+        }
         *key_cb.borrow_mut() = v.as_ref().and_then(recorded_key);
         key_changed();
     });
+    let sheet_caption = if held_keys.is_empty() {
+        "Click the shortcut, then press the keys you want to use.".to_string()
+    } else {
+        format!(
+            "This shortcut holds {} down. macOS can only record modifier keys, so it must be edited in the config file.",
+            held_keys.join(" + ")
+        )
+    };
     if let Some(old) = &old {
         recorder.set_title(&glyphs(old, &model.source.borrow()));
     }
@@ -640,6 +693,21 @@ fn binding_sheet(ui: Ui, model: &Rc<Model>, mode: String, old: Option<String>, c
         let Some(message) = error.upgrade() else {
             return;
         };
+        if recording_blocked.get() {
+            message.set_validation(&Validation::Error(
+                format!(
+                    "{} is held down as part of this shortcut, and cannot be recorded here. Edit this shortcut in the config file.",
+                    held_keys.join(" + ")
+                )
+                .into(),
+            ));
+            if let Some(model) = weak_model.upgrade()
+                && let Some(sheet) = model.sheet.borrow().as_ref()
+            {
+                sheet.fit_content();
+            }
+            return;
+        }
         let Some(key) = key.borrow().clone() else {
             message.set_validation(&Validation::Error("Record a shortcut first".into()));
             if let Some(model) = weak_model.upgrade()
@@ -680,10 +748,7 @@ fn binding_sheet(ui: Ui, model: &Rc<Model>, mode: String, old: Option<String>, c
                 right: 20.0,
             })
             .push(SectionTitle::new(&ui, "Keyboard Shortcut"))
-            .push(Caption::new(
-                &ui,
-                "Click the shortcut, then press the keys you want to use.",
-            ))
+            .push(Caption::new(&ui, &sheet_caption))
             .push(
                 Section::new(&ui, "")
                     .row(SettingsRow::new(&ui, "Shortcut", recorder))
@@ -1098,4 +1163,40 @@ fn modifier_combinations(f: &mut FormBuilder, model: &Rc<Model>) -> VStack {
         .push(list)
         .push(HStack::new(&ui).push(name).push(recorder).push(add))
         .push(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn source_with(alias: &str, value: &str) -> ConfigSource {
+        let mut source = ConfigSource {
+            settings: crate::common::config::Config::default().settings,
+            keys: Default::default(),
+            binding_modes: Default::default(),
+            virtual_workspaces: Default::default(),
+            modifier_combinations: Default::default(),
+        };
+        source.modifier_combinations.insert(alias.to_string(), value.to_string());
+        source
+    }
+
+    #[test]
+    fn a_shortcut_that_holds_an_ordinary_key_is_reported_so_the_recorder_can_refuse() {
+        // The macOS recorder reports modifier flags plus one key, so recording
+        // over "mod1 + H" would save a bare "H" that fires while typing.
+        let source = source_with("mod1", "F20");
+        assert_eq!(held_key_tokens("mod1 + H", &source), vec!["F20".to_string()]);
+        assert_eq!(held_key_tokens("mod1 + Shift + L", &source), vec![
+            "F20".to_string()
+        ]);
+    }
+
+    #[test]
+    fn ordinary_modifier_shortcuts_stay_recordable() {
+        let source = source_with("comb1", "Alt + Shift");
+        assert!(held_key_tokens("comb1 + H", &source).is_empty());
+        assert!(held_key_tokens("Ctrl + Alt + Backspace", &source).is_empty());
+        assert!(held_key_tokens("F20", &source).is_empty());
+    }
 }

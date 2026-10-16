@@ -1029,7 +1029,9 @@ impl Input {
                 let hotkey = Hotkey::with_held(modifiers, held_keys, key_code);
                 let active_mode = self.active_mode.get();
                 let bindings = self.hotkeys.borrow();
-                // TEMPORARY sync-debug probe — remove before committing.
+                // Kept deliberately: at `rift_wm::actor::input=trace` this is the
+                // only place that shows the chord the tap actually built,
+                // including held trigger keys, and whether a binding matched.
                 tracing::trace!(
                     ?hotkey,
                     mode = active_mode,
