@@ -607,7 +607,11 @@ use-local-config:
     else
       echo "==> already on the local config"
     fi
-    just restart
+    # NOT `just restart`: `launchctl kickstart -k` restarts from launchd's
+    # CACHED job definition and keeps the old --config, so the switch looks
+    # like it did nothing. The plist has to be unloaded and re-bootstrapped.
+    just stop
+    just start
     echo "✓ rift now reads ./local-config.toml — edit it and \`just restart\`"
     echo "  NOTE: \`darwin-rebuild switch\` rewrites this plist and reverts you."
 
@@ -626,7 +630,11 @@ use-system-config:
     echo "    --config $(/usr/libexec/PlistBuddy -c "Print :ProgramArguments:2" "{{plist}}")"
     echo "    --config $prev"
     /usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 $prev" "{{plist}}"
-    just restart
+    # NOT `just restart`: `launchctl kickstart -k` restarts from launchd's
+    # CACHED job definition and keeps the old --config, so the switch looks
+    # like it did nothing. The plist has to be unloaded and re-bootstrapped.
+    just stop
+    just start
     echo "✓ back on the system config; ./local-config.toml left on disk"
 
 # one-off: copy whatever config the agent currently uses into the checkout
