@@ -16,20 +16,51 @@ env:
   RUSTFLAGS: "-C debuginfo=0"
 
 jobs:
-  format:
+  # fmt and clippy run through the flake's devShell, NOT rustup. Both are
+  # version-sensitive and must use the exact binaries a contributor gets from
+  # `nix develop`/direnv:
+  #   - rustfmt.toml enables UNSTABLE options (overflow_delimited_expr,
+  #     brace_style, fn_single_line, where_single_line). The old job used
+  #     `dtolnay/rust-toolchain@nightly`, i.e. whatever nightly shipped that
+  #     morning, while the devShell pins fenix `latest.rustfmt` via flake.lock.
+  #     The day nightly changes any of those formatters, `--check` fails on a PR
+  #     that touched nothing related, and no local `cargo fmt` can reproduce it.
+  #   - clippy was in the devShell toolchain and in no job at all.
+  lint:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: NixOS/nix-installer-action@v1.0.0
+      - uses: nix-community/cache-nix-action@v7
         with:
-          components: rustfmt
+          primary-key: nix-lint-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**') }}
+          restore-prefixes-first-match: nix-lint-${{ runner.os }}-
+          gc-max-store-size: 2G
       - name: Format Check
-        run: cargo +nightly fmt --all --check --verbose
+        run: nix develop -c cargo fmt --all --check --verbose
+      # The tree currently carries ~314 style/complexity warnings, so `-D
+      # warnings` would fail on arrival and the job would be turned off within a
+      # week. Gate on `correctness` only — the category for code that is
+      # definitely wrong — which is CLEAN on this tree today (verified: exit 0).
+      #
+      # `-D clippy::suspicious` is NOT enabled, deliberately: it finds 5 real
+      # hits (await_holding_refcell_ref at src/actor/app.rs:1673 and :1914,
+      # arc_with_non_send_sync at src/sys/observer.rs:223 and src/sys/timer.rs:196
+      # and :208). Those are judgement calls about the single-threaded actor
+      # design, not drive-by fixes, and silencing them with #[allow] to make a
+      # new job green would be the wrong order of operations. Promote this to
+      # `-D clippy::suspicious` once those five are resolved on purpose.
+      - name: Clippy
+        run: nix develop -c cargo clippy --locked --workspace --all-targets -- -D clippy::correctness
 
   test:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      # Deliberately rustup and deliberately FLOATING: this job is the early
+      # warning for "the next stable release breaks rift", which a flake.lock
+      # pin would hide until someone ran `nix flake update`. It also keeps the
+      # fast path fast — no Nix install on the job that runs the test suite.
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
@@ -40,3 +71,40 @@ jobs:
       # `cargo nextest run --run-ignored all -E 'binary(settings_native)'`.
       - name: Test
         run: cargo nextest run -E 'not binary(settings_native)'
+
+  # Nothing used to exercise the flake. `checks.rift` existed and no workflow
+  # invoked it, so every invariant nix/package.nix documents — apple-sdk_14
+  # being stdenv's default SDK (zero extra download), darwinMinVersion feeding
+  # both the binary's LC_BUILD_VERSION and the bundle's LSMinimumSystemVersion,
+  # crane's cargoArtifacts key matching between buildDepsOnly and buildPackage —
+  # could be broken by a nixpkgs bump and only surface on someone's laptop.
+  #
+  # This also covers code the `test` job never compiles: it builds
+  # `--package rift-wm --bins` through crane, the packaged scope.
+  nix:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: NixOS/nix-installer-action@v1.0.0
+        with:
+          # packages.rift sets __noChroot (the bundle ad-hoc-signs with
+          # /usr/bin/codesign, which cannot run inside the sandbox). macOS
+          # defaults to sandbox = false, but state it rather than inherit it:
+          # an installer default flipping to true turns this job into an
+          # unexplainable "cannot build __noChroot derivation" failure.
+          extra-conf: |
+            sandbox = false
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-build-${{ runner.os }}-${{ hashFiles('flake.lock', 'nix/**', 'Cargo.lock') }}
+          restore-prefixes-first-match: nix-build-${{ runner.os }}-
+          gc-max-store-size: 5G
+      - name: Flake check
+        run: nix flake check -L
+      # Built separately from `nix flake check`: checks.rift is the crane build
+      # (raw binaries), while packages.rift is the Rift.app bundle that wraps it
+      # — the plist interpolation, the version read back from Cargo.toml, and
+      # the ad-hoc codesign only run here. The bundle sets __noChroot, which is
+      # fine on macOS where sandbox defaults to false.
+      - name: Build app bundle
+        run: nix build .#rift -L
