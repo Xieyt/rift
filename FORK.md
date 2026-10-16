@@ -877,7 +877,7 @@ on first activation (`services.rift.manageSigningIdentity`, default `true`) and
 signs with it, so Accessibility persists across rebuilds out of the box. The
 `just setup-signing-cert` step above is only for the local `just install` dev loop.
 Note: rift only manages *activated* spaces — if focus/layout commands are ignored,
-run `rift-cli execute toggle-space-activated` (or your `hyper+Z` bind).
+run `rift-cli execute toggle-space-activated` (or your `mod1+Z` bind).
 
 ### Formatting (use nightly rustfmt — important)
 

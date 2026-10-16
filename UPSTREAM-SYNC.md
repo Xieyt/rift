@@ -1097,7 +1097,7 @@ Bisected across all four candidates on pristine worktrees:
 Kept anyway, deliberately: conflicts were zero, `3a52122`'s breaking IPC change was
 free to absorb now and would not have been later (§7's whole thesis), the regression
 is upstream's and will be fixed upstream, and its blast radius here is a recoverable
-annoyance on a feature we have bound (`hyper + T`) but do not currently use. Skipped
+annoyance on a feature we have bound (`mod1 + T`) but do not currently use. Skipped
 in `just test` with the bisect recorded; drop the skip when upstream repairs it.
 
 **Upstream main now carries three red tests** (§8.3 lists the other two). That is
