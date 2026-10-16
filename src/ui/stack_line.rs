@@ -92,11 +92,14 @@ impl From<&crate::common::config::StackLineSettings> for IndicatorConfig {
     fn from(config: &crate::common::config::StackLineSettings) -> Self {
         let hex =
             |s: &Option<String>, d: Color| s.as_deref().and_then(Color::from_hex).unwrap_or(d);
+        // Upstream's typed RGBA keys are the defaults; the fork's hex strings
+        // override them when set. Both parse, so existing configs keep working.
+        let cfg = |c: crate::common::config::Color| Color::new(c.r, c.g, c.b, c.a);
         Self {
             bar_thickness: config.thickness,
-            selected_color: hex(&config.active_color, Color::new(0.26, 0.53, 0.98, 0.55)),
-            unselected_color: hex(&config.inactive_color, Color::new(0.12, 0.12, 0.14, 0.92)),
-            border_color: Color::new(0.0, 0.0, 0.0, 0.25),
+            selected_color: hex(&config.active_color, cfg(config.selected_color)),
+            unselected_color: hex(&config.inactive_color, cfg(config.unselected_color)),
+            border_color: cfg(config.border_color),
             border_width: config.border_width,
             horizontal_placement: config.horiz_placement,
             vertical_placement: config.vert_placement,

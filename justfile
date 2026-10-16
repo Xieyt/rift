@@ -87,8 +87,16 @@ fmt-check:
 # rewrote `identify_stale_windows` into the token-gated inventory pipeline, and
 # the test now passes both on a pristine `upstream/main` (83f3b66) and here.
 # Verified by deletion, as above.
+#
+# The third is `confirmed_window_move_forwards_membership_without_space_switch`,
+# added by the sixth sync's stage 1. It is UPSTREAM'S, verified by deletion: a
+# pristine worktree at the stage-1 checkpoint `0ddcf73` aborts on it too (SIGABRT,
+# "failed to initiate panic"). The fork has never edited `src/actor/spaces.rs`.
+# A sweep of the whole filtered suite on that pristine tree found exactly two red
+# tests — this one and the `topology_change_...` above — so the skip list is
+# complete for this checkpoint. Re-verify by deletion at the next one.
 test:
-    nix develop -c cargo test --lib -- layout_engine model common::config actor::raise_manager actor::reactor::tests actor::reactor::mouse_focus_publisher_tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::config actor::drag_swap actor::input actor::menu_bar actor::notification_center actor::process actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target
+    nix develop -c cargo test --lib -- layout_engine model common::config actor::raise_manager actor::reactor::tests actor::reactor::mouse_focus_publisher_tests actor::reactor::managers actor::reactor::events actor::reactor::animation actor::reactor::main_window actor::spaces actor::config actor::drag actor::input actor::menu_bar actor::notification_center actor::process actor::stack_line actor::window_notify actor::hints_bar ui::stack_line ui::hints_bar ui::menu_bar ui::mission_control --skip topology_change_clears_stale_pending_hide_target --skip confirmed_window_move_forwards_membership_without_space_switch
 
 # whole library suite — only meaningful in a real GUI session
 test-all:

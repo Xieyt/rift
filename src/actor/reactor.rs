@@ -80,6 +80,7 @@ use main_window::MainWindowTracker;
 use managers::LayoutManager;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 pub use replay::{Record, replay};
+use rift_protocol::DirectionalDistance;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use tracing::{debug, instrument, trace, warn};
@@ -104,7 +105,7 @@ use crate::model::tx_store::WindowTxStore;
 use crate::model::{AppRuleResult, RiftState};
 use crate::sys::event::MouseState;
 use crate::sys::executor::Executor;
-use crate::sys::geometry::{CGRectDef, CGRectExt};
+use crate::sys::geometry::{CGRectDef, CGRectExt, SameAs};
 pub use crate::sys::screen::ScreenInfo;
 use crate::sys::screen::{SpaceId, order_visible_spaces_by_position};
 use crate::sys::window_server::{
@@ -117,9 +118,8 @@ pub use query::ReactorQueryHandle;
 
 pub(crate) use crate::model::reactor::{AppState, WindowState};
 pub use crate::model::reactor::{
-    Command, DisplaySelector, DragSession, DragState, MenuState, MissionControlState,
-    ReactorCommand, RefocusState, Requested, StaleCleanupState, WorkspaceSwitchOrigin,
-    WorkspaceSwitchState,
+    Command, DisplaySelector, MenuState, MissionControlState, ReactorCommand, RefocusState,
+    Requested, StaleCleanupState, WorkspaceSwitchOrigin, WorkspaceSwitchState,
 };
 
 #[doc(hidden)]
@@ -311,7 +311,7 @@ pub enum Event {
     MenuOpened(pid_t),
     MenuClosed(pid_t),
 
-    /// Left mouse button was released.
+    /// A mouse button was released.
     ///
     /// Layout changes are suppressed while the button is down so that they
     /// don't interfere with drags. This event is used to update the layout in
@@ -319,12 +319,25 @@ pub enum Event {
     ///
     /// FIXME: This can be interleaved incorrectly with the MouseState in app
     /// actor events.
-    MouseUp,
+    MouseUp(crate::actor::drag::MouseButton),
     /// A hover resolved by the reactor from the latest input position.
     MouseMoved(WindowServerId),
     /// Coalesced wake for the latest pointer position from the input thread.
     #[serde(skip)]
     MouseFocusPending(MouseFocusPublisher),
+    /// Coalesced wake for native/modifier drag pointer motion.
+    #[serde(skip)]
+    DragMotionPending(crate::actor::drag::DragMotionPublisher),
+    #[serde(skip)]
+    DragMotion(crate::actor::drag::DragMotion),
+    #[serde(skip)]
+    ModifierMouseDown {
+        button: crate::actor::drag::MouseButton,
+        point: CGPoint,
+        action: crate::common::config::MouseAction,
+    },
+    #[serde(skip)]
+    DragCancel,
     /// Forwarded by the spaces actor after wake has been observed.
     ///
     /// The spaces actor is the authority for sleep/lock/display lifecycle.
@@ -426,6 +439,7 @@ impl Reactor {
         hints_bar_tx: hints_bar::Sender,
         window_notify: Option<(crate::actor::window_notify::Sender, WindowTxStore)>,
         one_space: bool,
+        native_motion_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> ReactorHandle {
         let (events_tx, events) = actor::channel();
         let events_tx_clone = events_tx.clone();
@@ -437,6 +451,7 @@ impl Reactor {
             window_notify,
             one_space,
         );
+        reactor.drag_manager.native_motion_active = native_motion_active;
         reactor.communication_manager.input_tx = Some(input_tx);
         reactor.menu_manager.menu_tx = Some(menu_tx);
         reactor.communication_manager.stack_line_tx = Some(stack_line_tx);
@@ -481,11 +496,13 @@ impl Reactor {
             main_window_tracker: MainWindowTracker::default(),
             pending_mouse_focus: None,
             drag_manager: managers::DragManager {
-                drag_state: DragState::Inactive,
-                drag_swap_manager: crate::actor::drag_swap::DragManager::new(
-                    config.settings.window_snapping,
-                ),
-                skip_layout_for_window: None,
+                actor: crate::actor::drag::DragActor::new(config.settings.drag_drop),
+                native_motion_active: std::sync::Arc::default(),
+                externally_controlled_window: None,
+                preview: None,
+                preview_enabled: config.settings.drag_drop.enabled
+                    && config.settings.drag_drop.preview,
+                preview_suppressed: false,
             },
             workspace_switch_manager: managers::WorkspaceSwitchManager {
                 workspace_switch_state: WorkspaceSwitchState::Inactive,
@@ -967,42 +984,13 @@ impl Reactor {
         }
     }
 
-    fn is_in_drag(&self) -> bool {
-        matches!(
-            self.drag_manager.drag_state,
-            DragState::Active { .. } | DragState::PendingSwap { .. }
-        )
-    }
+    fn is_in_drag(&self) -> bool { self.drag_manager.actor.is_active() }
 
     fn is_mission_control_active(&self) -> bool {
         matches!(
             self.mission_control_manager.mission_control_state,
             MissionControlState::Active
         )
-    }
-
-    fn get_pending_drag_swap(&self) -> Option<(WindowId, WindowId)> {
-        if let DragState::PendingSwap { session, target } = &self.drag_manager.drag_state {
-            Some((session.window, *target))
-        } else {
-            None
-        }
-    }
-
-    fn get_active_drag_session(&self) -> Option<&DragSession> {
-        if let DragState::Active { session } = &self.drag_manager.drag_state {
-            Some(session)
-        } else {
-            None
-        }
-    }
-
-    fn take_active_drag_session(&mut self) -> Option<DragSession> {
-        match std::mem::replace(&mut self.drag_manager.drag_state, DragState::Inactive) {
-            DragState::Active { session } => Some(session),
-            DragState::PendingSwap { session, .. } => Some(session),
-            _ => None,
-        }
     }
 
     async fn run(reactor: Reactor, events: Receiver, events_tx: Sender) {
@@ -1052,11 +1040,21 @@ impl Reactor {
                     }
                 }
             }
+            Event::DragMotionPending(publisher) => {
+                let motion = publisher.take_latest();
+                let mut reactor = reactor.borrow_mut();
+                if reactor.drag_manager.actor.is_active()
+                    && let Some(motion) = motion
+                {
+                    reactor.handle_loop_event(Event::DragMotion(motion));
+                }
+            }
             event => reactor.borrow_mut().handle_loop_event(event),
         }
     }
 
     fn handle_loop_event(&mut self, event: Event) {
+        let high_frequency = matches!(&event, Event::DragMotion(..));
         if let Event::Query(req) = event {
             self.handle_query_request(req);
             return;
@@ -1083,7 +1081,9 @@ impl Reactor {
         Self::note_windowserver_activity(&event);
         self.handle_event(event);
         #[cfg(any(test, debug_assertions))]
-        self.state.windows.debug_assert_invariants();
+        if !high_frequency {
+            self.state.windows.debug_assert_invariants();
+        }
     }
 
     pub(crate) fn handle_ipc_command(&mut self, command: Command) {
@@ -1110,6 +1110,7 @@ impl Reactor {
 
     fn log_event(&self, event: &Event) {
         match event {
+            Event::DragMotion(..) => {}
             // High-frequency, low-information events stay at trace so `reactor=debug`
             // remains usable. `WindowTitleChanged` belongs here for the same reason as
             // the others: any terminal with a progress spinner in its title emits one
@@ -1117,7 +1118,7 @@ impl Reactor {
             // entire log by volume and ~1 GiB/day, which is also how the log-rotation
             // agent's inability to rotate an actively-written file went unnoticed.
             Event::WindowFrameChanged(..)
-            | Event::MouseUp
+            | Event::MouseUp(_)
             | Event::MouseMoved(..)
             | Event::WindowTitleChanged(..) => {
                 trace!(?event, "Event")
@@ -1214,9 +1215,18 @@ impl Reactor {
         self.flush_deferred_window_inventory_refresh();
     }
 
-    #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
     fn handle_event(&mut self, event: Event) {
-        let was_dragging = !matches!(self.drag_manager.drag_state, DragState::Inactive);
+        if matches!(event, Event::DragMotion(..)) {
+            self.handle_event_inner(event);
+        } else {
+            self.handle_event_traced(event);
+        }
+    }
+
+    #[instrument(name = "reactor::handle_event", skip(self), fields(event=?event))]
+    fn handle_event_traced(&mut self, event: Event) { self.handle_event_inner(event) }
+
+    fn handle_event_inner(&mut self, event: Event) {
         let previously_focused_window = self.main_window();
         match self.dispatch_workflow(event) {
             Ok(mut outcome) => {
@@ -1230,12 +1240,7 @@ impl Reactor {
             }
             Err(error) => warn!(%error, "reactor workflow failed"),
         }
-        let dragging = !matches!(self.drag_manager.drag_state, DragState::Inactive);
-        if dragging != was_dragging
-            && let Some(tx) = &self.communication_manager.input_tx
-        {
-            tx.send(input::Request::SetDragActive(dragging));
-        }
+        self.drag_manager.sync_motion_gate();
     }
 
     fn dispatch_workflow(&mut self, mut event: Event) -> anyhow::Result<EventOutcome> {
@@ -1252,7 +1257,10 @@ impl Reactor {
         // yields focus back to the pre-sleep application. Only real input makes
         // a subsequent activation a trustworthy request to follow an app to a
         // different virtual workspace.
-        if matches!(event, Event::MouseUp | Event::MouseMoved(_) | Event::Command(_)) {
+        if matches!(
+            event,
+            Event::MouseUp(_) | Event::MouseMoved(_) | Event::Command(_)
+        ) {
             self.refresh_quarantine_manager.suppress_auto_workspace_switch_until_input = false;
         }
 
@@ -1626,10 +1634,7 @@ impl Reactor {
                     let mut outcome = EventOutcome::no_change();
                     outcome.dispatch_mouse_up = effective_mouse_state
                         == Some(crate::sys::event::MouseState::Up)
-                        && matches!(
-                            self.drag_manager.drag_state,
-                            DragState::Active { .. } | DragState::PendingSwap { .. }
-                        );
+                        && self.drag_manager.actor.is_active();
                     outcome.focused_window = raised_window;
                     return Ok(outcome);
                 }
@@ -1662,14 +1667,17 @@ impl Reactor {
                             .workspace_for_window(&self.state.windows, space, wid)
                             .is_some()
                 });
-                let screens = self
-                    .space_state
-                    .screens
-                    .iter()
-                    .filter_map(|screen| {
-                        Some((screen.space?, screen.frame, screen.display_uuid_owned()))
-                    })
-                    .collect();
+                let screens = if old_frame.size.same_as(new_frame.size) {
+                    Vec::new()
+                } else {
+                    self.space_state
+                        .screens
+                        .iter()
+                        .filter_map(|screen| {
+                            Some((screen.space?, screen.frame, screen.display_uuid_owned()))
+                        })
+                        .collect()
+                };
                 let mut outcome = window_workflow::handle_window_frame_changed(
                     &mut self.state,
                     &mut self.layout_manager,
@@ -1693,10 +1701,7 @@ impl Reactor {
                 // early from the reducer. Mouse release still has to terminate
                 // an existing drag session in those cases.
                 if effective_mouse_state == Some(crate::sys::event::MouseState::Up)
-                    && matches!(
-                        self.drag_manager.drag_state,
-                        DragState::Active { .. } | DragState::PendingSwap { .. }
-                    )
+                    && self.drag_manager.actor.is_active()
                 {
                     outcome.dispatch_mouse_up = true;
                 }
@@ -1751,33 +1756,93 @@ impl Reactor {
                 self.space_state.command_space = command_space;
                 return Ok(EventOutcome::default());
             }
-            Event::MouseUp => {
-                let pending_swap = self.get_pending_drag_swap();
-                let (visible_spaces, visible_space_centers) = self.visible_spaces_for_layout(true);
-                let swap_space = pending_swap
-                    .and_then(|(dragged, _)| {
-                        self.state.windows.window(dragged).and_then(|window| {
-                            self.best_space_for_window(&window.frame_monotonic, window.info.sys_id)
-                        })
-                    })
-                    .or_else(|| {
-                        self.drag_manager
-                            .drag_swap_manager
-                            .origin_frame()
-                            .and_then(|frame| self.best_space_for_frame(&frame))
-                    })
-                    .or_else(|| self.space_state.screens.iter().find_map(|screen| screen.space));
-                let session = match &self.drag_manager.drag_state {
-                    DragState::Active { session } | DragState::PendingSwap { session, .. } => {
-                        Some(session.clone())
+            Event::DragMotion(motion) => {
+                let mut intent_changed = self.drag_manager.actor.motion(motion);
+                if self.drag_manager.actor.kind()
+                    == Some(crate::actor::drag::DragKind::ModifierMove)
+                {
+                    let current_space =
+                        self.screen_for_point(motion.point)
+                            .and_then(|screen| screen.space)
+                            .or_else(|| {
+                                self.drag_manager.actor.source().and_then(|source| {
+                                    self.best_space_for_frame(&source.last_frame)
+                                })
+                            });
+                    if self.drag_manager.actor.update_current_space(current_space) {
+                        intent_changed |= self.drag_manager.actor.motion(motion);
                     }
-                    DragState::Inactive => None,
+                }
+                if intent_changed {
+                    self.resolve_drag_preview();
+                }
+                let Some((window, new_frame)) = self.drag_manager.actor.interactive_update() else {
+                    return Ok(EventOutcome::no_change());
                 };
-                let final_space = session.as_ref().and_then(|session| {
-                    session
-                        .settled_space
-                        .or_else(|| self.best_space_for_frame(&session.last_frame))
-                        .or_else(|| self.best_space_for_window_id(session.window))
+                return Ok(EventOutcome::no_change()
+                    .with_interactive_window_frame_write(window, new_frame, false));
+            }
+            Event::DragCancel => {
+                return Ok(interaction_workflow::handle_cancel(&mut self.drag_manager));
+            }
+            Event::ModifierMouseDown { button, point, action } => {
+                let session_id = self.drag_manager.actor.await_modifier(button, point, action);
+                let source = self.window_id_under_cursor().and_then(|window| {
+                    let state = self.state.windows.window(window)?;
+                    state.is_admitted().then_some((
+                        window,
+                        state.frame_monotonic,
+                        state.info.sys_id,
+                    ))
+                });
+                let Some((window, frame, server_id)) = source else {
+                    let _ = self.drag_manager.actor.resolve_start(
+                        session_id,
+                        None,
+                        crate::actor::drag::DragScene::default(),
+                    );
+                    return Ok(EventOutcome::no_change());
+                };
+                let space = self.best_space_for_window(&frame, server_id);
+                let tiled = !self.layout_manager.layout_engine.is_window_floating(window);
+                let scene = if tiled && action == crate::common::config::MouseAction::Move {
+                    space.map(|space| self.drag_scene(window, space)).unwrap_or_default()
+                } else {
+                    Default::default()
+                };
+                let _ = self.drag_manager.actor.resolve_start(
+                    session_id,
+                    Some(crate::actor::drag::DragSource {
+                        window,
+                        origin_frame: frame,
+                        last_frame: frame,
+                        origin_space: space,
+                        current_space: space,
+                        tiled,
+                    }),
+                    scene,
+                );
+                self.drag_manager.sync_preview();
+                if tiled && action == crate::common::config::MouseAction::Move {
+                    self.drag_manager.externally_controlled_window = Some(window);
+                }
+                return Ok(EventOutcome::no_change());
+            }
+            Event::MouseUp(button) => {
+                let final_space = self.drag_manager.actor.source().and_then(|source| {
+                    let frame_space = || self.best_space_for_frame(&source.last_frame);
+                    if self.drag_manager.actor.kind()
+                        == Some(crate::actor::drag::DragKind::ModifierMove)
+                    {
+                        frame_space()
+                            .or(source.current_space)
+                            .or_else(|| self.best_space_for_window_id(source.window))
+                    } else {
+                        source
+                            .current_space
+                            .or_else(frame_space)
+                            .or_else(|| self.best_space_for_window_id(source.window))
+                    }
                 });
                 let focused = self.window_id_under_cursor().and_then(|window| {
                     self.best_space_for_window_id(window).map(|space| (space, window))
@@ -1786,13 +1851,7 @@ impl Reactor {
                     &mut self.state,
                     &mut self.layout_manager,
                     &mut self.drag_manager,
-                    interaction_workflow::MouseUpPayload {
-                        pending_swap,
-                        swap_space,
-                        final_space,
-                        visible_spaces,
-                        visible_space_centers,
-                    },
+                    interaction_workflow::MouseUpPayload { button, final_space },
                 )?;
                 if let Some((space, window)) = focused {
                     outcome = outcome.with_layout_event(LayoutEvent::WindowFocused(space, window));
@@ -1871,6 +1930,7 @@ impl Reactor {
             Event::MissionControlNativeExited => {
                 return topology_workflow::handle_mission_control_native_exited(
                     &mut self.mission_control_manager,
+                    &mut self.drag_manager,
                 );
             }
             Event::RaiseCompleted { window_id, sequence_id } => {
@@ -2060,6 +2120,11 @@ impl Reactor {
                     .as_ref()
                     .and_then(|screen| screen.space)
                     .is_none_or(|space| self.is_space_active(space));
+                if focus_window.is_none()
+                    && let Some(space) = screen.as_ref().and_then(|screen| screen.space)
+                {
+                    self.focus_desktop_if_active_workspace_empty(space);
+                }
                 let focus_window_center = focus_window
                     .and_then(|wid| self.state.windows.window(wid))
                     .map(|window| window.frame_monotonic.mid());
@@ -2371,7 +2436,14 @@ impl Reactor {
         // Some transitions need to place a window on its destination display
         // before arranging that display. Keep these writes ahead of both layout
         // responses and the arrange pass so tiling always supplies the final frame.
-        for write in outcome.pre_layout_window_frame_writes {
+        for write in outcome
+            .pre_layout_window_frame_writes
+            .into_iter()
+            .chain(outcome.interactive_window_frame_write)
+        {
+            if write.coalesced && !self.drag_manager.actor.is_active() {
+                continue;
+            }
             let window_server_id =
                 self.state.windows.window(write.window).and_then(|window| window.info.sys_id);
             let transaction = if let Some(window_server_id) = window_server_id {
@@ -2381,15 +2453,22 @@ impl Reactor {
             } else {
                 TransactionId::default()
             };
-            if let Some(app) = self.app_manager.apps.get(&write.window.pid)
-                && let Err(error) = app.handle.send(Request::SetWindowFrame(
+            if let Some(app) = self.app_manager.apps.get(&write.window.pid) {
+                if write.coalesced {
+                    app.handle.send_interactive_frame(
+                        write.window,
+                        write.frame,
+                        write.set_size,
+                        transaction,
+                    );
+                } else if let Err(error) = app.handle.send(Request::SetWindowFrame(
                     write.window,
                     write.frame,
                     transaction,
                     write.requested,
-                ))
-            {
-                warn!(window = ?write.window, %error, "failed to write requested window frame");
+                )) {
+                    warn!(window = ?write.window, %error, "failed to write requested window frame");
+                }
             }
         }
 
@@ -2401,11 +2480,12 @@ impl Reactor {
         for (response, workspace_switch_space) in outcome.layout_responses {
             self.handle_layout_response(response, workspace_switch_space);
         }
-        for (window, frame) in outcome.drag_swap_evaluations {
-            self.maybe_swap_on_drag(window, frame);
-        }
-        if outcome.dispatch_mouse_up {
-            self.handle_event(Event::MouseUp);
+        // The input tap captured a modifier drag's button and always reports its real release,
+        // so none is inferred from button state for it.
+        let modifier_drag =
+            self.drag_manager.actor.kind() == Some(crate::actor::drag::DragKind::ModifierMove);
+        if outcome.dispatch_mouse_up && !modifier_drag {
+            self.handle_event(Event::MouseUp(crate::actor::drag::MouseButton::Left));
         }
 
         let mut layout_changed = false;
@@ -3241,24 +3321,88 @@ impl Reactor {
         })
     }
 
+    fn drag_scene(&self, source: WindowId, space: SpaceId) -> crate::actor::drag::DragScene {
+        interaction_workflow::build_drag_scene(&self.state, &self.layout_manager, source, space)
+    }
+
+    fn resolve_drag_preview(&mut self) {
+        let Some(source) = self.drag_manager.actor.source() else {
+            return;
+        };
+        while let Some(mut intent) = self.drag_manager.actor.intent() {
+            if intent.window == source.window
+                && !matches!(intent.action, crate::layout_engine::WindowDropAction::Move(_))
+            {
+                self.drag_manager.actor.set_preview(intent, Some(source.origin_frame));
+                break;
+            }
+            let preview = loop {
+                let preview = self.space_state.screen_by_space(intent.space).and_then(|screen| {
+                    self.layout_manager.layout_engine.drop_preview_frame(
+                        intent.space,
+                        source.window,
+                        intent.window,
+                        intent.frame,
+                        intent.action,
+                        screen.frame,
+                        screen.display_uuid_opt(),
+                        &self.config.settings.ui.stack_line,
+                    )
+                });
+                let Some(result) = preview else { break None };
+                let action =
+                    result.action(intent.action, self.config.settings.drag_drop.drop_action);
+                if action == intent.action {
+                    break Some(result);
+                }
+                intent.action = action;
+            };
+            if !self.drag_manager.actor.set_preview(intent, preview.map(|result| result.frame)) {
+                break;
+            }
+        }
+        self.drag_manager.sync_preview();
+    }
+
+    fn refresh_active_drag_scene(&mut self) {
+        let Some(source) = self.drag_manager.actor.source() else {
+            return;
+        };
+        if !source.tiled
+            || !matches!(
+                self.drag_manager.actor.kind(),
+                Some(
+                    crate::actor::drag::DragKind::NativeMove
+                        | crate::actor::drag::DragKind::ModifierMove
+                )
+            )
+        {
+            return;
+        }
+        let Some(space) = source.current_space else { return };
+        let scene = self.drag_scene(source.window, space);
+        self.drag_manager.actor.replace_scene(scene);
+        self.resolve_drag_preview();
+    }
+
     #[cfg(test)]
     fn ensure_active_drag(&mut self, wid: WindowId, frame: &CGRect) {
-        let needs_new_session =
-            self.get_active_drag_session().is_none_or(|session| session.window != wid);
-        if needs_new_session {
+        if self.drag_manager.actor.source().is_none_or(|source| source.window != wid) {
             let server_id = self.state.windows.window(wid).and_then(|window| window.info.sys_id);
             let origin_space = self.best_space_for_window(frame, server_id);
-            self.drag_manager.drag_state = DragState::Active {
-                session: DragSession {
+            self.drag_manager.actor.begin_native(
+                crate::actor::drag::DragSource {
                     window: wid,
+                    origin_frame: *frame,
                     last_frame: *frame,
                     origin_space,
-                    settled_space: origin_space,
-                    layout_dirty: false,
+                    current_space: origin_space,
+                    tiled: true,
                 },
-            };
+                crate::actor::drag::DragScene::default(),
+            );
         }
-        self.drag_manager.skip_layout_for_window = Some(wid);
+        self.drag_manager.externally_controlled_window = Some(wid);
     }
 
     fn best_space_for_window_state(&self, window: &WindowState) -> Option<SpaceId> {
@@ -3802,6 +3946,7 @@ impl Reactor {
             LayoutEvent::WindowRemoved(wid)
                 if self.layout_manager.layout_engine.focused_window() == Some(wid)
         );
+        self.prepare_refocus_before_removal(&event);
         let event_clone = event.clone();
         let layout_outcome =
             self.layout_manager.layout_engine.handle_event(&mut self.state.windows, event);
@@ -3833,6 +3978,9 @@ impl Reactor {
                 workspace_switch_space.is_some(),
                 workspace_switch_space.or(event_space),
             );
+            if self.is_in_drag() {
+                self.refresh_active_drag_scene();
+            }
         }
         if focus_desktop && let Some(space) = self.workspace_command_space() {
             self.focus_desktop_if_active_workspace_empty(space);
@@ -4412,7 +4560,7 @@ impl Reactor {
                     }
                 }
             } else if let Some(space) = pending_refocus_space.take() {
-                if let Some(wid) = self.last_focused_window_in_space(space) {
+                if let Some(wid) = self.visible_focus_candidate_in_active_workspace(space, None) {
                     focus_window = Some(wid);
                     false
                 } else if !self.is_in_drag() {
@@ -4522,151 +4670,6 @@ impl Reactor {
         if let Err(e) = self.communication_manager.raise_manager_tx.try_send(msg) {
             warn!("Failed to send raise request to raise manager: {}", e);
         }
-    }
-
-    fn collect_drag_swap_candidates(
-        &self,
-        wid: WindowId,
-        space: SpaceId,
-    ) -> Vec<(WindowId, CGRect)> {
-        self.state
-            .windows
-            .iter_windows()
-            .filter_map(|(other_wid, other_state)| {
-                if other_wid == wid {
-                    return None;
-                }
-                let other_space = self.best_space_for_window_state(other_state)?;
-                if other_space != space
-                    || !self.layout_manager.layout_engine.is_window_in_active_workspace(
-                        &self.state.windows,
-                        space,
-                        other_wid,
-                    )
-                    || self.layout_manager.layout_engine.is_window_floating(other_wid)
-                {
-                    return None;
-                }
-                Some((other_wid, other_state.frame_monotonic))
-            })
-            .collect()
-    }
-
-    fn maybe_swap_on_drag(&mut self, wid: WindowId, new_frame: CGRect) {
-        if !self.is_in_drag() {
-            trace!(?wid, "Skipping swap: not in drag (mouse up received)");
-            return;
-        }
-
-        let server_id = {
-            let Some(window) = self.state.windows.window(wid) else {
-                return;
-            };
-            window.info.sys_id
-        };
-
-        let Some(space) = self
-            .get_active_drag_session()
-            .and_then(|session| session.settled_space)
-            .or_else(|| self.best_space_for_window(&new_frame, server_id))
-        else {
-            return;
-        };
-
-        let origin_space_hint = self
-            .get_active_drag_session()
-            .and_then(|session| session.origin_space)
-            .or_else(|| {
-                self.drag_manager
-                    .origin_frame()
-                    .and_then(|frame| self.best_space_for_window(&frame, server_id))
-            });
-
-        if let Some(origin_space) = origin_space_hint
-            && origin_space != space
-        {
-            if let Some((pending_wid, pending_target)) = self.get_pending_drag_swap()
-                && pending_wid == wid
-            {
-                trace!(
-                    ?wid,
-                    ?pending_target,
-                    ?origin_space,
-                    ?space,
-                    "Clearing pending drag swap; dragged window entered new space"
-                );
-                self.drag_manager.drag_state = DragState::Inactive;
-            }
-            trace!(
-                ?wid,
-                ?origin_space,
-                ?space,
-                "Resetting drag swap tracking after space change"
-            );
-            self.drag_manager.drag_swap_manager.reset();
-            return;
-        }
-
-        if !self.layout_manager.layout_engine.is_window_in_active_workspace(
-            &self.state.windows,
-            space,
-            wid,
-        ) {
-            return;
-        }
-
-        let candidates = self.collect_drag_swap_candidates(wid, space);
-
-        let previous_pending = self.get_pending_drag_swap();
-        let new_candidate =
-            self.drag_manager.drag_swap_manager.on_frame_change(wid, new_frame, &candidates);
-        let active_target = self.drag_manager.drag_swap_manager.last_target();
-        if let Some(target_wid) = active_target {
-            if new_candidate.is_some() || previous_pending != Some((wid, target_wid)) {
-                trace!(
-                    ?wid,
-                    ?target_wid,
-                    "Detected swap candidate; deferring until MouseUp"
-                );
-            }
-
-            if let Some(session) = self.take_active_drag_session() {
-                self.drag_manager.drag_state =
-                    DragState::PendingSwap { session, target: target_wid };
-            } else {
-                trace!(
-                    ?wid,
-                    ?target_wid,
-                    "Skipping pending swap; no active drag session"
-                );
-                self.drag_manager.drag_state = DragState::Inactive;
-                self.drag_manager.skip_layout_for_window = None;
-                return;
-            }
-
-            self.drag_manager.skip_layout_for_window = Some(wid);
-            return;
-        }
-
-        if let Some((pending_wid, pending_target)) = previous_pending
-            && pending_wid == wid
-        {
-            trace!(
-                ?wid,
-                ?pending_target,
-                "Clearing pending drag swap; overlap ended before MouseUp"
-            );
-            if let Some(session) = self.take_active_drag_session() {
-                self.drag_manager.drag_state = DragState::Active { session };
-            } else {
-                self.drag_manager.drag_state = DragState::Inactive;
-            }
-        }
-
-        if self.drag_manager.skip_layout_for_window == Some(wid) {
-            self.drag_manager.skip_layout_for_window = None;
-        }
-        // wait for mouse::up before doing *anything*
     }
 
     pub(crate) fn window_id_under_cursor(&self) -> Option<WindowId> {
@@ -4820,6 +4823,25 @@ impl Reactor {
             .virtual_workspace_manager()
             .workspace_for_window(&self.state.windows, space, window_id)
             .is_some_and(|window_workspace| window_workspace != active_workspace)
+    }
+
+    fn prepare_refocus_before_removal(&mut self, event: &LayoutEvent) {
+        let focused = self.layout_manager.layout_engine.focused_window();
+        let removed_focus = match event {
+            LayoutEvent::AppClosed(pid) => focused.filter(|wid| wid.pid == *pid),
+            LayoutEvent::WindowRemoved(wid) if focused == Some(*wid) => focused,
+            _ => None,
+        };
+        if let Some(wid) = removed_focus
+            && let Some(space) = self
+                .layout_manager
+                .layout_engine
+                .space_with_window(wid)
+                .filter(|space| self.is_space_active(*space))
+                .or_else(|| self.workspace_command_space())
+        {
+            self.refocus_manager.refocus_state = RefocusState::Pending(space);
+        }
     }
 
     fn prepare_refocus_after_layout_event(&mut self, event: &LayoutEvent) {
@@ -5056,32 +5078,28 @@ impl Reactor {
             let min = frame.min();
             let max = frame.max();
 
-            let (primary_dist, orth_gap) = match direction {
-                Direction::Left => {
-                    if max.x > origin.x {
-                        continue;
-                    }
-                    (origin.x - max.x, interval_gap(min.y, max.y, origin.y, origin.y))
-                }
-                Direction::Right => {
-                    if min.x < origin.x {
-                        continue;
-                    }
-                    (min.x - origin.x, interval_gap(min.y, max.y, origin.y, origin.y))
-                }
-                Direction::Up => {
-                    // Smaller y means visually "up".
-                    if max.y > origin.y {
-                        continue;
-                    }
-                    (origin.y - max.y, interval_gap(min.x, max.x, origin.x, origin.x))
-                }
-                Direction::Down => {
-                    if min.y < origin.y {
-                        continue;
-                    }
-                    (min.y - origin.y, interval_gap(min.x, max.x, origin.x, origin.x))
-                }
+            let (edge, orth_gap) = match direction {
+                Direction::Left => (
+                    CGPoint::new(max.x, origin.y),
+                    interval_gap(min.y, max.y, origin.y, origin.y),
+                ),
+                Direction::Right => (
+                    CGPoint::new(min.x, origin.y),
+                    interval_gap(min.y, max.y, origin.y, origin.y),
+                ),
+                Direction::Up => (
+                    CGPoint::new(origin.x, max.y),
+                    interval_gap(min.x, max.x, origin.x, origin.x),
+                ),
+                Direction::Down => (
+                    CGPoint::new(origin.x, min.y),
+                    interval_gap(min.x, max.x, origin.x, origin.x),
+                ),
+            };
+            let Some(primary_dist) =
+                (origin.x, origin.y).distance_in_direction((edge.x, edge.y), direction)
+            else {
+                continue;
             };
 
             let should_replace = best.as_ref().map_or(true, |(best_primary, best_orth, _)| {
