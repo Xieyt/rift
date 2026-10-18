@@ -237,8 +237,29 @@ pub fn window_title(id: WindowServerId) -> Option<(i32, String)> {
     if query.window_id() != id.as_u32() {
         return None;
     }
-    let title = NonNull::new(unsafe { SLSWindowIteratorCopyTitle(query.iter) })?;
+    let Some(title) = NonNull::new(unsafe { SLSWindowIteratorCopyTitle(query.iter) }) else {
+        // WindowServer withholds titles without Screen Recording, and says so by
+        // returning a null string rather than an error. Callers then fall back to
+        // a synchronous Accessibility read inside the notification callback,
+        // which is ~16x slower per title change. The startup gate normally
+        // catches this; a grant revoked while running still lands here.
+        warn_titles_unavailable_once();
+        return None;
+    };
     Some((query.pid(), unsafe { CFRetained::from_raw(title) }.to_string()))
+}
+
+fn warn_titles_unavailable_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            "WindowServer returned no window title; falling back to Accessibility titles \
+             (slower). Grant Rift Screen Recording in System Settings > Privacy & Security > \
+             Screen & System Audio Recording. If Rift is already listed, the grant is stale: \
+             `tccutil reset ScreenCapture git.acsandmann.rift` and restart."
+        );
+    });
 }
 
 impl Drop for WindowIterator {
