@@ -593,6 +593,14 @@ git push origin develop
 on `cargo check --workspace --all-targets` and `just test`. It refuses to start on a
 dirty tree.
 
+**A sync is not finished until it is reported.** Green gates say nothing broke;
+they do not say what arrived. Every sync ends with a written account of, in order:
+(1) what each upstream commit actually changes in behaviour or cost — not its
+subject line; (2) every conflict and which side won, with the reason; (3) what
+changed on the fork's own side as a consequence; (4) what is still unverified,
+which for a headless gate is always the on-screen behaviour. `UPSTREAM-SYNC.md`
+§13 is the shortest example of the shape.
+
 **Why a range merge and not commit-by-commit** — this is counter-intuitive, and the
 first version of the recipe got it wrong. A range merge is the *smaller* conflict
 set, because git's 3-way merge over the range absorbs upstream's internal churn,
