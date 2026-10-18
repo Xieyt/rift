@@ -493,7 +493,7 @@ upstream-tripwire:
         hit=1
       fi
     fi
-    for f in src/layout_engine/systems/scrolling.rs src/actor/reactor.rs src/actor/app.rs; do
+    for f in src/layout_engine/systems/scrolling.rs src/actor/reactor.rs src/actor/app.rs src/sys/hotkey.rs src/actor/input.rs; do
       n=$(git log --oneline HEAD..upstream/main -- "$f" | wc -l | tr -d ' ')
       [ "$n" -gt 0 ] && echo "- [.] $n commit(s) touch \`$f\` (our churniest shared files)"
     done

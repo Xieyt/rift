@@ -231,7 +231,18 @@ impl HintsBar {
             return;
         }
         let sig = Self::signature(&snapshot.cells, &snapshot.workspaces, snapshot.top_count);
-        let changed = self.last_sig.as_ref() != Some(&sig);
+        let sig_changed = self.last_sig.as_ref() != Some(&sig);
+        // A frame-only change (display resize, arrangement change) must still
+        // trigger a render: `render()` is what calls `set_frame` and
+        // `sync_hit_rects`, and the chip signature alone says nothing about
+        // geometry, so without this the bar stays put while its hit rect
+        // goes stale.
+        let frame_changed = self.last_snapshot.as_ref().is_none_or(|prev| {
+            prev.bar_frame != snapshot.bar_frame
+                || prev.overflow_frame != snapshot.overflow_frame
+                || prev.screen_frame != snapshot.screen_frame
+        });
+        let changed = sig_changed || frame_changed;
         self.last_sig = Some(sig);
         self.last_snapshot = Some(snapshot);
         self.reevaluate(changed);
@@ -300,14 +311,32 @@ impl HintsBar {
     }
 
     /// Display backing scale so the bar rasterizes crisply on Retina.
-    fn backing_scale(&self) -> f64 {
-        NSScreen::mainScreen(self.mtm).map(|s| s.backingScaleFactor()).unwrap_or(2.0)
+    ///
+    /// Resolves the `NSScreen` whose frame contains `screen_frame` — the
+    /// display the bar is actually on — not `NSScreen::mainScreen`, which
+    /// tracks whatever screen holds the frontmost app's key window and can be
+    /// a different display entirely on a mixed-DPI setup.
+    fn backing_scale(&self, screen_frame: CGRect) -> f64 {
+        let cx = screen_frame.origin.x + screen_frame.size.width / 2.0;
+        let cy = screen_frame.origin.y + screen_frame.size.height / 2.0;
+        NSScreen::screens(self.mtm)
+            .iter()
+            .find(|s| {
+                let f = s.frame();
+                cx >= f.origin.x
+                    && cx < f.origin.x + f.size.width
+                    && cy >= f.origin.y
+                    && cy < f.origin.y + f.size.height
+            })
+            .or_else(|| NSScreen::mainScreen(self.mtm))
+            .map(|s| s.backingScaleFactor())
+            .unwrap_or(1.0)
     }
 
     fn render(&mut self, snap: Snapshot) {
         tracing::trace!(target: "hbbench", "hb_render");
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
-        let scale = self.backing_scale();
+        let scale = self.backing_scale(snap.screen_frame);
         let total = snap.cells.len();
         let has_overflow = snap.top_count < total;
 
@@ -331,6 +360,7 @@ impl HintsBar {
         // Main bar: create or reframe, then update.
         let main = match &self.bar {
             Some(bar) => {
+                bar.set_scale(scale);
                 if bar.frame() != snap.bar_frame {
                     if let Err(err) = bar.set_frame(snap.bar_frame) {
                         warn!(?err, "hints_bar: set_frame failed");
@@ -367,6 +397,7 @@ impl HintsBar {
             };
             let ob = match &self.overflow_bar {
                 Some(ob) => {
+                    ob.set_scale(scale);
                     if ob.frame() != of_frame {
                         if let Err(err) = ob.set_frame(of_frame) {
                             warn!(?err, "hints_bar: overflow set_frame failed");

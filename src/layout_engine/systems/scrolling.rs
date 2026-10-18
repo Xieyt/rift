@@ -1249,9 +1249,14 @@ impl ScrollingLayoutSystem {
     /// the same source the windows themselves are placed from, so the bar cannot
     /// drift from its column.
     ///
-    /// Node ids are `column.id.0`, which upstream guarantees even and therefore
-    /// non-colliding with odd window ids; the old `g.key | (1 << 63)` window-hash
-    /// scheme is gone with the cache.
+    /// Node ids are fabricated: `column.id.0` goes in the low (index) half and
+    /// the version half is saturated to `u32::MAX` (already odd), so the result
+    /// can only collide with a real tree `NodeId` once some slotmap slot has
+    /// been removed and reinserted ~2^31 times — i.e. never in practice. A
+    /// low-half placement like the old `g.key | (1 << 63)` window-hash scheme
+    /// would alias first-generation tree ids (`{ idx: N, version: 1 }`), since
+    /// column ids start at 2 and increment by 2 and so fit entirely in the low
+    /// half.
     pub(crate) fn collect_group_containers_scrolling(
         &self,
         layout: LayoutId,
@@ -1265,6 +1270,9 @@ impl ScrollingLayoutSystem {
         let Some(g) = state.geometry.as_ref() else {
             return Vec::new();
         };
+        if !state.columns.iter().any(|column| column.tabbed && column.windows.len() > 1) {
+            return Vec::new();
+        }
         let frames: HashMap<WindowId, CGRect> = Self::translate_frames(state, g, true).collect();
         state
             .columns
@@ -1275,7 +1283,7 @@ impl ScrollingLayoutSystem {
                 let frame = *frames.get(column.windows.first()?)?;
                 Some(crate::layout_engine::engine::GroupContainerInfo {
                     node_id: crate::model::tree::NodeId::from(slotmap::KeyData::from_ffi(
-                        column.id.0,
+                        (u64::MAX << 32) | column.id.0,
                     )),
                     container_kind: crate::layout_engine::LayoutKind::HorizontalStack,
                     frame,

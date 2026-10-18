@@ -2418,10 +2418,9 @@ impl LayoutEngine {
             }
             LayoutCommand::ToggleColumnTabbed => {
                 self.workspaces[workspace_id].layout_state.last_saved = Some(layout);
-                let _ = self.workspaces[workspace_id].layout_system.toggle_selection_tabbed(layout);
-                let visible_windows =
-                    self.workspaces[workspace_id].layout_system.visible_windows_in_layout(layout);
-                Self::response_for_raised_windows(visible_windows)
+                let affected =
+                    self.workspaces[workspace_id].layout_system.toggle_selection_tabbed(layout);
+                Self::response_for_raised_windows(affected)
             }
             LayoutCommand::CycleColumnWidth => {
                 self.workspaces[workspace_id].layout_state.last_saved = Some(layout);

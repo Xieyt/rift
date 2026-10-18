@@ -495,6 +495,70 @@ still ScreenCaptureKit, so §2.A's `apple-sdk_14` pin and the
    — `kTCCServiceScreenCapture` with `auth_value = 2` means granted.
 4. Only then suspect the code.
 
+### G. `feat(hotkey): mod1 modifier from F20 remap + held ordinary-key bindings`
+**Files:** `src/sys/hotkey.rs`, `src/actor/input.rs`, `src/ui/settings/commands.rs`.
+
+- A shortcut can require an **ordinary key** to already be held when its
+  trigger key is pressed — the usual case is Left Command, swapped to F20 by a
+  driver-level `hidutil` remap, bound as `mod1 = "F20"` in
+  `[modifier_combinations]` (a pre-existing general alias feature, not new
+  code) and written as `mod1 + H`. A remapped key like that arrives at the
+  event tap as a plain KeyDown/KeyUp, never as a `CGEventFlags` modifier bit,
+  so it cannot live in `Modifiers` the way Shift/Ctrl/Option/Command do.
+  `bc4958a` first modeled this as a ninth synthetic `Modifiers::HYPER` bit with
+  the key name hardcoded in two places; `0f71468` replaced it with the general
+  mechanism below, which needs no dedicated bit and works for *any* ordinary
+  key, not just one hardcoded trigger.
+- `Hotkey` (`src/sys/hotkey.rs`) gained `held_keys: Vec<KeyCode>`. `parse_spec`
+  no longer overwrites `key_code` on every plain token it sees — the **last**
+  plain key in a spec is the one pressed, every earlier plain key becomes a
+  held key (`"F20 + H"` used to parse as a bare `H` that fired while typing).
+  `Hotkey::with_held` sorts and dedups `held_keys` on construction so two
+  spellings of the same chord (`"F20 + F19 + H"` vs `"F19 + F20 + H"`) hash to
+  one `HashMap` entry — `Hotkey` is a binding-map key.
+- The event tap (`src/actor/input.rs`) derives which keys to track and swallow
+  from the bindings themselves: `rebuild_binding_maps` collects
+  `hotkey.held_keys` from every parsed binding into `trigger_keys`, so
+  retargeting the trigger (F20 → F19) is a config edit, not a tap rebuild — no
+  trigger key is hardcoded anywhere. `handle_keyboard_event` intercepts a
+  KeyDown/KeyUp whose code is in `trigger_keys` before normal dispatch: it
+  updates `state.pressed_keys` via `note_key_down`/`note_key_up` and returns
+  `false` so the raw press/release never reaches an app. On every other
+  KeyDown it builds the live chord with `Hotkey::with_held(modifiers, held,
+  key_code)`, where `held` is whichever tracked trigger keys are currently in
+  `state.pressed_keys` — that set is also what tells left Shift from right
+  Shift. A `trace!(…, "KEYPROBE")` logs the built chord, the active binding
+  mode, and whether it matched; kept deliberately (not debug scaffolding) as
+  the only place that shows the chord the tap actually built, including held
+  triggers, at `rift_wm::actor::input=trace`. `forget_held_triggers` clears any
+  held trigger from `state.pressed_keys` when the tap is replaced, since the
+  key-up that would have cleared it goes to the old, dead tap and would
+  otherwise leave the trigger stuck "held" forever.
+- `66bedd3`: the Settings shortcut recorder (`src/ui/settings/commands.rs`)
+  reports four modifier flags plus one key code, so it cannot see a held
+  ordinary key at all — re-recording over `mod1 + H` used to silently save a
+  bare `H`. `held_key_tokens` reads the held keys back off the shortcut's
+  config spec (expanding `modifier_combinations` aliases first) and, if any
+  exist, the sheet shows them in the caption up front and the save handler
+  refuses with a validation error instead of writing a shortcut that silently
+  differs from what was pressed; such a binding must be edited in the config
+  file.
+
+**Why:** the only way to bind a driver-remapped ordinary key (or any other key
+a user wants as a held trigger) without a dedicated per-trigger modifier bit,
+and without the settings UI silently corrupting such a binding when someone
+re-records it.
+**Conflict risk:** HIGH and currently **unmonitored** — `src/sys/hotkey.rs` and
+`src/actor/input.rs` are the chord parser and the event tap's per-keydown
+match; an upstream rewrite of either would silently break `held_keys`
+tracking or matching with nothing today flagging it. Both are now in
+`justfile`'s `upstream-tripwire` churn loop for exactly that reason.
+**Verify:** `just test` — `held_keys_hash_equally_whatever_order_they_were_written_in`
+and `expansion_keeps_the_held_keys_on_every_left_right_variant` in
+`src/sys/hotkey.rs`, plus
+`a_shortcut_that_holds_an_ordinary_key_is_reported_so_the_recorder_can_refuse`
+in `src/ui/settings/commands.rs`.
+
 ### Dropped / superseded (do NOT re-add)
 - **scrolling off-left snap** — a per-column `x` clamp in `scrolling.rs`. Reverted:
   upstream already clamps the scroll offset, so it was a redundant heuristic in

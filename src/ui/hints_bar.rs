@@ -7,7 +7,7 @@
 //!
 //! Rendered like `ui/stack_line`: a borderless CGS window whose content is a
 //! flipped `CALayer` tree, re-flushed on every update.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use cgs::{CgsWindow, CgsWindowError, render_layer_to_cgs_window, with_disabled_actions};
@@ -257,7 +257,10 @@ pub struct HintsBar {
     cgs_window: CgsWindow,
     state: RefCell<BarState>,
     /// Display backing scale (2.0 on Retina) — drives crisp rasterization.
-    scale: f64,
+    /// Re-applied via `set_scale` when the resolved display scale changes
+    /// (e.g. the bar moves to a different-DPI screen) without recreating the
+    /// window.
+    scale: Cell<f64>,
     /// Focused-column detail overlay (popover, or a docked bar).
     detail: RefCell<Option<DetailWindow>>,
     /// Cached notch geometry (static per display config) to avoid an NSScreen
@@ -310,13 +313,28 @@ impl HintsBar {
             }),
             detail: RefCell::new(None),
             notch_cache: RefCell::new(None),
-            scale,
+            scale: Cell::new(scale),
         })
     }
 
     pub fn is_visible(&self) -> bool { self.state.borrow().visible }
 
     pub fn frame(&self) -> CGRect { *self.frame.borrow() }
+
+    /// Re-apply the display's backing scale to the root layer and the CGS
+    /// window if it differs from what's currently set, and propagate it to
+    /// the detail overlay. A no-op on the common single-display case.
+    pub fn set_scale(&self, scale: f64) {
+        if self.scale.get() == scale {
+            return;
+        }
+        self.scale.set(scale);
+        self.root_layer.setContentsScale(scale);
+        let _ = self.cgs_window.set_resolution(scale);
+        if let Some(detail) = self.detail.borrow().as_ref() {
+            detail.set_scale(scale);
+        }
+    }
 
     pub fn set_frame(&self, frame: CGRect) -> Result<(), CgsWindowError> {
         self.cgs_window.set_shape(frame)?;
@@ -327,8 +345,6 @@ impl HintsBar {
         *self.frame.borrow_mut() = frame;
         Ok(())
     }
-
-    pub fn cells(&self) -> Vec<ColumnCell> { self.state.borrow().data.cells.clone() }
 
     /// Show `data` with `style`, rebuilding the layer tree and ordering the
     /// window above its neighbours.
@@ -1170,7 +1186,7 @@ impl HintsBar {
             CGPoint::new(x, rect.origin.y + (rect.size.height - sz) / 2.0),
             CGSize::new(sz, sz),
         );
-        if let Some(layer) = make_icon_layer(pid, frame, opacity) {
+        if let Some(layer) = make_icon_layer(pid, frame, opacity, self.scale.get()) {
             self.root_layer.addSublayer(&layer);
         }
     }
@@ -1202,7 +1218,7 @@ impl HintsBar {
             }
         });
         layer.setTruncationMode(unsafe { objc2_quartz_core::kCATruncationEnd });
-        layer.setContentsScale(2.0);
+        layer.setContentsScale(self.scale.get());
         layer.setForegroundColor(Some(&color.to_nscolor().CGColor()));
         layer.setZPosition(10.0);
         layer
@@ -1331,7 +1347,7 @@ impl HintsBar {
 
         let mut detail = self.detail.borrow_mut();
         if detail.is_none() {
-            match DetailWindow::new(frame, self.scale, style.blur) {
+            match DetailWindow::new(frame, self.scale.get(), style.blur) {
                 Ok(p) => *detail = Some(p),
                 Err(err) => {
                     warn!(?err, "hints_bar: failed to create detail window");
@@ -1340,6 +1356,11 @@ impl HintsBar {
             }
         }
         if let Some(p) = detail.as_ref() {
+            // Hot reload can change the display scale (rare) or the configured
+            // blur (common); the main bar picks both up every render, but the
+            // detail overlay is only built once, so follow them here too.
+            p.set_scale(self.scale.get());
+            p.set_blur(style.blur);
             p.show(frame, &cell, &style, fs);
         }
     }
@@ -1370,6 +1391,7 @@ fn make_text_layer(
     font_size: f64,
     color: Color,
     centered: bool,
+    scale: f64,
 ) -> Retained<CATextLayer> {
     let layer = CATextLayer::layer();
     let line_h = font_size * 1.3;
@@ -1390,36 +1412,65 @@ fn make_text_layer(
         }
     });
     layer.setTruncationMode(unsafe { objc2_quartz_core::kCATruncationEnd });
-    layer.setContentsScale(2.0);
+    layer.setContentsScale(scale);
     layer.setForegroundColor(Some(&color.to_nscolor().CGColor()));
     layer
 }
 
+/// Cap on distinct (identity, scale) icon cache entries (see `ICON_CACHE`).
+const ICON_CACHE_CAP: usize = 128;
+
 thread_local! {
-    /// App-icon layer contents cached by pid. Resolving an icon
-    /// (`NSRunningApplication` + `layerContentsForContentsScale`) is not free,
-    /// and every focus move rebuilds the bar — without this cache that
-    /// re-rasterized every icon on the main thread each move, making focus feel
-    /// clunky. Icons rarely change, so cache them for the process lifetime.
-    static ICON_CACHE: RefCell<HashMap<pid_t, Retained<objc2::runtime::AnyObject>>> =
+    /// App-icon layer contents cached by a stable app identity (bundle id,
+    /// falling back to a `pid:N` key when absent) plus the rasterization
+    /// scale. Resolving an icon's bitmap (`layerContentsForContentsScale`) is
+    /// not free, and every focus move rebuilds the bar — without this cache
+    /// that re-rasterized every icon on the main thread each move, making
+    /// focus feel clunky. Icons rarely change, so cache them for the process
+    /// lifetime.
+    ///
+    /// Keyed on identity rather than pid: macOS reuses pids, so a pid-keyed
+    /// cache could serve a quit app's icon to an unrelated process that later
+    /// gets the same pid. This UI-only module has no app-exit notification to
+    /// evict precisely on exit, so memory is bounded instead: once the cache
+    /// grows past `ICON_CACHE_CAP` entries it is dropped wholesale — cheap,
+    /// since only the handful of apps currently on the bar get re-rasterized.
+    static ICON_CACHE: RefCell<HashMap<(String, u64), Retained<objc2::runtime::AnyObject>>> =
         RefCell::new(HashMap::new());
 }
 
-fn make_icon_layer(pid: pid_t, frame: CGRect, opacity: f32) -> Option<Retained<CALayer>> {
+fn make_icon_layer(
+    pid: pid_t,
+    frame: CGRect,
+    opacity: f32,
+    scale: f64,
+) -> Option<Retained<CALayer>> {
+    // Always resolve the *current* occupant of `pid` and key on its identity,
+    // not the pid itself — a stale pid-keyed cache entry from a quit app
+    // would otherwise get handed to whatever unrelated process macOS later
+    // reuses that pid for.
+    let app = NSRunningApplication::with_process_id(pid)?;
+    let ident =
+        app.bundle_id().as_deref().map(ToString::to_string).unwrap_or_else(|| format!("pid:{pid}"));
+    let key = (ident, scale.to_bits());
+
     let contents = ICON_CACHE.with(|cache| {
-        if let Some(c) = cache.borrow().get(&pid) {
+        if let Some(c) = cache.borrow().get(&key) {
             return Some(c.clone());
         }
-        let app = NSRunningApplication::with_process_id(pid)?;
         let image = app.icon()?;
-        let contents = image.layerContentsForContentsScale(2.0);
-        cache.borrow_mut().insert(pid, contents.clone());
+        let contents = image.layerContentsForContentsScale(scale);
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= ICON_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, contents.clone());
         Some(contents)
     })?;
     let layer = CALayer::layer();
     layer.setFrame(frame);
     layer.setContentsGravity(unsafe { objc2_quartz_core::kCAGravityResizeAspect });
-    layer.setContentsScale(2.0);
+    layer.setContentsScale(scale);
     if opacity < 0.999 {
         layer.setOpacity(opacity);
     }
@@ -1447,6 +1498,8 @@ fn member_chip_w(m: &WindowMember, style: &HintsBarStyle, fs: f64) -> f64 {
 struct DetailWindow {
     cgs: CgsWindow,
     root: Retained<CALayer>,
+    scale: Cell<f64>,
+    blur: Cell<u32>,
 }
 
 impl DetailWindow {
@@ -1464,7 +1517,30 @@ impl DetailWindow {
         if blur > 0 {
             let _ = cgs.set_blur(blur as i32, None);
         }
-        Ok(Self { cgs, root })
+        Ok(Self { cgs, root, scale: Cell::new(scale), blur: Cell::new(blur) })
+    }
+
+    /// Re-apply the display scale if it changed since construction (the bar
+    /// moved to a different-DPI screen); a no-op otherwise.
+    fn set_scale(&self, scale: f64) {
+        if self.scale.get() == scale {
+            return;
+        }
+        self.scale.set(scale);
+        self.root.setContentsScale(scale);
+        let _ = self.cgs.set_resolution(scale);
+    }
+
+    /// Re-apply the configured blur if it changed (config hot reload); a
+    /// no-op otherwise. Unlike the main bar — which always re-sends blur on
+    /// every render — this is only called from `update_detail`, so the diff
+    /// check avoids a redundant CGS call on the common unchanged path.
+    fn set_blur(&self, blur: u32) {
+        if self.blur.get() == blur {
+            return;
+        }
+        self.blur.set(blur);
+        let _ = self.cgs.set_blur(blur as i32, None);
     }
 
     fn hide(&self) { let _ = self.cgs.order_out(); }
@@ -1517,6 +1593,7 @@ impl DetailWindow {
                 m.window_id.pid,
                 CGRect::new(CGPoint::new(pad + 4.0, iy), CGSize::new(icon_sz, icon_sz)),
                 1.0,
+                self.scale.get(),
             ) {
                 self.root.addSublayer(&l);
             }
@@ -1537,6 +1614,7 @@ impl DetailWindow {
                 fs,
                 tc,
                 false,
+                self.scale.get(),
             ));
         }
     }
@@ -1569,6 +1647,7 @@ impl DetailWindow {
                 m.window_id.pid,
                 CGRect::new(CGPoint::new(cap_pad + PAD_X, iy), CGSize::new(icon_sz, icon_sz)),
                 1.0,
+                self.scale.get(),
             ) {
                 self.root.addSublayer(&l);
             }
@@ -1590,6 +1669,7 @@ impl DetailWindow {
                 fs,
                 tc,
                 false,
+                self.scale.get(),
             ));
         }
     }
@@ -1617,6 +1697,7 @@ impl DetailWindow {
                 m.window_id.pid,
                 CGRect::new(CGPoint::new(x + PAD_X, iy), CGSize::new(icon_sz, icon_sz)),
                 1.0,
+                self.scale.get(),
             ) {
                 self.root.addSublayer(&l);
             }
@@ -1638,6 +1719,7 @@ impl DetailWindow {
                 fs,
                 tc,
                 false,
+                self.scale.get(),
             ));
             x += chip_w + CHIP_GAP;
         }

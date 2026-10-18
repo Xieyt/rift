@@ -4060,6 +4060,68 @@ fn focus_window_command_raise_is_quiet_and_does_not_activate() {
     }
 }
 
+/// §2's new already-frontmost guard (reactor-side, not app-actor-side: the
+/// app actor's `is_frontmost` is AX-derived and lags Carbon, while
+/// `MainWindowTracker::is_globally_frontmost` is Carbon-authoritative and
+/// free). A focus move that targets a window of the app that is already
+/// globally frontmost must not carry `activate: true` — sending it anyway
+/// is a no-op `ActivateIgnoringOtherApps` round trip that also arms the app
+/// actor's `pending_activation_quiet` marker for an activation edge that
+/// never arrives, leaving it armed long enough to misattribute the user's
+/// next real cmd-tab-back.
+#[test]
+fn focus_move_skips_activate_when_target_app_is_already_globally_frontmost() {
+    let (mut apps, mut reactor) = test_context();
+    let screen = CGRect::new(CGPoint::new(0., 0.), CGSize::new(1000., 1000.));
+    let space = SpaceId::new(1);
+    let frontmost_window = WindowId::new(3, 1);
+    let other_window = WindowId::new(4, 1);
+
+    reactor.handle_event(space_state_event(vec![screen], vec![Some(space)]));
+    apps.make_app_and_settle(&mut reactor, frontmost_window.pid, make_windows(2));
+    apps.make_app_and_settle(&mut reactor, other_window.pid, make_windows(2));
+    reactor.handle_event(Event::ApplicationGloballyActivated(frontmost_window.pid));
+
+    let (raise_manager_tx, mut raise_manager_rx) = actor::channel();
+    reactor.communication_manager.raise_manager_tx = raise_manager_tx;
+
+    reactor.handle_layout_response(
+        layout::EventResponse {
+            changed: true,
+            raise_windows: vec![frontmost_window],
+            focus_window: Some(frontmost_window),
+            boundary_hit: None,
+            activate: true,
+        },
+        None,
+    );
+    match raise_manager_rx.try_recv().expect("should send raise request").1 {
+        raise_manager::Event::RaiseRequest(request) => assert!(
+            !request.activate,
+            "focus move within the already-frontmost app must not re-activate it"
+        ),
+        other => panic!("Unexpected event: {other:?}"),
+    }
+
+    reactor.handle_layout_response(
+        layout::EventResponse {
+            changed: true,
+            raise_windows: vec![other_window],
+            focus_window: Some(other_window),
+            boundary_hit: None,
+            activate: true,
+        },
+        None,
+    );
+    match raise_manager_rx.try_recv().expect("should send raise request").1 {
+        raise_manager::Event::RaiseRequest(request) => assert!(
+            request.activate,
+            "focus move to a different, non-frontmost app must still activate it"
+        ),
+        other => panic!("Unexpected event: {other:?}"),
+    }
+}
+
 #[test]
 fn resolved_activation_without_main_window_does_not_choose_arbitrary_app_window() {
     let (mut apps, mut reactor) = test_context();

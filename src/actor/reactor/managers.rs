@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -323,51 +325,147 @@ fn strip_column_visibility(
     (xmax.min(screen_right) - xmin.max(screen_left)).max(0.0) > 24.0
 }
 
+/// Lets one walk over the engine's column/workspace data either hash
+/// borrowed fields (steady state: nothing to send, zero allocation) or build
+/// the owned `ColumnCell`/`WorkspaceCell` payload actually sent to the actor.
+/// A field reachable from only one of the two impls would make the bar
+/// silently stop updating, so both go through the single walk below rather
+/// than two loops that are expected to agree.
+trait HintsBarSink {
+    fn cell<'m>(
+        &mut self,
+        hint: Option<char>,
+        members: impl Iterator<Item = (WindowId, &'m str, &'m str)>,
+        active: usize,
+        tabbed: bool,
+        focused: bool,
+        visible: bool,
+    );
+    fn workspace(&mut self, index: usize, active: bool, pids: &[pid_t]);
+}
+
+/// Hashes every field `HintsBarBuilder` would otherwise own, without
+/// allocating a `String`, a `ColumnCell`, or a `WorkspaceCell`.
+struct HintsBarHasher<'h>(&'h mut DefaultHasher);
+
+impl HintsBarSink for HintsBarHasher<'_> {
+    fn cell<'m>(
+        &mut self,
+        hint: Option<char>,
+        members: impl Iterator<Item = (WindowId, &'m str, &'m str)>,
+        active: usize,
+        tabbed: bool,
+        focused: bool,
+        visible: bool,
+    ) {
+        hint.hash(self.0);
+        active.hash(self.0);
+        tabbed.hash(self.0);
+        focused.hash(self.0);
+        visible.hash(self.0);
+        for (window_id, label, title) in members {
+            window_id.hash(self.0);
+            label.hash(self.0);
+            title.hash(self.0);
+        }
+    }
+
+    fn workspace(&mut self, index: usize, active: bool, pids: &[pid_t]) {
+        index.hash(self.0);
+        active.hash(self.0);
+        pids.hash(self.0);
+    }
+}
+
+/// Builds the real payload; only reached once `HintsBarHasher` finds a change.
+#[derive(Default)]
+struct HintsBarBuilder {
+    cells: Vec<crate::ui::hints_bar::ColumnCell>,
+    workspaces: Vec<crate::ui::hints_bar::WorkspaceCell>,
+}
+
+impl HintsBarSink for HintsBarBuilder {
+    fn cell<'m>(
+        &mut self,
+        hint: Option<char>,
+        members: impl Iterator<Item = (WindowId, &'m str, &'m str)>,
+        active: usize,
+        tabbed: bool,
+        focused: bool,
+        visible: bool,
+    ) {
+        let members = members
+            .map(|(window_id, label, title)| crate::ui::hints_bar::WindowMember {
+                window_id,
+                label: label.to_string(),
+                title: title.to_string(),
+            })
+            .collect();
+        self.cells.push(crate::ui::hints_bar::ColumnCell {
+            hint: hint.map(|c| c.to_string()).unwrap_or_default(),
+            members,
+            active,
+            tabbed,
+            focused,
+            visible,
+        });
+    }
+
+    fn workspace(&mut self, index: usize, active: bool, pids: &[pid_t]) {
+        self.workspaces.push(crate::ui::hints_bar::WorkspaceCell {
+            label: (index + 1).to_string(),
+            index,
+            active,
+            pids: pids.to_vec(),
+        });
+    }
+}
+
 /// Build the scrolling strip cells: one per column of the active workspace, in the
 /// engine's own left -> right order, decorated with a hint letter, its app, focus,
-/// and whether it lies inside the screen viewport.
+/// and whether it lies inside the screen viewport. Then the occupied-workspace
+/// rail. Each field is handed to `sink` exactly once.
 ///
 /// Cell index `i` is deliberately the same index `focus_column i` acts on, because
 /// the bar is the legend for the `mod1 + a s d f g` binds. Deriving columns from
 /// frame x broke that: parked columns merged, so letters after a merge labelled the
 /// wrong column.
-fn build_hints_bar_cells(
+///
+/// `frames`/`keys`/`focused` are precomputed by the caller so this can run
+/// twice (hash, then build) without redoing that work.
+#[allow(clippy::too_many_arguments)]
+fn walk_hints_bar(
     reactor: &Reactor,
-    layout: &[(WindowId, CGRect)],
-    screen: CGRect,
-    hb: &crate::common::config::HintsBarSettings,
+    frames: &HashMap<WindowId, CGRect>,
+    screen_left: f64,
+    screen_right: f64,
+    keys: &[char],
+    focused: Option<WindowId>,
     groups: &[crate::layout_engine::engine::GroupContainerInfo],
-    columns: Vec<Vec<WindowId>>,
-) -> Vec<crate::ui::hints_bar::ColumnCell> {
-    let focused = reactor.layout_manager.layout_engine.focused_window();
-    let resolve = |wid: WindowId| -> (String, String) {
+    columns: &[Vec<WindowId>],
+    workspaces: &[(usize, String, bool, Vec<pid_t>)],
+    sink: &mut impl HintsBarSink,
+) {
+    let resolve = |wid: WindowId| -> (&str, &str) {
         let label = reactor
             .app_manager
             .apps
             .get(&wid.pid)
-            .and_then(|a| a.info.localized_name.clone())
-            .unwrap_or_default();
+            .and_then(|a| a.info.localized_name.as_deref())
+            .unwrap_or("");
         let title = reactor
             .state
             .windows
             .window(wid)
-            .map(|w| w.info.title.clone())
-            .unwrap_or_default();
+            .map(|w| w.info.title.as_str())
+            .unwrap_or("");
         (label, title)
     };
 
-    // `columns` is one entry per ENGINE column, in the engine's own order, so cell
-    // index i is exactly the index `focus_column i` acts on.
-    let frames: HashMap<WindowId, CGRect> = layout.iter().copied().collect();
-
-    let keys: Vec<char> = hb.keys.chars().collect();
-    let screen_left = screen.origin.x;
-    let screen_right = screen.origin.x + screen.size.width;
-
-    let mut cells = Vec::with_capacity(columns.len());
-    for (i, column) in columns.into_iter().enumerate() {
+    for (i, column) in columns.iter().enumerate() {
         let wins: Vec<WindowId> = column
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|w| !reactor.layout_manager.layout_engine.is_window_floating(*w))
             .collect();
         let focused_here = focused.is_some_and(|f| wins.contains(&f));
@@ -376,7 +474,7 @@ fn build_hints_bar_cells(
         // carrying the full window list + active tab even when the hidden tabs
         // aren't in the visible frame list.
         let group = groups.iter().find(|g| g.window_ids.iter().any(|w| wins.contains(w)));
-        let (member_ids, active, tabbed) = if let Some(g) = group {
+        let (member_ids, active, tabbed): (Vec<WindowId>, usize, bool) = if let Some(g) = group {
             let count = g.window_ids.len().max(1);
             let active = if focused_here {
                 g.window_ids
@@ -396,66 +494,251 @@ fn build_hints_bar_cells(
             };
             (ids, active, false)
         };
-
-        let members: Vec<crate::ui::hints_bar::WindowMember> = member_ids
-            .iter()
-            .map(|w| {
-                let (label, title) = resolve(*w);
-                crate::ui::hints_bar::WindowMember { window_id: *w, label, title }
-            })
-            .collect();
-        if members.is_empty() {
+        if member_ids.is_empty() {
             continue;
         }
-        let active = active.min(members.len() - 1);
+        let active = active.min(member_ids.len() - 1);
 
-        let visible = strip_column_visibility(&wins, &frames, screen_left, screen_right);
-
-        cells.push(crate::ui::hints_bar::ColumnCell {
-            hint: keys.get(i).map(|c| c.to_string()).unwrap_or_default(),
-            members,
-            active,
-            tabbed,
-            focused: focused_here,
-            visible,
+        let visible = strip_column_visibility(&wins, frames, screen_left, screen_right);
+        let hint = keys.get(i).copied();
+        let members = member_ids.iter().map(|&w| {
+            let (label, title) = resolve(w);
+            (w, label, title)
         });
+        sink.cell(hint, members, active, tabbed, focused_here, visible);
     }
-    cells
+
+    for (index, _name, active, pids) in workspaces {
+        sink.workspace(*index, *active, pids);
+    }
 }
 
-/// Cheap content signature of a hint-bar snapshot, so the reactor can skip
-/// re-sending an identical bar (nothing downstream would change).
-fn hints_bar_sig(
-    cells: &[crate::ui::hints_bar::ColumnCell],
-    workspaces: &[crate::ui::hints_bar::WorkspaceCell],
-    frame: CGRect,
-    top_count: usize,
-) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    frame.origin.x.to_bits().hash(&mut h);
-    frame.origin.y.to_bits().hash(&mut h);
-    frame.size.width.to_bits().hash(&mut h);
-    frame.size.height.to_bits().hash(&mut h);
-    for c in cells {
-        c.hint.hash(&mut h);
-        c.active.hash(&mut h);
-        c.tabbed.hash(&mut h);
-        c.focused.hash(&mut h);
-        c.visible.hash(&mut h);
-        for m in &c.members {
-            m.window_id.hash(&mut h);
-            m.label.hash(&mut h);
-            m.title.hash(&mut h);
+fn hash_hints_bar_frame(h: &mut DefaultHasher, frame: CGRect) {
+    frame.origin.x.to_bits().hash(h);
+    frame.origin.y.to_bits().hash(h);
+    frame.size.width.to_bits().hash(h);
+    frame.size.height.to_bits().hash(h);
+}
+
+/// Scalar fingerprint of the hint-bar config fields that feed
+/// `HintsBar::overflow_split` (and so `top_count`/the reserve) but aren't
+/// already covered by the per-cell walk or the base frame rect. With these
+/// included, `overflow_split`'s result is a pure function of exactly what
+/// `apply_hints_bar`'s gate hash covers, so an unchanged gate proves the
+/// reserve cannot have changed either — it is not just unlikely to have.
+fn hash_hints_bar_style(h: &mut DefaultHasher, hb: &crate::common::config::HintsBarSettings) {
+    std::mem::discriminant(&hb.density).hash(h);
+    std::mem::discriminant(&hb.overflow).hash(h);
+    std::mem::discriminant(&hb.placement).hash(h);
+    std::mem::discriminant(&hb.position).hash(h);
+    hb.show_titles.hash(h);
+    hb.max_width_ratio.to_bits().hash(h);
+    hb.font_size.map(f64::to_bits).hash(h);
+}
+
+/// Feeds the scrolling-strip hint bar for `space` (already known to be the
+/// active, scrolling workspace of an enabled bar). Hashes the engine's
+/// current column/workspace data first (`HintsBarHasher`, zero allocation);
+/// only when that gate differs from what the last apply left behind does it
+/// build the real payload (`HintsBarBuilder`), replan the overflow split,
+/// and write back the dynamic tiling reserve. Both walks are the same
+/// function (`walk_hints_bar`), so there is no second, hand-maintained loop
+/// that could silently drift from what gets built and sent.
+fn apply_hints_bar(
+    reactor: &mut Reactor,
+    tx: &hints_bar::Sender,
+    space: SpaceId,
+    layout: &[(WindowId, CGRect)],
+    screen_frame: CGRect,
+    group_infos: &[crate::layout_engine::engine::GroupContainerInfo],
+) {
+    use crate::common::config::{
+        HintsBarOverflow as HbOverflow, HintsBarPlacement, HintsBarPosition as HbPos,
+    };
+
+    let hb = &reactor.config.settings.ui.hints_bar;
+    let h = hb.height.max(1.0);
+    let show_workspace = hb.show_workspace;
+    let p = hb.pad;
+    let sx = screen_frame.origin.x;
+    let sy = screen_frame.origin.y;
+    let sw = screen_frame.size.width;
+    let sh = screen_frame.size.height;
+    let base_frame = match hb.position {
+        HbPos::Bottom => CGRect::new(
+            CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
+            CGSize::new((sw - p.left - p.right).max(1.0), h),
+        ),
+        HbPos::Top => CGRect::new(
+            CGPoint::new(sx + p.left, sy + p.top),
+            CGSize::new((sw - p.left - p.right).max(1.0), h),
+        ),
+        HbPos::Right | HbPos::Left => {
+            let w = (sw * 0.35).clamp(160.0, 360.0);
+            let x = if matches!(hb.position, HbPos::Right) {
+                sx + sw - w - p.right
+            } else {
+                sx + p.left
+            };
+            CGRect::new(
+                CGPoint::new(x, sy + p.top),
+                CGSize::new(w, (sh - p.top - p.bottom).max(1.0)),
+            )
+        }
+    };
+
+    // The engine's own column list, not a grouping of frames: cell index
+    // must line up with `focus_column i`, and off-strip columns share one
+    // parked x.
+    let columns = reactor.layout_manager.layout_engine.active_workspace_columns(space);
+    let workspaces: Vec<(usize, String, bool, Vec<pid_t>)> = if show_workspace {
+        reactor
+            .layout_manager
+            .layout_engine
+            .workspace_app_summaries(&reactor.state.windows, space)
+            .into_iter()
+            .filter(|(_, _, _, pids)| !pids.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let frames: HashMap<WindowId, CGRect> = layout.iter().copied().collect();
+    let keys: Vec<char> = hb.keys.chars().collect();
+    let screen_left = screen_frame.origin.x;
+    let screen_right = screen_frame.origin.x + screen_frame.size.width;
+    let focused = reactor.layout_manager.layout_engine.focused_window();
+
+    let mut gh = DefaultHasher::new();
+    hash_hints_bar_frame(&mut gh, base_frame);
+    hash_hints_bar_style(&mut gh, hb);
+    walk_hints_bar(
+        reactor,
+        &frames,
+        screen_left,
+        screen_right,
+        &keys,
+        focused,
+        group_infos,
+        &columns,
+        &workspaces,
+        &mut HintsBarHasher(&mut gh),
+    );
+    let gate = gh.finish();
+
+    // Skip redundant work: nothing downstream would change when the gate
+    // matches the one the last apply left behind for this space.
+    if reactor.communication_manager.hints_bar_last_sig.get(&space) == Some(&gate) {
+        return;
+    }
+
+    let mut builder = HintsBarBuilder::default();
+    walk_hints_bar(
+        reactor,
+        &frames,
+        screen_left,
+        screen_right,
+        &keys,
+        focused,
+        group_infos,
+        &columns,
+        &workspaces,
+        &mut builder,
+    );
+    let HintsBarBuilder { cells, workspaces } = builder;
+
+    let mut bar_frame = base_frame;
+    let style = crate::ui::hints_bar::HintsBarStyle::from(hb);
+    let overflow_mode = hb.overflow;
+    let mut top_count = cells.len();
+    let mut overflow_frame: Option<CGRect> = None;
+    // Overflow plan: cap the top strip at `max_width_ratio` of the display;
+    // wrap the excess per `overflow` mode.
+    if !cells.is_empty()
+        && hb.max_width_ratio < 1.0
+        && !matches!(overflow_mode, HbOverflow::Scale)
+        && !hb.position.is_vertical()
+    {
+        let fs = style.font_size.unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
+        let budget = (sw * hb.max_width_ratio).max(1.0);
+        let k =
+            crate::ui::hints_bar::HintsBar::overflow_split(&cells, &workspaces, &style, fs, budget);
+        if k < cells.len() {
+            top_count = k;
+            match overflow_mode {
+                HbOverflow::Row => match hb.position {
+                    HbPos::Bottom => {
+                        bar_frame.origin.y -= h;
+                        bar_frame.size.height += h;
+                    }
+                    _ => {
+                        bar_frame.size.height += h;
+                    }
+                },
+                HbOverflow::Bar => {
+                    overflow_frame = Some(match hb.position {
+                        HbPos::Top => CGRect::new(
+                            CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
+                            CGSize::new((sw - p.left - p.right).max(1.0), h),
+                        ),
+                        _ => CGRect::new(
+                            CGPoint::new(sx + p.left, sy + p.top),
+                            CGSize::new((sw - p.left - p.right).max(1.0), h),
+                        ),
+                    });
+                }
+                HbOverflow::Scale => {}
+            }
         }
     }
-    for w in workspaces {
-        w.label.hash(&mut h);
-        w.active.hash(&mut h);
-        w.pids.hash(&mut h);
+
+    // Dynamic-reserve feedback: record the strip(s) this overflow needs so
+    // the next (forced) layout pass shrinks the tiling area to match. Only
+    // under `reserve` placement.
+    let reserving = hb.placement == HintsBarPlacement::Reserve && !hb.position.is_vertical();
+    let (want_top, want_bottom) = if reserving && top_count < cells.len() {
+        match overflow_mode {
+            HbOverflow::Row => {
+                if matches!(hb.position, HbPos::Top) {
+                    (h, 0.0)
+                } else {
+                    (0.0, h)
+                }
+            }
+            HbOverflow::Bar => {
+                if matches!(hb.position, HbPos::Top) {
+                    (0.0, h)
+                } else {
+                    (h, 0.0)
+                }
+            }
+            HbOverflow::Scale => (0.0, 0.0),
+        }
+    } else {
+        (0.0, 0.0)
+    };
+    let prev = reactor
+        .communication_manager
+        .hints_bar_reserve
+        .get(&space)
+        .copied()
+        .unwrap_or((0.0, 0.0));
+    if (prev.0 - want_top).abs() > 0.5 || (prev.1 - want_bottom).abs() > 0.5 {
+        reactor.communication_manager.hints_bar_reserve.insert(space, (want_top, want_bottom));
+        reactor.communication_manager.hints_bar_reserve_dirty = true;
     }
-    top_count.hash(&mut h);
-    h.finish()
+
+    reactor.communication_manager.hints_bar_last_sig.insert(space, gate);
+    tracing::trace!(target: "hbbench", "hb_sent");
+    let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
+        space_id: space,
+        bar_frame,
+        screen_frame,
+        cells,
+        workspaces,
+        overflow: overflow_mode,
+        top_count,
+        overflow_frame,
+    }));
 }
 
 impl LayoutManager {
@@ -706,196 +989,52 @@ impl LayoutManager {
                 Self::publish_stack_tabs(reactor, space, &group_infos, stack_has_fullscreen, false);
 
                 // Feed the scrolling-strip hint bar for the active display space.
+                // The bar is scrolling-only by design (FORK.md §2.E), so fold
+                // that into the guard: a non-scrolling workspace does no rail,
+                // frame, or signature work at all, just a cheap reserve check
+                // and (once, on the scrolling -> other transition) a clearing
+                // snapshot so a previously-drawn bar doesn't freeze on screen.
                 if reactor.config.settings.ui.hints_bar.enabled && active_space == Some(space) {
                     if let Some(tx) = reactor.communication_manager.hints_bar_tx.clone() {
                         let is_scrolling =
                             reactor.layout_manager.layout_engine.active_layout_mode_at(space)
                                 == LayoutMode::Scrolling;
-                        let cells = if is_scrolling {
-                            let hb = &reactor.config.settings.ui.hints_bar;
-                            // The engine's own column list, not a grouping of frames:
-                            // cell index must line up with `focus_column i`, and
-                            // off-strip columns share one parked x.
-                            let columns = reactor
-                                .layout_manager
-                                .layout_engine
-                                .active_workspace_columns(space);
-                            build_hints_bar_cells(
-                                reactor,
-                                &layout,
-                                screen_frame,
-                                hb,
-                                &group_infos,
-                                columns,
-                            )
+                        if is_scrolling {
+                            apply_hints_bar(reactor, &tx, space, &layout, screen_frame, &group_infos);
                         } else {
-                            Vec::new()
-                        };
-
-                        use crate::common::config::HintsBarPosition as HbPos;
-                        let hb = &reactor.config.settings.ui.hints_bar;
-                        let h = hb.height.max(1.0);
-                        let show_workspace = hb.show_workspace;
-                        let p = hb.pad;
-                        let sx = screen_frame.origin.x;
-                        let sy = screen_frame.origin.y;
-                        let sw = screen_frame.size.width;
-                        let sh = screen_frame.size.height;
-                        let mut bar_frame = match hb.position {
-                            HbPos::Bottom => CGRect::new(
-                                CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
-                                CGSize::new((sw - p.left - p.right).max(1.0), h),
-                            ),
-                            HbPos::Top => CGRect::new(
-                                CGPoint::new(sx + p.left, sy + p.top),
-                                CGSize::new((sw - p.left - p.right).max(1.0), h),
-                            ),
-                            HbPos::Right | HbPos::Left => {
-                                let w = (sw * 0.35).clamp(160.0, 360.0);
-                                let x = if matches!(hb.position, HbPos::Right) {
-                                    sx + sw - w - p.right
-                                } else {
-                                    sx + p.left
-                                };
-                                CGRect::new(
-                                    CGPoint::new(x, sy + p.top),
-                                    CGSize::new(w, (sh - p.top - p.bottom).max(1.0)),
-                                )
-                            }
-                        };
-                        let workspaces: Vec<crate::ui::hints_bar::WorkspaceCell> = if show_workspace
-                        {
-                            reactor
-                                .layout_manager
-                                .layout_engine
-                                .workspace_app_summaries(&reactor.state.windows, space)
-                                .into_iter()
-                                .filter(|(_, _, _, pids)| !pids.is_empty())
-                                .map(|(idx, _name, active, pids)| {
-                                    crate::ui::hints_bar::WorkspaceCell {
-                                        label: (idx + 1).to_string(),
-                                        index: idx,
-                                        active,
-                                        pids,
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                        // Overflow plan: cap the top strip at `max_width_ratio`
-                        // of the display; wrap the excess per `overflow` mode.
-                        use crate::common::config::HintsBarOverflow as HbOverflow;
-                        let style = crate::ui::hints_bar::HintsBarStyle::from(hb);
-                        let overflow_mode = hb.overflow;
-                        let mut top_count = cells.len();
-                        let mut overflow_frame: Option<CGRect> = None;
-                        if !cells.is_empty()
-                            && hb.max_width_ratio < 1.0
-                            && !matches!(overflow_mode, HbOverflow::Scale)
-                            && !hb.position.is_vertical()
-                        {
-                            let fs = style
-                                .font_size
-                                .unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
-                            let budget = (sw * hb.max_width_ratio).max(1.0);
-                            let k = crate::ui::hints_bar::HintsBar::overflow_split(
-                                &cells,
-                                &workspaces,
-                                &style,
-                                fs,
-                                budget,
-                            );
-                            if k < cells.len() {
-                                top_count = k;
-                                match overflow_mode {
-                                    HbOverflow::Row => match hb.position {
-                                        HbPos::Bottom => {
-                                            bar_frame.origin.y -= h;
-                                            bar_frame.size.height += h;
-                                        }
-                                        _ => {
-                                            bar_frame.size.height += h;
-                                        }
-                                    },
-                                    HbOverflow::Bar => {
-                                        overflow_frame = Some(match hb.position {
-                                            HbPos::Top => CGRect::new(
-                                                CGPoint::new(sx + p.left, sy + sh - h - p.bottom),
-                                                CGSize::new((sw - p.left - p.right).max(1.0), h),
-                                            ),
-                                            _ => CGRect::new(
-                                                CGPoint::new(sx + p.left, sy + p.top),
-                                                CGSize::new((sw - p.left - p.right).max(1.0), h),
-                                            ),
-                                        });
-                                    }
-                                    HbOverflow::Scale => {}
-                                }
-                            }
-                        }
-
-                        // Dynamic-reserve feedback: record the strip(s) this
-                        // overflow needs so the next (forced) layout pass shrinks
-                        // the tiling area to match. Only under `reserve` placement.
-                        let reserving = hb.placement
-                            == crate::common::config::HintsBarPlacement::Reserve
-                            && !hb.position.is_vertical();
-                        let (want_top, want_bottom) = if reserving && top_count < cells.len() {
-                            match overflow_mode {
-                                HbOverflow::Row => {
-                                    if matches!(hb.position, HbPos::Top) {
-                                        (h, 0.0)
-                                    } else {
-                                        (0.0, h)
-                                    }
-                                }
-                                HbOverflow::Bar => {
-                                    if matches!(hb.position, HbPos::Top) {
-                                        (0.0, h)
-                                    } else {
-                                        (h, 0.0)
-                                    }
-                                }
-                                HbOverflow::Scale => (0.0, 0.0),
-                            }
-                        } else {
-                            (0.0, 0.0)
-                        };
-                        let prev = reactor
-                            .communication_manager
-                            .hints_bar_reserve
-                            .get(&space)
-                            .copied()
-                            .unwrap_or((0.0, 0.0));
-                        if (prev.0 - want_top).abs() > 0.5 || (prev.1 - want_bottom).abs() > 0.5 {
-                            reactor
+                            let prev = reactor
                                 .communication_manager
                                 .hints_bar_reserve
-                                .insert(space, (want_top, want_bottom));
-                            reactor.communication_manager.hints_bar_reserve_dirty = true;
-                        }
-
-                        // Skip redundant sends: nothing downstream changes when the
-                        // signature matches the last one we pushed for this space.
-                        let sig = hints_bar_sig(&cells, &workspaces, bar_frame, top_count);
-                        let unchanged =
-                            reactor.communication_manager.hints_bar_last_sig.get(&space)
-                                == Some(&sig);
-                        if !unchanged {
-                            reactor.communication_manager.hints_bar_last_sig.insert(space, sig);
-                            tracing::trace!(target: "hbbench", "hb_sent");
-                            let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
-                                space_id: space,
-                                bar_frame,
-                                screen_frame,
-                                cells,
-                                workspaces,
-                                overflow: overflow_mode,
-                                top_count,
-                                overflow_frame,
-                            }));
+                                .get(&space)
+                                .copied()
+                                .unwrap_or((0.0, 0.0));
+                            if prev.0.abs() > 0.5 || prev.1.abs() > 0.5 {
+                                reactor
+                                    .communication_manager
+                                    .hints_bar_reserve
+                                    .insert(space, (0.0, 0.0));
+                                reactor.communication_manager.hints_bar_reserve_dirty = true;
+                            }
+                            if reactor
+                                .communication_manager
+                                .hints_bar_last_sig
+                                .remove(&space)
+                                .is_some()
+                            {
+                                let _ = tx.try_send(hints_bar::Event::Snapshot(hints_bar::Snapshot {
+                                    space_id: space,
+                                    bar_frame: CGRect::new(
+                                        CGPoint::new(0.0, 0.0),
+                                        CGSize::new(0.0, 0.0),
+                                    ),
+                                    screen_frame,
+                                    cells: Vec::new(),
+                                    workspaces: Vec::new(),
+                                    overflow: crate::common::config::HintsBarOverflow::default(),
+                                    top_count: 0,
+                                    overflow_frame: None,
+                                }));
+                            }
                         }
                     }
                 }

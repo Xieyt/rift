@@ -4575,7 +4575,7 @@ impl Reactor {
             raise_windows,
             mut focus_window,
             boundary_hit,
-            activate,
+            mut activate,
         } = response;
 
         if let Some(space) = workspace_switch_space
@@ -4731,6 +4731,21 @@ impl Reactor {
             .filter(|wid| self.is_window_on_active_space(*wid))
             .collect();
         let focus_window = focus_window.filter(|wid| self.is_window_on_active_space(*wid));
+        if activate
+            && let Some(wid) = focus_window
+            && self.main_window_tracker.is_globally_frontmost(wid.pid)
+        {
+            // The target app is already Carbon-authoritative frontmost (common
+            // case: moving focus between two windows of the same app). Sending
+            // `activate: true` here would be a no-op `ActivateIgnoringOtherApps`
+            // round trip, and it would also arm the app actor's
+            // `pending_activation_quiet` marker for an activation that never
+            // arrives (no duplicate `ApplicationGloballyActivated` edge consumes
+            // it when the app was already frontmost), leaving it armed for up to
+            // a second and misattributing the user's next real cmd-tab-back as
+            // rift-initiated.
+            activate = false;
+        }
         if let Some(space) = workspace_switch_space {
             self.layout_manager.layout_engine.commit_workspace_focus(
                 &mut self.state.windows,
