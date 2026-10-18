@@ -570,6 +570,21 @@ impl HintsBar {
         None
     }
 
+    /// Is there anything at all to lay out on a strip?
+    ///
+    /// Column chips, or workspace-rail pills — the rail only draws outside
+    /// `dots` density. Keying this on chips alone is what painted a
+    /// correctly-sized, completely blank bar on every empty workspace: the
+    /// actor had already decided to show the window, and the painter then
+    /// returned before it ever looked at the pills.
+    pub fn strip_has_content(
+        cells: &[ColumnCell],
+        workspaces: &[WorkspaceCell],
+        dots: bool,
+    ) -> bool {
+        !cells.is_empty() || (!workspaces.is_empty() && !dots)
+    }
+
     /// How many leading column chips fit within `budget_px` (rail + chips at
     /// natural width, incl. margins/gaps). Returns `cells.len()` when they all
     /// fit (no overflow); at least 1 otherwise. Pure, so the reactor can call it
@@ -626,7 +641,11 @@ impl HintsBar {
         with_disabled_actions(|| {
             unsafe { self.root_layer.setSublayers(None) };
 
-            if cells.is_empty() {
+            if !Self::strip_has_content(
+                &cells,
+                &workspaces,
+                matches!(style.density, HintsBarDensity::Dots),
+            ) {
                 state.chip_rects.clear();
                 state.ws_rects.clear();
                 return;
@@ -686,12 +705,12 @@ impl HintsBar {
     ) -> (Vec<CGRect>, Vec<CGRect>) {
         let vertical = style.position.is_vertical();
         let dots = matches!(style.density, HintsBarDensity::Dots);
-        if cells.is_empty() {
+        let show_ws = !workspaces.is_empty() && !dots;
+        if !Self::strip_has_content(cells, workspaces, dots) {
             return (Vec::new(), Vec::new());
         }
 
         let chip_widths = Self::natural_widths(cells, style, fs);
-        let show_ws = !workspaces.is_empty() && !dots;
         let ws_icon_w = fs + 2.0;
         let ws_widths: Vec<f64> = if show_ws {
             workspaces
@@ -1745,6 +1764,34 @@ mod tests {
         let style = HintsBarStyle::from(&c);
         assert_eq!(style.align, HintsBarAlign::Start, "main bar must not move");
         assert_eq!(style.overflow_align, HintsBarAlign::End);
+    }
+
+    fn pill(index: usize, active: bool) -> WorkspaceCell {
+        WorkspaceCell {
+            label: (index + 1).to_string(),
+            index,
+            active,
+            pids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_empty_workspace_still_lays_out_its_rail() {
+        // The regression this pins: standing on a workspace with no windows
+        // left the bar window on screen and completely blank, because the
+        // painter gave up on zero chips before it looked at the pills.
+        assert!(
+            HintsBar::strip_has_content(&[], &[pill(0, false), pill(2, true)], false),
+            "pills alone must still draw"
+        );
+        assert!(
+            !HintsBar::strip_has_content(&[], &[], false),
+            "nothing at all must not draw"
+        );
+        assert!(
+            !HintsBar::strip_has_content(&[], &[pill(0, false)], true),
+            "dots density has no rail, so pills alone draw nothing"
+        );
     }
 
     #[test]

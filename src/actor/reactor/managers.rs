@@ -597,7 +597,10 @@ fn apply_hints_bar(
             .layout_engine
             .workspace_app_summaries(&reactor.state.windows, space)
             .into_iter()
-            .filter(|(_, _, _, pids)| !pids.is_empty())
+            // Occupied workspaces, plus the one you are standing on even when it
+            // holds nothing — otherwise an empty workspace shows a rail with no
+            // marker for where you are.
+            .filter(|(_, _, active, pids)| !pids.is_empty() || *active)
             .collect()
     } else {
         Vec::new()
