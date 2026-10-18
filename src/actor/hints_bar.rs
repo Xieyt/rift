@@ -360,6 +360,11 @@ impl HintsBar {
 
         // Overflow bar (only `bar` mode with real overflow).
         if let Some(of_frame) = snap.overflow_frame.filter(|_| !overflow_cells.is_empty()) {
+            // The overflow bar aligns independently of the main one.
+            let of_style = HintsBarStyle {
+                align: style.overflow_align,
+                ..style
+            };
             let ob = match &self.overflow_bar {
                 Some(ob) => {
                     if ob.frame() != of_frame {
@@ -369,7 +374,7 @@ impl HintsBar {
                     }
                     ob
                 }
-                None => match HintsBarWindow::new(of_frame, style, scale) {
+                None => match HintsBarWindow::new(of_frame, of_style, scale) {
                     Ok(ob) => {
                         self.overflow_bar = Some(ob);
                         self.overflow_bar.as_ref().unwrap()
@@ -381,7 +386,7 @@ impl HintsBar {
                     }
                 },
             };
-            if let Err(err) = ob.update(style, HintsBarData {
+            if let Err(err) = ob.update(of_style, HintsBarData {
                 cells: overflow_cells,
                 screen: snap.screen_frame,
                 workspaces: Vec::new(),

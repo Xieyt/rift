@@ -1266,6 +1266,10 @@ pub struct HintsBarSettings {
     /// opposite edge).
     #[serde(default)]
     pub overflow: HintsBarOverflow,
+    /// `overflow = "bar"` only: which end of the SECOND (overflow) bar its chips
+    /// sit at. Unset = follow `align`, so the two bars match.
+    #[serde(default)]
+    pub overflow_align: Option<HintsBarAlign>,
     /// Focused-column detail: `[settings.ui.hints_bar.detail]` — `style`
     /// (`popover`/`bar`), plus `position`/`align`/`pad` for `bar`.
     #[serde(default)]
@@ -1297,6 +1301,7 @@ impl Default for HintsBarSettings {
             notch: HintsBarNotch::default(),
             max_width_ratio: default_hints_bar_max_width_ratio(),
             overflow: HintsBarOverflow::default(),
+            overflow_align: None,
             detail: HintsBarDetailSettings::default(),
         }
     }

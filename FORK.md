@@ -416,7 +416,9 @@ indicator method, one trait default, one engine arm + command.
   second CGS strip on the opposite edge). The rail + fitting columns stay on top;
   a click on either strip maps to the right window (the overflow strip renders
   the tail *slice*, so no index math). Split point is `HintsBar::overflow_split`
-  (pure). Under `placement = reserve` the tiling area shrinks for the extra
+  (pure). `overflow_align` (unset = follow `align`) aligns the second strip on
+  its own, so a left-aligned top bar can pair with a right-aligned bottom one.
+  Under `placement = reserve` the tiling area shrinks for the extra
   strip **dynamically** (only while overflowing) via a one-pass reserve-feedback
   loop in `managers.rs` (`hints_bar_reserve` + a guarded convergence re-layout in
   `update_layout`). Upstream's `space_scope: Option<SpaceId>` parameter (`fe97ae2`,

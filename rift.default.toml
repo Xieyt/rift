@@ -294,6 +294,10 @@ notch = "flow"
 # workspace rail and the columns that fit stay on the top row.
 max_width_ratio = 1.0
 overflow = "scale"
+# overflow = "bar" only: which end of the SECOND bar its chips sit at. Commented
+# out = follow `align`, so both bars match. Set it to right-align the bottom bar
+# while the top one stays left.
+# overflow_align = "end"
 # per-side padding (px) insetting the whole bar from the display edges
 pad = { top = 0.0, bottom = 0.0, left = 0.0, right = 0.0 }
 

@@ -178,6 +178,9 @@ pub struct HintsBarStyle {
     pub detail_pad: HintsBarPad,
     pub max_width_ratio: f64,
     pub overflow: HintsBarOverflow,
+    /// `align` for the second bar in `overflow = "bar"` mode; resolved from
+    /// `overflow_align`, falling back to `align`.
+    pub overflow_align: HintsBarAlign,
 }
 
 impl Default for HintsBarStyle {
@@ -202,6 +205,7 @@ impl Default for HintsBarStyle {
             detail_pad: HintsBarPad::default(),
             max_width_ratio: 1.0,
             overflow: HintsBarOverflow::Scale,
+            overflow_align: HintsBarAlign::Center,
         }
     }
 }
@@ -232,6 +236,7 @@ impl From<&HintsBarSettings> for HintsBarStyle {
             detail_pad: c.detail.pad,
             max_width_ratio: c.max_width_ratio,
             overflow: c.overflow,
+            overflow_align: c.overflow_align.unwrap_or(c.align),
         }
     }
 }
@@ -1644,6 +1649,21 @@ mod tests {
     use super::*;
 
     fn bounds(w: f64) -> CGRect { CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w, 26.0)) }
+
+    #[test]
+    fn overflow_align_overrides_align_only_when_set() {
+        let mut c = crate::common::config::HintsBarSettings::default();
+        c.align = HintsBarAlign::Start;
+        assert_eq!(
+            HintsBarStyle::from(&c).overflow_align,
+            HintsBarAlign::Start,
+            "unset overflow_align must follow align"
+        );
+        c.overflow_align = Some(HintsBarAlign::End);
+        let style = HintsBarStyle::from(&c);
+        assert_eq!(style.align, HintsBarAlign::Start, "main bar must not move");
+        assert_eq!(style.overflow_align, HintsBarAlign::End);
+    }
 
     #[test]
     fn chips_are_ordered_non_overlapping_and_within_bounds() {

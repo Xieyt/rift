@@ -230,12 +230,33 @@ install: build
 #
 # Requires a prior full `just install` to create the bundle. Default profile is
 # `release-fast` (opt-level 2, incremental); pass `dev` for the fastest compile.
-dev-install profile="release-fast" config="dev-config.toml":
+dev-install profile="release-fast" config="local-config.toml":
     #!/usr/bin/env bash
     set -euo pipefail
     if [ ! -d "{{app}}" ]; then
       echo "!! {{app}} missing — run \`just install\` once to create the bundle." >&2
       exit 1
+    fi
+    # Resolve the config path FIRST and say out loud that this repoints the
+    # LIVE agent. On 2026-10-18 a `just dev-install` with default arguments
+    # moved the running agent onto the scratch config; the bars and keymap
+    # changed under the operator mid-session and read as "rift is broken".
+    # The build takes ~30s, so printing this before it leaves time to Ctrl-C.
+    cfg=""
+    if [ -n "{{config}}" ] && [ -f "{{config}}" ]; then
+      cfg="$(cd "$(dirname "{{config}}")" && pwd)/$(basename "{{config}}")"
+    fi
+    plist="$HOME/Library/LaunchAgents/git.acsandmann.rift.plist"
+    cur_cfg_now="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:3' "$plist" 2>/dev/null || echo '(none)')"
+    if [ -n "$cfg" ] && [ "$cfg" != "$cur_cfg_now" ]; then
+      echo "==> THIS REPOINTS YOUR LIVE RIFT AGENT"
+      echo "    config now:   $cur_cfg_now"
+      echo "    config after: $cfg"
+      echo "    your keys and bars come from the 'after' file until \`just use-system-config\`"
+    elif [ -n "$cfg" ]; then
+      echo "==> agent config unchanged: $cfg"
+    else
+      echo "==> config '{{config}}' not found; the agent keeps its current --config ($cur_cfg_now)"
     fi
     # Snapshot the running layout BEFORE rebuilding, using the current rift-cli
     # (matches the running rift), so the post-restart `--restore` reloads it.
@@ -269,12 +290,7 @@ dev-install profile="release-fast" config="dev-config.toml":
     # /opt/homebrew/bin on PATH so run_on_start scripts resolve `sketchybar`
     # (temporary shim until `just fern` bakes PATH into the nix module). Any
     # plist change needs a bootout/bootstrap — kickstart won't pick up edits.
-    plist="$HOME/Library/LaunchAgents/git.acsandmann.rift.plist"
     hb="/opt/homebrew/bin"
-    cfg=""
-    if [ -n "{{config}}" ] && [ -f "{{config}}" ]; then
-      cfg="$(cd "$(dirname "{{config}}")" && pwd)/$(basename "{{config}}")"
-    fi
     if [ -n "$cfg" ] && [ -f "$plist" ]; then
       chmod u+w "$plist" 2>/dev/null || true
       need_reload=0
@@ -323,7 +339,7 @@ dev-install profile="release-fast" config="dev-config.toml":
     fi
 
 # Like `dev-install` but discards the saved layout snapshot for a clean slate.
-dev-install-fresh profile="release-fast" config="dev-config.toml":
+dev-install-fresh profile="release-fast" config="local-config.toml":
     @FRESH=1 just dev-install {{profile}} {{config}}
 
 # one-time: create a stable self-signed code-signing cert in the System keychain
