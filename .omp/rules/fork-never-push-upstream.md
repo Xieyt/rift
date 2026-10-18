@@ -8,19 +8,19 @@ scope: "tool:bash"
 interruptMode: tool-only
 probes:
   fire:
-    - "git push upstream xieyt/5"
+    - "git push upstream develop"
     - "git push --force-with-lease upstream main"
     # Pushing *to* origin but writing an upstream ref is the same mistake.
     - "git push origin upstream/main:main"
     - "git -C /tmp/probe push upstream main"
   silent:
-    - "git push origin xieyt/5"
+    - "git push origin develop"
     - "git fetch upstream --quiet"
     # `upstream/main` as a read source is fine; only `push` is the violation.
     - "git merge upstream/main"
     - "git rev-list --count HEAD..upstream/main"
     # A compound whose push targets origin and whose *other* clause reads upstream.
-    - "git push origin xieyt/5 && git fetch upstream --quiet"
+    - "git push origin develop && git fetch upstream --quiet"
 ---
 
 # Never push to `upstream`
@@ -31,10 +31,10 @@ rule as absolute: **local work never touches upstream. We only ever push to
 
 ```bash
 # WRONG — pushes our fork's private work into someone else's repository.
-git push upstream xieyt/5
+git push upstream develop
 
 # RIGHT — our fork, our branch.
-git push origin xieyt/5
+git push origin develop
 ```
 
 `upstream` is fetch-only in practice, even though the remote has a push URL

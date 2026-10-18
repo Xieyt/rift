@@ -431,10 +431,18 @@ upstream-tripwire:
     behind=$(git rev-list --count HEAD..upstream/main)
     if [ "$behind" -eq 0 ]; then echo "- up to date with \`upstream/main\`."; exit 0; fi
     hit=0
-    if ! git diff --quiet HEAD..upstream/main -- Cargo.toml Cargo.lock crates/; then
-      echo "- **[!] crate/workspace change** — a new or moved crate re-homes our command variants:"
+    # `merge-base..upstream/main`, NOT `HEAD..upstream/main`. The two-dot form here
+    # is a *tree* diff, so it also reports everything OUR side carries — and we
+    # permanently carry `arc-swap` in Cargo.toml plus five command variants in
+    # crates/rift-protocol. Read that way the check fired on every run forever,
+    # printing our own additions as deletions (2026-10-18, UPSTREAM-SYNC.md §13).
+    # From the merge base it answers the only question that matters: what did
+    # UPSTREAM change in the range we are about to merge?
+    mb=$(git merge-base HEAD upstream/main)
+    if ! git diff --quiet "$mb..upstream/main" -- Cargo.toml Cargo.lock crates/; then
+      echo "- **[!] crate/workspace or dependency change** — a new or moved crate re-homes our command variants; a version bump in \`Cargo.toml\` must agree with \`Cargo.lock\` after the merge:"
       echo '```'
-      git diff --stat HEAD..upstream/main -- Cargo.toml Cargo.lock crates/
+      git diff --stat "$mb..upstream/main" -- Cargo.toml Cargo.lock crates/
       echo '```'
       hit=1
     fi

@@ -2,9 +2,12 @@ name: rust
 
 on:
   push:
-    branches: ["main"]
+    # `develop` is this fork's default branch; `main` does not exist on `origin`,
+    # so the old filter meant CI never ran here. docs.yml/tag.yml keep `main`
+    # on purpose — they are guarded to `acsandmann/rift`.
+    branches: ["develop"]
   pull_request:
-    branches: ["main"]
+    branches: ["develop"]
 
 concurrency:
   group: rust-ci-${{ github.workflow }}-${{ github.ref }}

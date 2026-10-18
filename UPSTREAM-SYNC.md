@@ -21,30 +21,36 @@ its own sake:
   to sync: it is the shortest complete worked example, and §8.3 covers what to do
   when upstream ships a failing test.
 
-## 0. Status — five syncs complete, a sixth planned; §12 is the newest
+## 0. Status — seven syncs complete; §13 is the newest
 
 ```
-branch                    xieyt/5
-behind upstream           132      (git rev-list --left-right --count HEAD...upstream/main)
-ahead                     80
-upstream tip merged       83f3b66  (2026-09-17; backlog ended 6c64d8b, then 1de4d09,
-                                   then 7829780, then 3a52122, then 74ce00d, now this)
-upstream tip available    250d992  (2026-10-15, v0.7.0) — NOT merged; see §12
+branch                    develop   (repo default AND the ref xnix-config pins;
+                                     `xieyt/5` and `main` are gone from origin)
+behind upstream           0        (git rev-list --left-right --count upstream/main...HEAD)
+ahead                     101
+upstream tip merged       7803767  (2026-10-16, merge commit e3f45e6; backlog ended
+                                   6c64d8b, then 1de4d09, 7829780, 3a52122, 74ce00d,
+                                   83f3b66, 250d992, now this)
 curated tests             327 -> 352 (backlog merge) -> 359 (allowlist fix)
                               -> 363 (§8) -> 370 (§9) -> 520 (guard widened)
-                              -> 549 (§10) -> 605 (§11), plus 14 crate tests
-                              that had never run at all before §11
-cargo check               --workspace --all-targets clean (at 686f4a6, pre-merge)
+                              -> 549 (§10) -> 605 (§11) -> 846 (§12), plus the
+                              crate tests that had never run at all before §11
+cargo check               --workspace --all-targets clean (at e3f45e6)
+just test                 846 passed, 0 failed
 just fmt-check            clean
-nix build .#rift          succeeds; `nix eval .#rift.version` reads 0.5.9
+nix build .#rift          succeeds; `nix eval .#rift.version` reads 0.7.0
 ```
 
-**§12 is the sixth-sync PLAN** (132 commits, 68 hunks across 18 files, four
-upstream subsystem rewrites, two fork features retired as superseded) and is the
-one to read if you are about to sync. **§12.10 is the most important section in
-this file**: it is why a 77-commit backlog became a 132-commit one, and the three
-rule changes that stop the next one. §12.3 answers "do we still need ours?" per
-fork feature; §12.6 is the twelve-entry hazard register.
+**§13 is the seventh sync** (2 commits, 1 hunk) and is the shortest worked example
+in this file — read it for the `Cargo.toml` manifest/lock interaction and for why
+the crate tripwire fires at steady state even when upstream touched no crate.
+
+**§12 is the sixth sync** (132 commits, 68 hunks across 18 files, four upstream
+subsystem rewrites, two fork features retired as superseded); §12.11 is its
+outcome. **§12.10 is the most important section in this file**: it is why a
+77-commit backlog became a 132-commit one, and the three rule changes that stop
+the next one. §12.3 answers "do we still need ours?" per fork feature; §12.6 is
+the twelve-entry hazard register.
 
 **§11 records the 2026-09-18 sync** (77 commits, 13 hunks, 2 deleted files we had
 edited, 2 SKIPs). It is the first of these where the cost was a **migration, not
@@ -2338,3 +2344,51 @@ each verified by deletion on a pristine checkpoint worktree.
 feature C, tab raise order, the bar tracking `presented_frames` during a
 `CameraSpring` animation, the settings window launching from inside the nix
 `.app`, and feature B's activation attribution are all unverified on hardware.
+
+---
+
+## 13. Seventh sync — 2026-10-18, `250d992` → `7803767` (2 commits)
+
+**Branch note, and it is the finding of this one.** Work now lands on **`develop`**,
+which is the repo's default branch (`git ls-remote --symref origin HEAD`) *and* the
+ref `xnix-config`'s flake input pins (`rift.url = "github:Xieyt/rift/develop"`).
+`xieyt/5` no longer exists on the remote; `main` does not either. Everything above
+§13 naming `xieyt/5` means `develop`. The local `origin/HEAD` still pointed at
+`main` until `git remote set-head origin -a` was run — the
+`fork-remote-state-not-cached` rule, sixth instance, this time on the *symref*.
+
+```
+behind upstream   2      ahead 101  ->  after merge: 0 / 101
+upstream tip      7803767 (2026-10-16)
+merge commit      e3f45e6 on develop
+curated tests     846 passed, 0 failed (62 filtered)
+```
+
+| Commit | Subject | Verdict | Note |
+|---|---|---|---|
+| `d05915c` | stackline multi display behavior (#585) | TAKE | `stack_line.rs`, `managers.rs`, `sys/screen.rs`, `reactor/tests.rs`. Feature C was retired in §12.8, so the stack line is wholly upstream's now — zero fork hunks in range, all auto-merged. |
+| `7803767` | perf: optimize stackline | TAKE | Same file plus `traditional.rs`; needs `cgs` 0.3.10. |
+
+**One conflict hunk, `Cargo.toml`.** Competing edits on adjacent lines, not a
+semantic clash: ours is the fork-only `arc-swap = "1"` (hint-bar `SharedHitRects`,
+FORK.md §2.E) sitting directly above `cgs`; theirs bumps `cgs` 0.3.9 → 0.3.10.
+Kept both. `Cargo.lock` had already auto-merged to 0.3.10, so the resolution is the
+one that makes the two agree — the alternative (take ours) would have produced a
+manifest/lock mismatch that `cargo check` does not flag.
+
+**The tripwire's crate check is a false positive at steady state.** It reported
+"crate/workspace change — a new or moved crate re-homes our command variants" and
+printed a diffstat showing `crates/rift-protocol/src/commands.rs -75` and
+`Cargo.lock -228`. That is `git diff HEAD..upstream/main`, a **two-way tree diff**:
+the deletions are *ours*, read backwards. The two new commits touch `crates/` not
+at all. The signal is still worth keeping, but read `git log --stat HEAD..upstream/main`
+before believing it — that is the one that answers "what did upstream change".
+
+Gates: `cargo check --workspace --all-targets` clean · `just test` 846/846 ·
+`just fmt-check` clean · `just smoke` (nix build, `rift`/`rift-cli` link and run;
+`nix eval .#rift.version` is 0.7.0). Pushed; `git ls-remote origin refs/heads/develop`
+confirms `e3f45e6`.
+
+**Still owed: §12.9**, unchanged. Every gate here is headless, and this sync is
+entirely in the stack line's rendering and multi-display path — exactly the code a
+headless suite cannot see. Nothing was verified on a second physical display.

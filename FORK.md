@@ -22,11 +22,14 @@ Read this before syncing with upstream or adding new local features.
 
 Branches:
 
-- **`xieyt/5`** — the working branch: `upstream/main` **merged** with our local
-  changes on top. This is what we build and ship. (Older notes called it
-  `udpate/to-latest`, then `xieyt/4`; the live branch is `xieyt/5`.)
-- **`main`** — kept in sync with `upstream/main` as a clean mirror. No local work
-  lands here.
+- **`develop`** — the working branch: `upstream/main` **merged** with our local
+  changes on top. This is what we build and ship. It is the repo's **default
+  branch** (`git ls-remote --symref origin HEAD`) and the ref `xnix-config`'s
+  flake input pins (`rift.url = "github:Xieyt/rift/develop"`), so the branch name
+  is part of a consumer's lockfile — do not rename it casually. (Older notes call
+  it `udpate/to-latest`, `xieyt/4`, then `xieyt/5`; all mean this branch.)
+- There is **no clean upstream mirror branch** any more. `origin` has no `main`
+  and no `xieyt/5`; read `upstream/main` directly.
 
 > **Rule:** local work never touches upstream. We only ever push to `origin`.
 > The original developer only sees what we deliberately open as a PR from a
@@ -583,7 +586,7 @@ store.
 ```bash
 just upstream-status   # drift + structural tripwires: does this need syncing NOW?
 just sync              # one range merge, gated on build + tests
-git push origin xieyt/5
+git push origin develop
 ```
 
 `just sync` merges the **whole range at once** (`sync-to upstream/main`), then gates
@@ -618,8 +621,7 @@ The manual equivalent, when you want to drive a single checkpoint by hand:
 
 ```bash
 git fetch upstream
-git push origin upstream/main:main      # keep the clean mirror in sync (fast-forward)
-git checkout xieyt/5
+git checkout develop
 git log --oneline HEAD..upstream/main   # more than a handful? pick checkpoints
 git merge <checkpoint-sha>
 # ...resolve conflicts if any (see §4), then:
@@ -637,9 +639,9 @@ Upstream has shipped a red test at its own tip at least once (§8.3 of
 **Rebase alternative** (only for upstreaming / a linear history):
 
 ```bash
-git checkout xieyt/5
+git checkout develop
 git rebase upstream/main             # resolve per-commit; rerere still helps
-git push --force-with-lease origin xieyt/5
+git push --force-with-lease origin develop
 ```
 
 ---
@@ -1058,12 +1060,12 @@ work. And when you change a policy in this document, change its rule too — the
 ```bash
 # how far are we from upstream?
 git fetch upstream
-git rev-list --left-right --count upstream/main...xieyt/5
+git rev-list --left-right --count upstream/main...develop
 #  -> "<N behind>  <M ahead>"   ; M = number of commits we carry on top
 
 # what exactly do we carry on top of upstream?
-git log --oneline upstream/main..xieyt/5
-git diff --stat upstream/main..xieyt/5
+git log --oneline upstream/main..develop
+git diff --stat upstream/main..develop
 
 # structural tripwires — any hit means sync now, not later (UPSTREAM-SYNC.md §7)
 just upstream-status                   # drift + tripwires, for a human

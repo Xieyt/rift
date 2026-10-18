@@ -55,4 +55,4 @@ Too large for one bite? `just sync-to <sha>` — a *smaller range*, still a rang
 ## Rebase is for upstreaming only
 
 A clean linear PR against `acsandmann/rift` is the one place it earns its cost, and
-that happens on a dedicated feature branch, never on `xieyt/5`.
+that happens on a dedicated feature branch, never on `develop`.
