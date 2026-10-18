@@ -6,6 +6,8 @@
 //! clicks (delivered from the event tap as [`Event::MouseDown`]) to a
 //! `FocusWindow` reactor command. It runs on the main thread because the CGS
 //! window and its layer tree must be created and mutated there.
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,11 +77,7 @@ pub enum Event {
 pub type Sender = actor::Sender<Event>;
 pub type Receiver = actor::Receiver<Event>;
 
-type CellSig = (
-    Vec<(String, bool, bool, bool, usize, usize, String)>,
-    Vec<(String, bool, Vec<crate::sys::app::pid_t>)>,
-    usize,
-);
+type CellSig = u64;
 
 pub struct HintsBar {
     config: Config,
@@ -152,6 +150,28 @@ impl HintsBar {
                                     self.debounce_armed = true;
                                 }
                             }
+                            Event::ConfigUpdated(config) => {
+                                // Apply the new config and adopt any debounced
+                                // snapshot BEFORE painting anything, so a reload
+                                // never flashes a frame drawn under the stale
+                                // config, and a reload that disables the bar
+                                // tears down without painting anything first.
+                                self.config = config;
+                                if let Some(pending) = self.pending.take() {
+                                    self.last_sig = Some(Self::signature(
+                                        &pending.cells,
+                                        &pending.workspaces,
+                                        pending.top_count,
+                                    ));
+                                    self.last_snapshot = Some(pending);
+                                }
+                                if self.is_enabled() {
+                                    self.reevaluate(true);
+                                } else {
+                                    self.teardown();
+                                }
+                                self.arm_hide(&mut hide_timer);
+                            }
                             other => {
                                 self.flush_pending();
                                 self.handle_event(other);
@@ -195,34 +215,39 @@ impl HintsBar {
     fn handle_event(&mut self, event: Event) {
         match event {
             Event::Snapshot(snapshot) => self.on_snapshot(snapshot),
-            Event::ConfigUpdated(config) => self.on_config(config),
+            Event::ConfigUpdated(_) => unreachable!(
+                "ConfigUpdated is intercepted in run() so the config applies \
+                 before any pending snapshot is flushed"
+            ),
             Event::MouseDown(point) => self.on_mouse_down(point),
             Event::Toggle => self.on_toggle(),
         }
     }
 
     fn signature(cells: &[ColumnCell], workspaces: &[WorkspaceCell], top_count: usize) -> CellSig {
-        let entries = cells
-            .iter()
-            .map(|c| {
-                let active_label = c
-                    .members
-                    .get(c.active)
-                    .map(|m| format!("{}\u{1}{}", m.label, m.title))
-                    .unwrap_or_default();
-                (
-                    c.hint.clone(),
-                    c.focused,
-                    c.visible,
-                    c.tabbed,
-                    c.active,
-                    c.members.len(),
-                    active_label,
-                )
-            })
-            .collect();
-        let ws = workspaces.iter().map(|w| (w.label.clone(), w.active, w.pids.clone())).collect();
-        (entries, ws, top_count)
+        let mut hasher = DefaultHasher::new();
+        for c in cells {
+            c.hint.hash(&mut hasher);
+            c.focused.hash(&mut hasher);
+            c.visible.hash(&mut hasher);
+            c.tabbed.hash(&mut hasher);
+            c.active.hash(&mut hasher);
+            c.members.len().hash(&mut hasher);
+            let (label, title) = c
+                .members
+                .get(c.active)
+                .map(|m| (m.label.as_str(), m.title.as_str()))
+                .unwrap_or(("", ""));
+            label.hash(&mut hasher);
+            title.hash(&mut hasher);
+        }
+        for w in workspaces {
+            w.label.hash(&mut hasher);
+            w.active.hash(&mut hasher);
+            w.pids.hash(&mut hasher);
+        }
+        top_count.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn on_snapshot(&mut self, snapshot: Snapshot) {
@@ -231,7 +256,7 @@ impl HintsBar {
             return;
         }
         let sig = Self::signature(&snapshot.cells, &snapshot.workspaces, snapshot.top_count);
-        let sig_changed = self.last_sig.as_ref() != Some(&sig);
+        let sig_changed = self.last_sig != Some(sig);
         // A frame-only change (display resize, arrangement change) must still
         // trigger a render: `render()` is what calls `set_frame` and
         // `sync_hit_rects`, and the chip signature alone says nothing about
@@ -246,16 +271,6 @@ impl HintsBar {
         self.last_sig = Some(sig);
         self.last_snapshot = Some(snapshot);
         self.reevaluate(changed);
-    }
-
-    fn on_config(&mut self, config: Config) {
-        self.config = config;
-        if !self.is_enabled() {
-            self.teardown();
-            return;
-        }
-        // Restyle / re-place with the latest snapshot.
-        self.reevaluate(true);
     }
 
     fn on_toggle(&mut self) {
@@ -277,10 +292,11 @@ impl HintsBar {
 
     /// Decide visibility for the current mode and render or hide accordingly.
     fn reevaluate(&mut self, changed: bool) {
-        let Some(snapshot) = self.last_snapshot.clone() else {
+        let Some(snapshot) = self.last_snapshot.take() else {
             return;
         };
         if should_hide_bar(self.is_enabled(), &snapshot) {
+            self.last_snapshot = Some(snapshot);
             self.hide();
             return;
         }
@@ -298,11 +314,12 @@ impl HintsBar {
 
         if show {
             if changed || !self.bar_visible() {
-                self.render(snapshot);
+                self.render(&snapshot);
             }
         } else {
             self.hide();
         }
+        self.last_snapshot = Some(snapshot);
     }
 
     fn arm_flash(&mut self) {
@@ -333,7 +350,7 @@ impl HintsBar {
             .unwrap_or(1.0)
     }
 
-    fn render(&mut self, snap: Snapshot) {
+    fn render(&mut self, snap: &Snapshot) {
         tracing::trace!(target: "hbbench", "hb_render");
         let style = HintsBarStyle::from(&self.config.settings.ui.hints_bar);
         let scale = self.backing_scale(snap.screen_frame);

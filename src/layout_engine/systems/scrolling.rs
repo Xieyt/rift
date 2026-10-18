@@ -1295,6 +1295,20 @@ impl ScrollingLayoutSystem {
             .collect()
     }
 
+    /// Column membership and order only, without building a protocol tree.
+    ///
+    /// Mirrors `container_tree`'s column order and per-column window order
+    /// exactly (iterate `state.columns`, then each column's `windows`) so
+    /// callers that index by column position — e.g. the hint bar's
+    /// `focus_column i` — stay aligned. Off-strip (parked) columns are still
+    /// columns here; this makes no frame-position judgment at all.
+    pub(crate) fn columns_window_ids(&self, layout: LayoutId) -> Vec<Vec<WindowId>> {
+        let Some(state) = self.layouts.get(layout) else {
+            return Vec::new();
+        };
+        state.columns.iter().map(|column| column.windows.clone()).collect()
+    }
+
     fn translate_frames<'a>(
         state: &'a LayoutState,
         g: &'a Geometry,

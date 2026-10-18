@@ -465,6 +465,14 @@ impl LayoutEngine {
         let Some(workspace) = self.workspaces.workspace_info(space, active) else {
             return Vec::new();
         };
+        // The scrolling layout is the only column strip; read its columns
+        // directly rather than round-tripping through the protocol tree
+        // (`container_tree`'s allocation cost dominates layout-apply CPU with
+        // the hint bar enabled). Every other mode keeps the generic path,
+        // which yields empty columns for them (see the doc comment above).
+        if let LayoutSystemKind::Scrolling(scrolling) = &workspace.layout_system {
+            return scrolling.columns_window_ids(layout);
+        }
         // For a column strip the tree is exactly one container per column, each
         // holding its windows (see `ScrollingLayoutSystem::container_tree`).
         workspace

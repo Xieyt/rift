@@ -303,10 +303,13 @@ still needs them: `Color` (with `from_hex`/`to_nscolor`) and
   left/right moves between columns.
 - Feeds tabbed columns into the **same** stack-line indicator pipeline as §C: a
   new `LayoutSystem::toggle_selection_tabbed` (default no-op) plus
-  `ScrollingLayoutSystem::collect_group_containers_scrolling`, which caches the
-  authoritative column frame during `calculate_layout` (`tab_groups`) and
-  synthesizes a stable `NodeId` per column (`KeyData::from_ffi`). So with §C's
-  `show_titles` on, scrolling tabs get titles too.
+  `ScrollingLayoutSystem::collect_group_containers_scrolling`, which derives
+  each tabbed column's frame on demand from the prepared `Geometry` (translated
+  by the current viewport offset — the same source the windows themselves are
+  placed from) and synthesizes a stable `NodeId` per column (`KeyData::from_ffi`).
+  The sixth sync's re-port dropped the earlier `tab_groups` `RefCell` cache of
+  the column frame computed during a `calculate_layout` call; that call site no
+  longer exists. So with §C's `show_titles` on, scrolling tabs get titles too.
 - Toggle: `LayoutCommand::ToggleColumnTabbed` → `rift-cli execute layout toggle-tabbed`
   (or bind `toggle_column_tabbed`). Build a multi-window column first
   (`consume-or-expel-window`), then toggle tabbed.
@@ -553,9 +556,10 @@ re-records it.
 match; an upstream rewrite of either would silently break `held_keys`
 tracking or matching with nothing today flagging it. Both are now in
 `justfile`'s `upstream-tripwire` churn loop for exactly that reason.
-**Verify:** `just test` — `held_keys_hash_equally_whatever_order_they_were_written_in`
-and `expansion_keeps_the_held_keys_on_every_left_right_variant` in
-`src/sys/hotkey.rs`, plus
+**Verify:** `src/sys/hotkey.rs`'s `held_keys_hash_equally_whatever_order_they_were_written_in`
+and `expansion_keeps_the_held_keys_on_every_left_right_variant` live in the `sys`
+module, classified `GUI_OR_DEFERRED` — `just test` does **not** run them, only
+`just test-all` does. `just test` does cover
 `a_shortcut_that_holds_an_ordinary_key_is_reported_so_the_recorder_can_refuse`
 in `src/ui/settings/commands.rs`.
 

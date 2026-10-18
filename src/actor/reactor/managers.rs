@@ -997,7 +997,12 @@ impl LayoutManager {
                 // frame, or signature work at all, just a cheap reserve check
                 // and (once, on the scrolling -> other transition) a clearing
                 // snapshot so a previously-drawn bar doesn't freeze on screen.
-                if reactor.config.settings.ui.hints_bar.enabled && active_space == Some(space) {
+                // `hints_bar_suppressed` is the `mod1+B` toggle: without it the
+                // reactor keeps gathering and hashing for a bar nobody can see.
+                if reactor.config.settings.ui.hints_bar.enabled
+                    && !reactor.hints_bar_suppressed
+                    && active_space == Some(space)
+                {
                     if let Some(tx) = reactor.communication_manager.hints_bar_tx.clone() {
                         let is_scrolling =
                             reactor.layout_manager.layout_engine.active_layout_mode_at(space)

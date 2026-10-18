@@ -427,6 +427,11 @@ pub struct Reactor {
     window_inventory_manager: managers::WindowInventoryManager,
     refocus_manager: managers::RefocusManager,
     suppress_auto_workspace_switch_until_input: bool,
+    /// Runtime on/off for the `toggle_hints_bar` command, independent of
+    /// `config.settings.ui.hints_bar.enabled`. `managers.rs`'s hints-bar
+    /// producer ANDs this into its per-apply gather/hash/send guard so
+    /// toggling the bar off also stops that work, not just the drawing.
+    pub(super) hints_bar_suppressed: bool,
     pending_space_change_manager: managers::PendingSpaceChangeManager,
     active_spaces: HashSet<SpaceId>,
     startup_ready: Option<oneshot::Sender<()>>,
@@ -571,6 +576,7 @@ impl Reactor {
                 refocus_state: RefocusState::None,
             },
             suppress_auto_workspace_switch_until_input: false,
+            hints_bar_suppressed: false,
             pending_space_change_manager: managers::PendingSpaceChangeManager {
                 pending_space_change: None,
             },
@@ -2232,6 +2238,15 @@ impl Reactor {
                 );
             }
             Event::Command(Command::Reactor(ReactorCommand::ToggleHintsBar)) => {
+                // Flip the runtime suppression flag the hints-bar producer
+                // reads (managers.rs). Clear the per-space signature cache
+                // too: while suppressed no apply reaches it, so if
+                // geometry/style happen to be unchanged from before the
+                // toggle, the stale cached hash would otherwise gate away
+                // the first snapshot after re-enabling and the bar would
+                // stay hidden.
+                self.hints_bar_suppressed = !self.hints_bar_suppressed;
+                self.communication_manager.hints_bar_last_sig.clear();
                 if let Some(tx) = &self.communication_manager.hints_bar_tx {
                     let _ = tx.try_send(hints_bar::Event::Toggle);
                 }

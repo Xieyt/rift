@@ -266,6 +266,15 @@ pub struct HintsBar {
     /// Cached notch geometry (static per display config) to avoid an NSScreen
     /// query on every render; keyed by the display rect.
     notch_cache: RefCell<Option<(CGRect, Option<(f64, f64, f64)>)>>,
+    /// Blur value last actually sent to the window server; `update()` skips
+    /// the `set_blur` call when the style's blur hasn't changed, so a
+    /// redraw (every layout apply) isn't a window-server round trip.
+    last_blur: Cell<u32>,
+    /// Whether the window is currently ordered above its neighbours;
+    /// `update()` skips the redundant `order_above` call once this is
+    /// already true, and `hide()` resets it so the next `update()` after a
+    /// hide re-orders.
+    ordered: Cell<bool>,
 }
 
 impl HintsBar {
@@ -314,6 +323,8 @@ impl HintsBar {
             detail: RefCell::new(None),
             notch_cache: RefCell::new(None),
             scale: Cell::new(scale),
+            last_blur: Cell::new(style.blur),
+            ordered: Cell::new(false),
         })
     }
 
@@ -355,12 +366,24 @@ impl HintsBar {
             state.data = data;
             state.visible = true;
         }
-        // Apply blur every update so it tracks config hot-reloads (0 = off,
-        // plain alpha transparency shows straight through).
-        let _ = self.cgs_window.set_blur(style.blur as i32, None);
+        // Apply blur only when it actually changed (config hot-reloads still
+        // pick it up — they flow through `style` like everything else — but a
+        // redraw on every layout apply no longer re-sends an unchanged value).
+        if self.last_blur.get() != style.blur {
+            let _ = self.cgs_window.set_blur(style.blur as i32, None);
+            self.last_blur.set(style.blur);
+        }
         self.rebuild_layers();
         self.present();
-        let result = self.cgs_window.order_above(None);
+        let result = if self.ordered.get() {
+            Ok(())
+        } else {
+            let r = self.cgs_window.order_above(None);
+            if r.is_ok() {
+                self.ordered.set(true);
+            }
+            r
+        };
         self.update_detail();
         result
     }
@@ -368,6 +391,7 @@ impl HintsBar {
     /// Hide the bar without discarding its data.
     pub fn hide(&self) -> Result<(), CgsWindowError> {
         self.state.borrow_mut().visible = false;
+        self.ordered.set(false);
         if let Some(detail) = self.detail.borrow().as_ref() {
             detail.hide();
         }
@@ -629,30 +653,30 @@ impl HintsBar {
     }
 
     fn rebuild_layers(&self) {
-        let mut state = self.state.borrow_mut();
+        // Compute the new rects first under a shared borrow (no clone of
+        // `cells`/`workspaces` needed — `render_strip` only reads them), then
+        // write them back under a separate exclusive borrow. Splitting the
+        // borrow this way, rather than cloning out of it, is what lets this
+        // run on every redraw without a per-column-chip allocation.
+        let state = self.state.borrow();
         let style = state.style;
         let bounds = self.bounds();
-        let cells = state.data.cells.clone();
-        let workspaces = state.data.workspaces.clone();
+        let cells = &state.data.cells;
+        let workspaces = &state.data.workspaces;
         let split = state.data.overflow_split;
         let screen = state.data.screen;
         let frame = *self.frame.borrow();
+        let dots = matches!(style.density, HintsBarDensity::Dots);
 
-        with_disabled_actions(|| {
+        let rects = with_disabled_actions(|| {
             unsafe { self.root_layer.setSublayers(None) };
 
-            if !Self::strip_has_content(
-                &cells,
-                &workspaces,
-                matches!(style.density, HintsBarDensity::Dots),
-            ) {
-                state.chip_rects.clear();
-                state.ws_rects.clear();
-                return;
+            if !Self::strip_has_content(cells, workspaces, dots) {
+                return None;
             }
 
             let fs = style.font_size.unwrap_or_else(|| (style.height * 0.5).clamp(11.0, 15.0));
-            match split {
+            Some(match split {
                 // Two rows in one (taller) window: rail + cells[..k] on top,
                 // cells[k..] on the bottom half. Chip rects concatenate in cell
                 // order so click hit-testing maps straight to the window id.
@@ -667,7 +691,7 @@ impl HintsBar {
                     let (ws_r, mut chip_r) = self.render_strip(
                         top_b,
                         &cells[..k],
-                        &workspaces,
+                        workspaces,
                         &style,
                         fs,
                         screen,
@@ -676,17 +700,28 @@ impl HintsBar {
                     let (_ws2, chip_r2) =
                         self.render_strip(bot_b, &cells[k..], &[], &style, fs, screen, frame);
                     chip_r.extend(chip_r2);
-                    state.chip_rects = chip_r;
-                    state.ws_rects = ws_r;
+                    (chip_r, ws_r)
                 }
                 _ => {
                     let (ws_r, chip_r) =
-                        self.render_strip(bounds, &cells, &workspaces, &style, fs, screen, frame);
-                    state.chip_rects = chip_r;
-                    state.ws_rects = ws_r;
+                        self.render_strip(bounds, cells, workspaces, &style, fs, screen, frame);
+                    (chip_r, ws_r)
                 }
-            }
+            })
         });
+        drop(state);
+
+        let mut state = self.state.borrow_mut();
+        match rects {
+            Some((chip_rects, ws_rects)) => {
+                state.chip_rects = chip_rects;
+                state.ws_rects = ws_rects;
+            }
+            None => {
+                state.chip_rects.clear();
+                state.ws_rects.clear();
+            }
+        }
     }
 
     /// Lay out + render one strip (row) of `cells` (with an optional leading
@@ -1551,9 +1586,9 @@ impl DetailWindow {
     }
 
     /// Re-apply the configured blur if it changed (config hot reload); a
-    /// no-op otherwise. Unlike the main bar — which always re-sends blur on
-    /// every render — this is only called from `update_detail`, so the diff
-    /// check avoids a redundant CGS call on the common unchanged path.
+    /// no-op otherwise. Same diffing as the main bar's `update()` — tracked
+    /// separately here because this window has its own `CgsWindow` and is
+    /// only ever touched from `update_detail`.
     fn set_blur(&self, blur: u32) {
         if self.blur.get() == blur {
             return;
