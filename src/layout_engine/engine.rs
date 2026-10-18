@@ -1919,9 +1919,45 @@ impl LayoutEngine {
                 } else if let Some((ws_id, layout)) = self.workspaces.active_layout_for_space(space)
                 {
                     if !self.workspaces[ws_id].layout_system.contains_window(layout, wid) {
+                        // Diagnostic only (no behaviour change): the bare message
+                        // says a focus was discarded but not why, and six of the
+                        // nine occurrences in a three-day log had an EMPTY active
+                        // workspace — so the interesting fact is what rift was
+                        // showing at that instant, and where the window really is.
+                        let held =
+                            self.workspaces[ws_id].layout_system.all_windows_in_layout(layout).len();
+                        let owner = self
+                            .workspaces
+                            .workspace_ids(space)
+                            .iter()
+                            .copied()
+                            .find(|other| {
+                                self.workspaces
+                                    .active_layout(space, *other)
+                                    .is_some_and(|other_layout| {
+                                        self.workspaces[*other]
+                                            .layout_system
+                                            .contains_window(other_layout, wid)
+                                    })
+                            })
+                            .map(|other| {
+                                (
+                                    other,
+                                    self.workspace_name(space, other)
+                                        .unwrap_or_else(|| format!("{other:?}")),
+                                )
+                            });
                         warn!(
+                            active_workspace = ?ws_id,
+                            active_workspace_name = %self
+                                .workspace_name(space, ws_id)
+                                .unwrap_or_else(|| format!("{ws_id:?}")),
+                            windows_in_active_workspace = held,
+                            window_actually_in = ?owner,
+                            floating = self.floating.is_floating(wid),
                             "WindowFocused ignored: wid={:?} not in active layout for space {:?}",
-                            wid, space
+                            wid,
+                            space
                         );
                         return EventResponse::default();
                     }
